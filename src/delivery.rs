@@ -2,11 +2,12 @@
 
 use crate::Error;
 use crate::checkpoint::{escape_field, unescape_field};
-use crate::contract::{CONTRACT_VERSION, IdempotencyKey, Record};
+use crate::contract::{IdempotencyKey, Record};
 
 pub fn encode(record: &Record, idk: &IdempotencyKey) -> String {
-    format!(
-        "v{CONTRACT_VERSION}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+    let version = if record.source.is_some() { 2 } else { 1 };
+    let mut line = format!(
+        "v{version}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         escape_field(&idk.encode()),
         escape_field(&record.kind),
         escape_field(&record.key),
@@ -15,15 +16,30 @@ pub fn encode(record: &Record, idk: &IdempotencyKey) -> String {
         encode_quality(record.quality.as_deref()),
         record.position,
         escape_field(&record.payload),
-    )
+    );
+    if let Some(source) = &record.source {
+        line.pop();
+        line.push('\t');
+        line.push_str(&escape_field(&serde_json::json!(source).to_string()));
+        line.push('\n');
+    }
+    line
 }
 
 pub fn decode(line: &str) -> Result<(Record, IdempotencyKey), Error> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 9 || parts[0] != format!("v{CONTRACT_VERSION}") {
+    if !((parts.len() == 9 && parts[0] == "v1") || (parts.len() == 10 && parts[0] == "v2")) {
         return Err(Error::new("delivery row is unreadable"));
     }
     let record = Record {
+        source: if parts[0] == "v2" {
+            Some(
+                serde_json::from_str(&unescape_field(parts[9])?)
+                    .map_err(|_| Error::new("invalid source metadata"))?,
+            )
+        } else {
+            None
+        },
         kind: unescape_field(parts[2])?,
         key: unescape_field(parts[3])?,
         source_ts_ms: parts[4]
@@ -66,6 +82,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trips_tabs_and_newlines() {
         let rec = Record {
+            source: None,
             kind: "tag".into(),
             key: "k\t1".into(),
             source_ts_ms: 10,

@@ -526,7 +526,11 @@ impl Connector for OpcUaConnector {
             result
         })
     }
-    fn read(&mut self, _: Option<Position>) -> Result<Option<Record>, Error> {
+    fn read(
+        &mut self,
+        _: Option<Position>,
+        _source_cursor: Option<&str>,
+    ) -> Result<Option<Record>, Error> {
         Ok(None)
     }
 }

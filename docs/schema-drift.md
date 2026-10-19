@@ -34,7 +34,8 @@ cannot accidentally clear quarantine. While quarantined, a further discovered
 schema change stops the run until the recorded decision is resolved.
 
 Schema state uses atomic replacement, file and directory fsync, and a separate
-`schema-*.v1.json` file beside unchanged v1 checkpoints and quarantine logs.
+`schema-*.v1.json` file beside checkpoints and quarantine logs. Their v2 cursor extension and
+v1 compatibility are described in [Source cursors](source-cursors.md).
 Malformed or unknown state fails closed. Pending events survive restart and
 replay with their original sequence. Instance state must travel together with
 its source checkpoint during backup, restore, or takeover.
@@ -46,6 +47,7 @@ lease. Independent directories for the same source are not coordinated. Do
 not share an instance across nodes without storage that enforces the lock.
 
 The discovery Rust API changes from opaque text to typed schemas. Sink data,
-checkpoint, and quarantine encodings remain v1. Consumers need reserved-control
+checkpoint, and quarantine compatibility is described in
+[Source cursors](source-cursors.md). Consumers need reserved-control
 support before upgrading the producer. Older binaries do not enforce schema
 quarantine; drain the instance before rollback and retain its complete state.

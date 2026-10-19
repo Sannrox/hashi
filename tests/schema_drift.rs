@@ -36,7 +36,11 @@ impl Connector for Fixture {
             },
         ])
     }
-    fn read(&mut self, from: Option<Position>) -> Result<Option<Record>, Error> {
+    fn read(
+        &mut self,
+        from: Option<Position>,
+        _source_cursor: Option<&str>,
+    ) -> Result<Option<Record>, Error> {
         Ok(self
             .records
             .iter()

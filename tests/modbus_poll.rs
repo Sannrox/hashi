@@ -140,7 +140,7 @@ fn tcp_simulator_decodes_all_numeric_types_and_word_byte_orders_in_one_batch() {
             state_dir(),
         )
         .unwrap();
-        let row = connector.read(None).unwrap().unwrap();
+        let row = connector.read(None, None).unwrap().unwrap();
         assert_eq!(row.quality, None);
         let values: serde_json::Value = serde_json::from_str(&row.payload).unwrap();
         for (name, value) in &expected {
@@ -148,7 +148,7 @@ fn tcp_simulator_decodes_all_numeric_types_and_word_byte_orders_in_one_batch() {
             assert_eq!(values[format!("{name}_unit")], "unit");
         }
         assert_eq!(
-            connector.read(None).unwrap(),
+            connector.read(None, None).unwrap(),
             Some(row.clone()),
             "unacknowledged observation must replay"
         );
@@ -177,7 +177,7 @@ fn bit_tables_use_lsb_first_and_batch_adjacent_bits() {
             state_dir(),
         )
         .unwrap();
-        let r = c.read(None).unwrap().unwrap();
+        let r = c.read(None, None).unwrap().unwrap();
         let values: serde_json::Value = serde_json::from_str(&r.payload).unwrap();
         for n in 0..9 {
             assert_eq!(values[format!("b{n}")], matches!(n, 0 | 2 | 7 | 8));
@@ -240,13 +240,13 @@ fn failed_device_emits_bad_quality_with_backoff_while_other_devices_continue() {
         state_dir(),
     )
     .unwrap();
-    let bad = c.read(None).unwrap().unwrap();
+    let bad = c.read(None, None).unwrap().unwrap();
     assert!(bad.quality.unwrap().contains("unavailable"));
-    let good = c.read(Some(0)).unwrap().unwrap();
+    let good = c.read(Some(0), None).unwrap().unwrap();
     assert_eq!(good.kind, "good");
     assert_eq!(good.quality, None);
     clock.0.store(1, Ordering::SeqCst);
-    let next = c.read(Some(1)).unwrap().unwrap();
+    let next = c.read(Some(1), None).unwrap().unwrap();
     assert_eq!(next.kind, "good");
     assert_eq!(
         next.source_ts_ms, 10,
@@ -322,7 +322,7 @@ fn rtu_serial_simulator_checks_crc_and_rejects_corruption() {
             state_dir(),
         )
         .unwrap();
-        let r = c.read(None).unwrap().unwrap();
+        let r = c.read(None, None).unwrap().unwrap();
         if corrupt {
             assert!(r.quality.unwrap().contains("checksum"));
         } else {
@@ -361,7 +361,7 @@ fn unacknowledged_sample_survives_restart_and_fences_map_changes() {
         &path,
     )
     .unwrap();
-    let record = c.read(Some(5)).unwrap().unwrap();
+    let record = c.read(Some(5), None).unwrap().unwrap();
     assert_eq!(record.position, 6);
     drop(c);
     let mut changed = config.clone();
@@ -369,7 +369,7 @@ fn unacknowledged_sample_survives_restart_and_fences_map_changes() {
     assert!(ModbusConnector::new("modbus", vec![changed], source(), clock.clone(), &path).is_err());
     let mut resumed =
         ModbusConnector::new("modbus", vec![config], source(), clock.clone(), &path).unwrap();
-    assert_eq!(resumed.read(Some(5)).unwrap(), Some(record));
+    assert_eq!(resumed.read(Some(5), None).unwrap(), Some(record));
     assert_eq!(
         requests.lock().unwrap().len(),
         1,
@@ -488,8 +488,8 @@ fn failing_first_group_cannot_starve_healthy_groups() {
         &path,
     )
     .unwrap();
-    assert_eq!(source.read(None).unwrap().unwrap().kind, "bad");
-    let next = source.read(Some(0)).unwrap().unwrap();
+    assert_eq!(source.read(None, None).unwrap().unwrap().kind, "bad");
+    let next = source.read(Some(0), None).unwrap().unwrap();
     assert_eq!(next.kind, "good");
     assert_eq!(next.quality, None);
     drop(source);
@@ -533,7 +533,7 @@ fn trickled_tcp_response_cannot_extend_the_exchange_timeout() {
         state_dir(),
     )
     .unwrap();
-    let row = source.read(None).unwrap().unwrap();
+    let row = source.read(None, None).unwrap().unwrap();
     assert!(
         row.quality.is_some(),
         "a valid response trickled beyond the deadline must not be admitted"
@@ -566,7 +566,7 @@ fn restart_preserves_device_backoff_and_request_reservations() {
             &path,
         )
         .unwrap();
-        let row = source.read(position.checked_sub(1)).unwrap().unwrap();
+        let row = source.read(position.checked_sub(1), None).unwrap().unwrap();
         assert_eq!(row.position, position);
         source.acknowledge(position).unwrap();
     }

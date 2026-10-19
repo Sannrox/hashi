@@ -12,6 +12,7 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkpoint {
+    pub source_cursor: Option<String>,
     pub contract_version: u32,
     pub connector: String,
     pub instance: String,
@@ -20,6 +21,7 @@ pub struct Checkpoint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuarantineRow {
+    pub source: Option<crate::contract::SourceMetadata>,
     pub connector: String,
     pub instance: String,
     pub kind: String,
@@ -70,7 +72,7 @@ impl FileCheckpoint {
 
     fn checkpoint_path(&self, connector: &str, instance: &str) -> PathBuf {
         self.dir.join(format!(
-            "checkpoint-{}.{}.v{CONTRACT_VERSION}",
+            "checkpoint-{}.{}.v1",
             path_token(connector),
             path_token(instance)
         ))
@@ -78,7 +80,7 @@ impl FileCheckpoint {
 
     fn quarantine_path(&self, connector: &str, instance: &str) -> PathBuf {
         self.dir.join(format!(
-            "quarantine-{}.{}.v{CONTRACT_VERSION}.log",
+            "quarantine-{}.{}.v1.log",
             path_token(connector),
             path_token(instance)
         ))
@@ -202,11 +204,12 @@ impl CheckpointStore for FileCheckpoint {
 
 fn encode_checkpoint(checkpoint: &Checkpoint) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n",
         checkpoint.contract_version,
         escape_field(&checkpoint.connector),
         escape_field(&checkpoint.instance),
-        checkpoint.position
+        checkpoint.position,
+        serde_json::json!(checkpoint.source_cursor)
     )
 }
 
@@ -217,7 +220,7 @@ fn parse_checkpoint(text: &str) -> Result<Option<Checkpoint>, Error> {
         .ok_or_else(|| Error::new("checkpoint missing version"))?
         .parse::<u32>()
         .map_err(|error| Error::new(error.to_string()))?;
-    if version != CONTRACT_VERSION {
+    if version != 1 && version != CONTRACT_VERSION {
         return Err(Error::new(format!(
             "unsupported checkpoint contract {version}"
         )));
@@ -237,7 +240,21 @@ fn parse_checkpoint(text: &str) -> Result<Option<Checkpoint>, Error> {
         .ok_or_else(|| Error::new("checkpoint missing position"))?
         .parse::<Position>()
         .map_err(|error| Error::new(error.to_string()))?;
+    let source_cursor = if version == 1 {
+        None
+    } else {
+        serde_json::from_str(
+            lines
+                .next()
+                .ok_or_else(|| Error::new("checkpoint missing source cursor"))?,
+        )
+        .map_err(|_| Error::new("invalid source cursor"))?
+    };
+    if lines.next().is_some() {
+        return Err(Error::new("checkpoint has extra fields"));
+    }
     Ok(Some(Checkpoint {
+        source_cursor,
         contract_version: version,
         connector,
         instance,
@@ -246,7 +263,7 @@ fn parse_checkpoint(text: &str) -> Result<Option<Checkpoint>, Error> {
 }
 
 fn encode_quarantine(row: &QuarantineRow) -> String {
-    format!(
+    let mut line = format!(
         "v{CONTRACT_VERSION}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         escape_field(&row.connector),
         escape_field(&row.instance),
@@ -258,16 +275,27 @@ fn encode_quarantine(row: &QuarantineRow) -> String {
         row.source_ts_ms,
         row.ingest_ts_ms,
         escape_field(row.quality.as_deref().unwrap_or(""))
-    )
+    );
+    line.pop();
+    line.push('\t');
+    line.push_str(&escape_field(&serde_json::json!(row.source).to_string()));
+    line.push('\n');
+    line
 }
 
 fn parse_quarantine(line: &str) -> Result<QuarantineRow, Error> {
     let parts: Vec<&str> = line.split('\t').collect();
-    if parts.len() != 11 || parts[0] != format!("v{CONTRACT_VERSION}") {
+    if !((parts.len() == 11 && parts[0] == "v1") || (parts.len() == 12 && parts[0] == "v2")) {
         return Err(Error::new("quarantine row is unreadable"));
     }
     let quality = unescape_field(parts[10])?;
     Ok(QuarantineRow {
+        source: if parts[0] == "v2" {
+            serde_json::from_str(&unescape_field(parts[11])?)
+                .map_err(|_| Error::new("invalid quarantined source metadata"))?
+        } else {
+            None
+        },
         connector: unescape_field(parts[1])?,
         instance: unescape_field(parts[2])?,
         kind: unescape_field(parts[3])?,
@@ -402,6 +430,7 @@ mod tests {
         let store = FileCheckpoint::open(dir()).unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: "fake".into(),
                 instance: "line-a".into(),
@@ -417,6 +446,7 @@ mod tests {
         let store = FileCheckpoint::open(dir()).unwrap();
         store
             .quarantine(&QuarantineRow {
+                source: None,
                 connector: "fake".into(),
                 instance: "line-a".into(),
                 kind: "tag".into(),
@@ -441,6 +471,7 @@ mod tests {
         let store = FileCheckpoint::open(dir()).unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: "a-b".into(),
                 instance: "c".into(),
@@ -449,6 +480,7 @@ mod tests {
             .unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: "a".into(),
                 instance: "b-c".into(),
@@ -464,6 +496,7 @@ mod tests {
         let store = FileCheckpoint::open(dir()).unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: "fake".into(),
                 instance: "line-a".into(),
@@ -472,6 +505,7 @@ mod tests {
             .unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: "fake".into(),
                 instance: "Line-a".into(),
@@ -487,6 +521,7 @@ mod tests {
         let store = FileCheckpoint::open(dir()).unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: String::new(),
                 instance: "x".into(),
@@ -495,6 +530,7 @@ mod tests {
             .unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: "_".into(),
                 instance: "x".into(),
@@ -510,6 +546,7 @@ mod tests {
         let store = FileCheckpoint::open(dir()).unwrap();
         store
             .commit(&Checkpoint {
+                source_cursor: None,
                 contract_version: CONTRACT_VERSION,
                 connector: "mod\nbus".into(),
                 instance: "line\na".into(),
@@ -527,6 +564,7 @@ mod tests {
         let store = FileCheckpoint::open(dir()).unwrap();
         store
             .quarantine(&QuarantineRow {
+                source: None,
                 connector: "fake".into(),
                 instance: "line-a".into(),
                 kind: "tag".into(),
@@ -551,6 +589,7 @@ mod tests {
         let dir = dir();
         let store = FileCheckpoint::open(&dir).unwrap();
         let complete = QuarantineRow {
+            source: None,
             connector: "fake".into(),
             instance: "line-a".into(),
             kind: "tag".into(),
@@ -570,6 +609,7 @@ mod tests {
         }
         store
             .quarantine(&QuarantineRow {
+                source: None,
                 connector: "fake".into(),
                 instance: "line-a".into(),
                 kind: "tag".into(),
@@ -594,6 +634,7 @@ mod tests {
         let store = FileCheckpoint::open(&dir).unwrap();
         store
             .quarantine(&QuarantineRow {
+                source: None,
                 connector: "fake".into(),
                 instance: "line-a".into(),
                 kind: "tag".into(),

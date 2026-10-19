@@ -633,7 +633,11 @@ impl<T: Transport, C: Clock> Connector for ModbusConnector<T, C> {
             })
             .collect())
     }
-    fn read(&mut self, from: Option<Position>) -> Result<Option<Record>, Error> {
+    fn read(
+        &mut self,
+        from: Option<Position>,
+        _source_cursor: Option<&str>,
+    ) -> Result<Option<Record>, Error> {
         // Keep observations until their source checkpoint acknowledges them.
         // Atomic spool replacement makes a failed delivery replay the same sample after restart.
         if let Some(position) = from {
@@ -699,6 +703,7 @@ impl<T: Transport, C: Clock> Connector for ModbusConnector<T, C> {
                             .ok_or_else(|| Error::new("Modbus position exhausted"))?,
                     };
                     self.pending.push_back(Record {
+                        source: None,
                         kind: group.kind.clone(),
                         key: group.record_key.clone(),
                         source_ts_ms: self.clock.now_ms(),

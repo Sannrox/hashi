@@ -73,8 +73,8 @@ impl Sink for JsonLinesSink {
 }
 
 fn to_jsonl(record: &Record, idk: &IdempotencyKey) -> String {
-    // JSON object with escaped strings. Keep this independent of serde.
-    format!(
+    // Preserve the v1 envelope byte-for-byte when optional source metadata is absent.
+    let mut line = format!(
         "{{\"kind\":{},\"key\":{},\"sourceTsMs\":{},\"ingestTsMs\":{},\"quality\":{},\"position\":{},\"payload\":{},\"idempotencyKey\":{}}}\n",
         json_str(&record.kind),
         json_str(&record.key),
@@ -87,7 +87,14 @@ fn to_jsonl(record: &Record, idk: &IdempotencyKey) -> String {
         record.position,
         json_str(&record.payload),
         json_str(&idk.encode()),
-    )
+    );
+    if let Some(source) = &record.source {
+        line.truncate(line.len() - 2);
+        line.push_str(",\"source\":");
+        line.push_str(&serde_json::json!(source).to_string());
+        line.push_str("}\n");
+    }
+    line
 }
 
 fn json_str(value: &str) -> String {
@@ -127,6 +134,15 @@ fn read_jsonl(path: &Path) -> Result<Vec<(Record, IdempotencyKey)>, Error> {
 
 fn parse_jsonl(line: &str) -> Result<(Record, IdempotencyKey), Error> {
     // Replay uses the same field order we write. Keep parse strict.
+    let json: serde_json::Value =
+        serde_json::from_str(line).map_err(|_| Error::new("invalid delivery JSON"))?;
+    let source = json
+        .get("source")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| Error::new("invalid source metadata"))
+        })
+        .transpose()?;
     let kind = json_field(line, "kind")?;
     let key = json_field(line, "key")?;
     let source_ts_ms = json_i64(line, "sourceTsMs")?;
@@ -137,6 +153,7 @@ fn parse_jsonl(line: &str) -> Result<(Record, IdempotencyKey), Error> {
     let idk = IdempotencyKey::decode(&json_field(line, "idempotencyKey")?)?;
     Ok((
         Record {
+            source,
             kind,
             key,
             source_ts_ms,
@@ -274,6 +291,7 @@ mod tests {
     fn jsonl_escapes_quotes_in_payload() {
         let mut sink = JsonLinesSink::open(dir()).unwrap();
         let rec = Record {
+            source: None,
             kind: "tag".into(),
             key: "k1".into(),
             source_ts_ms: 1,
