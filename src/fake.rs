@@ -55,7 +55,7 @@ impl FakeSource {
         if !self.kinds.iter().any(|kind| kind.kind == record.kind) {
             self.kinds.push(DiscoveredKind {
                 kind: record.kind.clone(),
-                schema: "payload:text".into(),
+                schema: crate::schema::Schema::text(),
             });
         }
         self.records.push(record);
@@ -105,7 +105,7 @@ fn unique_kinds(records: &[Record]) -> Vec<DiscoveredKind> {
         {
             kinds.push(DiscoveredKind {
                 kind: record.kind.clone(),
-                schema: "payload:text".into(),
+                schema: crate::schema::Schema::text(),
             });
         }
     }

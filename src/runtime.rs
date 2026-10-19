@@ -116,6 +116,10 @@ where
         }
         let discovered = self.connector.discover()?;
         let connector_id = self.connector.id().to_string();
+        let _lease = self.store.acquire(&connector_id, &self.config.instance)?;
+        let mut schemas = self
+            .store
+            .load_schemas(&connector_id, &self.config.instance)?;
         let loaded = self.store.load(&connector_id, &self.config.instance)?;
         let mut committed: Option<Position> = loaded.map(|checkpoint| checkpoint.position);
         let mut report = RunReport {
@@ -132,7 +136,9 @@ where
         // would stop the source snapshot. The next run drains them.
         match self.sink.recover() {
             Ok(()) | Err(DeliverError::Transient(_)) => {}
-            Err(DeliverError::Poison(reason)) => return Err(Error::new(reason)),
+            Err(DeliverError::Poison(reason) | DeliverError::Blocked(reason)) => {
+                return Err(Error::new(reason));
+            }
         }
         // Sequential deliver-then-commit is a buffer of one. The next read
         // waits for the sink ack; `in_flight_limit` is the configured bound.
@@ -140,6 +146,8 @@ where
             if !keep_going(&report) {
                 break;
             }
+            let discovered = self.connector.discover()?;
+            self.refresh_schemas(&connector_id, &mut schemas, &discovered)?;
             let Some(mut record) = self.connector.read(committed)? else {
                 break;
             };
@@ -149,7 +157,19 @@ where
                 return Err(Error::new("connector emitted a non-monotonic position"));
             }
             record.ingest_ts_ms = self.clock.now_ms();
-            match self.dispatch(&connector_id, &record)? {
+            let schema = schemas.kinds.get(&record.kind);
+            let reason = if !discovered.iter().any(|kind| kind.kind == record.kind) {
+                Some("record kind absent from discovery")
+            } else {
+                schema.and_then(|state| state.quarantine.as_deref())
+            };
+            let outcome = if let Some(reason) = reason {
+                self.quarantine(&connector_id, &record, reason)?;
+                Dispatch::Quarantined
+            } else {
+                self.dispatch(&connector_id, &record)?
+            };
+            match outcome {
                 Dispatch::Delivered => {
                     self.commit(&connector_id, record.position)?;
                     committed = Some(record.position);
@@ -167,6 +187,85 @@ where
         Ok(report)
     }
 
+    /// Accept only the exact quarantined schema, under the same instance lease as reads.
+    pub fn resolve_schema(&self, kind: &str, schema: &crate::schema::Schema) -> Result<(), Error> {
+        let id = self.connector.id();
+        let _lease = self.store.acquire(id, &self.config.instance)?;
+        let mut state = self.store.load_schemas(id, &self.config.instance)?;
+        state.resolve(kind, schema)?;
+        self.store.save_schemas(id, &self.config.instance, &state)
+    }
+
+    fn refresh_schemas(
+        &mut self,
+        id: &str,
+        state: &mut crate::schema::SchemaState,
+        discovered: &[crate::contract::DiscoveredKind],
+    ) -> Result<(), Error> {
+        self.flush_schema_controls(id, state)?;
+        let mut changed = false;
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in discovered {
+            if !seen.insert(&kind.kind) {
+                return Err(Error::new("duplicate discovered kind"));
+            }
+            changed |= state.observe(&kind.kind, &kind.schema)?;
+        }
+        // Persist decisions before delivery. A crash replays pending controls with the same key.
+        if changed {
+            self.store.save_schemas(id, &self.config.instance, state)?;
+        }
+        self.flush_schema_controls(id, state)
+    }
+
+    fn flush_schema_controls(
+        &mut self,
+        id: &str,
+        state: &mut crate::schema::SchemaState,
+    ) -> Result<(), Error> {
+        let mut acknowledged = false;
+        for (kind, entry) in &mut state.kinds {
+            if !entry.pending {
+                continue;
+            }
+            let record = Record {
+                kind: crate::schema::CONTROL_KIND.into(),
+                key: kind.clone(),
+                position: entry.event.sequence,
+                source_ts_ms: 0,
+                ingest_ts_ms: 0,
+                quality: None,
+                payload: serde_json::to_string(&entry.event)
+                    .map_err(|error| Error::new(error.to_string()))?,
+            };
+            let idk = record.idempotency_key(id, &self.config.instance);
+            let mut delivered = false;
+            for attempt in 0..self.config.max_attempts.max(1) {
+                match self.sink.deliver(&record, &idk) {
+                    Ok(()) => {
+                        delivered = true;
+                        break;
+                    }
+                    Err(DeliverError::Transient(_)) => {
+                        self.clock.sleep_ms(backoff_ms(attempt, record.position))
+                    }
+                    Err(DeliverError::Poison(reason) | DeliverError::Blocked(reason)) => {
+                        return Err(Error::new(format!("schema control rejected: {reason}")));
+                    }
+                }
+            }
+            if !delivered {
+                return Err(Error::new("schema control retries exhausted"));
+            }
+            entry.pending = false;
+            acknowledged = true;
+        }
+        if acknowledged {
+            self.store.save_schemas(id, &self.config.instance, state)?;
+        }
+        Ok(())
+    }
+
     fn dispatch(&mut self, connector_id: &str, record: &Record) -> Result<Dispatch, Error> {
         if record.key.trim().is_empty() || record.kind.trim().is_empty() {
             self.quarantine(connector_id, record, "missing kind or key")?;
@@ -180,6 +279,7 @@ where
         let mut last_error = String::new();
         for attempt in 0..self.config.max_attempts.max(1) {
             match self.sink.deliver(record, &idk) {
+                Err(DeliverError::Blocked(reason)) => return Err(Error::new(reason)),
                 Ok(()) => return Ok(Dispatch::Delivered),
                 Err(DeliverError::Poison(reason)) => {
                     self.quarantine(connector_id, record, &reason)?;
@@ -445,6 +545,25 @@ mod tests {
     }
 
     impl<K: CheckpointStore> CheckpointStore for CrashAfter<K> {
+        fn acquire(&self, connector: &str, instance: &str) -> Result<std::fs::File, Error> {
+            self.inner.acquire(connector, instance)
+        }
+        fn load_schemas(
+            &self,
+            connector: &str,
+            instance: &str,
+        ) -> Result<crate::schema::SchemaState, Error> {
+            self.inner.load_schemas(connector, instance)
+        }
+        fn save_schemas(
+            &self,
+            connector: &str,
+            instance: &str,
+            state: &crate::schema::SchemaState,
+        ) -> Result<(), Error> {
+            self.inner.save_schemas(connector, instance, state)
+        }
+
         fn load(&self, connector: &str, instance: &str) -> Result<Option<Checkpoint>, Error> {
             self.inner.load(connector, instance)
         }

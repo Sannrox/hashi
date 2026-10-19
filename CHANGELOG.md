@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Read-only Modbus TCP and serial RTU polling with declarative maps, all four
+  data tables, integer/float decoding, independent word/byte order, scaling,
+  units, bounded batches, per-device rate limits, and failure backoff. Samples
+  spool durably until acknowledged and read failures produce bad quality (#5).
+
+- Versioned typed schema discovery, additive and lossless widening detection,
+  and durable per-kind quarantine for breaking changes. Drift control records
+  use the existing sinks and replay safely after interruption. Explicit schema
+  resolution resumes the kind; other kinds continue while it is quarantined.
+  An exclusive instance lease prevents concurrent local checkpoint writers (#10).
+
 - Pluggable sinks: JSON Lines, partitioned Apache Parquet, a file-backed
   Kafka-compatible idempotent topic log, and a versioned out-of-process
   platform SDK protocol.

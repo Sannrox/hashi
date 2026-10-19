@@ -1,6 +1,6 @@
 //! Connector runtime: check, discover, read, durable checkpoints, at-least-once delivery.
 //!
-//! Protocol connectors, schema drift, and ops surfaces live in later Issues.
+//! Protocol connectors and diagnostics are added independently.
 //! This crate owns the versioned record contract, the runtime, and pluggable
 //! sinks (JSON Lines, Parquet, Kafka-compatible, platform SDK) plus a
 //! store-and-forward buffer.
@@ -13,9 +13,11 @@ pub mod delivery;
 pub mod fake;
 pub mod jsonl;
 pub mod kafka;
+pub mod modbus;
 pub mod parquet;
 pub mod platform;
 pub mod runtime;
+pub mod schema;
 pub mod sink;
 
 pub use buffer::StoreAndForward;

@@ -111,7 +111,7 @@ pub struct CheckReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredKind {
     pub kind: String,
-    pub schema: String,
+    pub schema: crate::schema::Schema,
 }
 
 #[cfg(test)]

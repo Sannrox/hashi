@@ -166,11 +166,19 @@ impl<S: Sink> StoreAndForward<S> {
             };
             match self.inner.deliver(&record, &idk) {
                 Ok(()) => {}
+                Err(error @ DeliverError::Blocked(_)) => return Err(error),
                 Err(DeliverError::Transient(reason)) => {
                     self.compact(generation, offset).map_err(io_err)?;
                     return Err(DeliverError::Transient(reason));
                 }
                 Err(DeliverError::Poison(reason)) => {
+                    if record.kind == crate::schema::CONTROL_KIND {
+                        // A rejected transition fences every following record. Keep its cursor
+                        // unchanged so remediation can retry the exact control after restart.
+                        return Err(DeliverError::Blocked(format!(
+                            "schema control rejected: {reason}"
+                        )));
+                    }
                     // Already acked to the runtime on enqueue. Skip so a
                     // later record's deliver cannot inherit this poison.
                     self.record_poison(&record, &idk, &reason).map_err(io_err)?;
