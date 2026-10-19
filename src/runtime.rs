@@ -127,6 +127,13 @@ where
         if self.config.in_flight_limit == 0 {
             return Err(Error::new("in_flight_limit must be >= 1"));
         }
+        // Transient recover is the uplink-down case. Those records were
+        // already acked into the store-and-forward log; failing the run
+        // would stop the source snapshot. The next run drains them.
+        match self.sink.recover() {
+            Ok(()) | Err(DeliverError::Transient(_)) => {}
+            Err(DeliverError::Poison(reason)) => return Err(Error::new(reason)),
+        }
         // Sequential deliver-then-commit is a buffer of one. The next read
         // waits for the sink ack; `in_flight_limit` is the configured bound.
         loop {

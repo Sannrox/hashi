@@ -7,3 +7,4 @@ description = "Connector engine: industrial protocols and change data capture wi
 publish = false
 
 [dependencies]
+parquet = { version = "60.0.0", default-features = false }
