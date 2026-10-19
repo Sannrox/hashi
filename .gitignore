@@ -1,1 +1,4 @@
 /target
+.worktrees/
+.hashi-state/
+
