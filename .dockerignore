@@ -1,0 +1,7 @@
+.git
+.worktrees
+target
+.hashi-state
+.env*
+**/*.pem
+**/*.der

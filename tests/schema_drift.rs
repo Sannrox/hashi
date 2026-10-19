@@ -27,10 +27,12 @@ impl Connector for Fixture {
             DiscoveredKind {
                 kind: "row".into(),
                 schema: self.schema.clone(),
+                metadata: Default::default(),
             },
             DiscoveredKind {
                 kind: "other".into(),
                 schema: Schema::text(),
+                metadata: Default::default(),
             },
         ])
     }
