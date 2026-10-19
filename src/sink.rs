@@ -5,6 +5,8 @@ use crate::contract::{IdempotencyKey, Record};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliverError {
+    /// Delivery is fenced by a control decision; never quarantine a later data record.
+    Blocked(String),
     Transient(String),
     Poison(String),
 }
@@ -12,7 +14,9 @@ pub enum DeliverError {
 impl From<DeliverError> for Error {
     fn from(error: DeliverError) -> Self {
         match error {
-            DeliverError::Transient(message) | DeliverError::Poison(message) => Error::new(message),
+            DeliverError::Transient(message)
+            | DeliverError::Poison(message)
+            | DeliverError::Blocked(message) => Error::new(message),
         }
     }
 }

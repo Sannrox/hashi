@@ -33,6 +33,19 @@ pub struct QuarantineRow {
 }
 
 pub trait CheckpointStore {
+    /// Hold this exclusive lease for the entire run, including sink acknowledgements.
+    fn acquire(&self, connector: &str, instance: &str) -> Result<File, Error>;
+    fn load_schemas(
+        &self,
+        connector: &str,
+        instance: &str,
+    ) -> Result<crate::schema::SchemaState, Error>;
+    fn save_schemas(
+        &self,
+        connector: &str,
+        instance: &str,
+        state: &crate::schema::SchemaState,
+    ) -> Result<(), Error>;
     fn load(&self, connector: &str, instance: &str) -> Result<Option<Checkpoint>, Error>;
     fn commit(&self, checkpoint: &Checkpoint) -> Result<(), Error>;
     fn quarantine(&self, row: &QuarantineRow) -> Result<(), Error>;
@@ -73,6 +86,58 @@ impl FileCheckpoint {
 }
 
 impl CheckpointStore for FileCheckpoint {
+    fn acquire(&self, connector: &str, instance: &str) -> Result<File, Error> {
+        let path = self.dir.join(format!(
+            "lease-{}.{}",
+            path_token(connector),
+            path_token(instance)
+        ));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.try_lock()
+            .map_err(|error| Error::new(format!("connector instance already running: {error}")))?;
+        Ok(file)
+    }
+
+    fn load_schemas(
+        &self,
+        connector: &str,
+        instance: &str,
+    ) -> Result<crate::schema::SchemaState, Error> {
+        let path = self.dir.join(format!(
+            "schema-{}.{}.v1.json",
+            path_token(connector),
+            path_token(instance)
+        ));
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| Error::new(format!("invalid schema state: {error}"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(crate::schema::SchemaState::default())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn save_schemas(
+        &self,
+        connector: &str,
+        instance: &str,
+        state: &crate::schema::SchemaState,
+    ) -> Result<(), Error> {
+        let path = self.dir.join(format!(
+            "schema-{}.{}.v1.json",
+            path_token(connector),
+            path_token(instance)
+        ));
+        let body = serde_json::to_string(state).map_err(|error| Error::new(error.to_string()))?;
+        atomic_write(&path, &body)
+    }
+
     fn load(&self, connector: &str, instance: &str) -> Result<Option<Checkpoint>, Error> {
         let path = self.checkpoint_path(connector, instance);
         if !path.exists() {

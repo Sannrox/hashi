@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Versioned typed schema discovery, additive and lossless widening detection,
+  and durable per-kind quarantine for breaking changes. Drift control records
+  use the existing sinks and replay safely after interruption. Explicit schema
+  resolution resumes the kind; other kinds continue while it is quarantined.
+  An exclusive instance lease prevents concurrent local checkpoint writers (#10).
+
 - Pluggable sinks: JSON Lines, partitioned Apache Parquet, a file-backed
   Kafka-compatible idempotent topic log, and a versioned out-of-process
   platform SDK protocol.
