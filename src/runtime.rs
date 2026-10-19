@@ -121,6 +121,9 @@ where
             .store
             .load_schemas(&connector_id, &self.config.instance)?;
         let loaded = self.store.load(&connector_id, &self.config.instance)?;
+        let mut source_cursor = loaded
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.source_cursor.clone());
         let mut committed: Option<Position> = loaded.map(|checkpoint| checkpoint.position);
         let mut report = RunReport {
             discovered: discovered.len(),
@@ -148,13 +151,37 @@ where
             }
             let discovered = self.connector.discover()?;
             self.refresh_schemas(&connector_id, &mut schemas, &discovered)?;
-            let Some(mut record) = self.connector.read(committed)? else {
+            let Some(mut record) = self.connector.read(committed, source_cursor.as_deref())? else {
                 break;
             };
             if let Some(previous) = committed
                 && record.position <= previous
             {
                 return Err(Error::new("connector emitted a non-monotonic position"));
+            }
+            if source_cursor.is_some()
+                && record
+                    .source
+                    .as_ref()
+                    .and_then(|source| source.cursor.as_ref())
+                    .is_none()
+            {
+                return Err(Error::new("cursor-aware source omitted its next cursor"));
+            }
+            if let Some(source) = &record.source
+                && (source
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.len() > 4096)
+                    || source
+                        .change
+                        .as_ref()
+                        .and_then(|change| change.transaction_id.as_ref())
+                        .is_some_and(|id| id.len() > 1024))
+            {
+                return Err(Error::new(
+                    "source cursor or transaction id exceeds contract bounds",
+                ));
             }
             record.ingest_ts_ms = self.clock.now_ms();
             let schema = schemas.kinds.get(&record.kind);
@@ -169,20 +196,25 @@ where
             } else {
                 self.dispatch(&connector_id, &record)?
             };
+            let next_cursor = record
+                .source
+                .as_ref()
+                .and_then(|metadata| metadata.cursor.clone());
             match outcome {
                 Dispatch::Delivered => {
-                    self.commit(&connector_id, record.position)?;
+                    self.commit(&connector_id, record.position, next_cursor.clone())?;
                     committed = Some(record.position);
                     report.delivered += 1;
                     report.checkpoint = record.position;
                 }
                 Dispatch::Quarantined => {
-                    self.commit(&connector_id, record.position)?;
+                    self.commit(&connector_id, record.position, next_cursor.clone())?;
                     committed = Some(record.position);
                     report.quarantined += 1;
                     report.checkpoint = record.position;
                 }
             }
+            source_cursor = next_cursor;
         }
         Ok(report)
     }
@@ -229,6 +261,7 @@ where
                 continue;
             }
             let record = Record {
+                source: None,
                 kind: crate::schema::CONTROL_KIND.into(),
                 key: kind.clone(),
                 position: entry.event.sequence,
@@ -271,7 +304,13 @@ where
             self.quarantine(connector_id, record, "missing kind or key")?;
             return Ok(Dispatch::Quarantined);
         }
-        if record.payload.len() > self.config.max_record_bytes {
+        let before_bytes = record
+            .source
+            .as_ref()
+            .and_then(|source| source.change.as_ref())
+            .and_then(|change| change.before_image.as_ref())
+            .map_or(0, String::len);
+        if record.payload.len().saturating_add(before_bytes) > self.config.max_record_bytes {
             self.quarantine(connector_id, record, "payload exceeds max_record_bytes")?;
             return Ok(Dispatch::Quarantined);
         }
@@ -297,8 +336,14 @@ where
         )))
     }
 
-    fn commit(&self, connector_id: &str, position: Position) -> Result<(), Error> {
+    fn commit(
+        &self,
+        connector_id: &str,
+        position: Position,
+        source_cursor: Option<String>,
+    ) -> Result<(), Error> {
         self.store.commit(&Checkpoint {
+            source_cursor,
             contract_version: CONTRACT_VERSION,
             connector: connector_id.to_string(),
             instance: self.config.instance.clone(),
@@ -308,6 +353,7 @@ where
 
     fn quarantine(&self, connector_id: &str, record: &Record, reason: &str) -> Result<(), Error> {
         self.store.quarantine(&QuarantineRow {
+            source: record.source.clone(),
             connector: connector_id.to_string(),
             instance: self.config.instance.clone(),
             kind: record.kind.clone(),

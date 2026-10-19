@@ -5,9 +5,10 @@ use crate::contract::{IdempotencyKey, Record};
 use crate::sink::{DeliverError, Sink};
 
 /// Protocol name carried on every frame so a peer can refuse a mismatch.
-pub const PLATFORM_SINK_PROTOCOL: &str = "hashi.sink.v1";
+pub const PLATFORM_SINK_PROTOCOL: &str = "hashi.sink.v2";
+const LEGACY_PROTOCOL: &str = "hashi.sink.v1";
 const MAGIC: &[u8; 4] = b"HSK1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 pub trait PlatformPeer {
     fn exchange(&mut self, frame: &[u8]) -> Result<(), DeliverError>;
@@ -75,8 +76,16 @@ impl<P: PlatformPeer> Sink for PlatformSdkSink<P> {
 pub fn encode_frame(record: &Record, idk: &IdempotencyKey) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&VERSION.to_le_bytes());
-    put_str(&mut buf, PLATFORM_SINK_PROTOCOL);
+    let version = if record.source.is_some() { VERSION } else { 1 };
+    buf.extend_from_slice(&version.to_le_bytes());
+    put_str(
+        &mut buf,
+        if version == 1 {
+            LEGACY_PROTOCOL
+        } else {
+            PLATFORM_SINK_PROTOCOL
+        },
+    );
     put_str(&mut buf, &idk.encode());
     put_str(&mut buf, &record.kind);
     put_str(&mut buf, &record.key);
@@ -91,6 +100,9 @@ pub fn encode_frame(record: &Record, idk: &IdempotencyKey) -> Vec<u8> {
     }
     buf.extend_from_slice(&record.position.to_le_bytes());
     put_str(&mut buf, &record.payload);
+    if let Some(source) = &record.source {
+        put_str(&mut buf, &serde_json::json!(source).to_string());
+    }
     buf
 }
 
@@ -98,13 +110,19 @@ pub fn decode_frame(frame: &[u8]) -> Result<(Record, IdempotencyKey), Error> {
     let mut cur = frame;
     cur = take_magic(cur)?;
     let version = take_u32(&mut cur)?;
-    if version != VERSION {
+    if version != 1 && version != VERSION {
         return Err(Error::new(format!(
             "unsupported platform sink protocol {version}"
         )));
     }
     let protocol = take_str(&mut cur)?;
-    if protocol != PLATFORM_SINK_PROTOCOL {
+    if protocol
+        != if version == 1 {
+            LEGACY_PROTOCOL
+        } else {
+            PLATFORM_SINK_PROTOCOL
+        }
+    {
         return Err(Error::new("unsupported platform sink protocol"));
     }
     let idk = IdempotencyKey::decode(&take_str(&mut cur)?)?;
@@ -119,11 +137,20 @@ pub fn decode_frame(frame: &[u8]) -> Result<(Record, IdempotencyKey), Error> {
     };
     let position = take_u64(&mut cur)?;
     let payload = take_str(&mut cur)?;
+    let source = if version == 2 {
+        Some(
+            serde_json::from_str(&take_str(&mut cur)?)
+                .map_err(|_| Error::new("invalid source metadata"))?,
+        )
+    } else {
+        None
+    };
     if !cur.is_empty() {
         return Err(Error::new("platform frame is unreadable"));
     }
     Ok((
         Record {
+            source,
             kind,
             key,
             source_ts_ms,

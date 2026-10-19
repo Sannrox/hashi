@@ -1,7 +1,7 @@
 //! Versioned connector contract. Connectors and consumers upgrade independently.
 
 /// Contract revision carried on every persisted checkpoint and quarantine row.
-pub const CONTRACT_VERSION: u32 = 1;
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// Monotonic read position inside one connector instance.
 pub type Position = u64;
@@ -10,6 +10,7 @@ pub type Position = u64;
 /// to objects, markings, or Actions is the consumer's job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
+    pub source: Option<SourceMetadata>,
     pub kind: String,
     pub key: String,
     pub source_ts_ms: i64,
@@ -17,6 +18,34 @@ pub struct Record {
     pub quality: Option<String>,
     pub position: Position,
     pub payload: String,
+}
+
+/// Connector-owned cursor and optional source-neutral change information.
+/// Cursors are opaque; the runtime neither compares nor parses them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceMetadata {
+    pub cursor: Option<String>,
+    pub change: Option<Change>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    Insert,
+    Update,
+    Delete,
+    TransactionBegin,
+    TransactionEnd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Change {
+    pub operation: Operation,
+    pub before_image: Option<String>,
+    pub transaction_id: Option<String>,
+    pub commit_ts_ms: Option<i64>,
 }
 
 impl Record {
@@ -123,6 +152,7 @@ mod tests {
     #[test]
     fn idempotency_key_binds_connector_instance_kind_key_and_position() {
         let record = Record {
+            source: None,
             kind: "tag".into(),
             key: "pump-1".into(),
             source_ts_ms: 10,

@@ -82,7 +82,11 @@ impl Connector for FakeSource {
         Ok(self.kinds.clone())
     }
 
-    fn read(&mut self, from: Option<Position>) -> Result<Option<Record>, Error> {
+    fn read(
+        &mut self,
+        from: Option<Position>,
+        _source_cursor: Option<&str>,
+    ) -> Result<Option<Record>, Error> {
         if !self.credential_ok {
             return Err(Error::new("read refused: check failed"));
         }
@@ -116,6 +120,7 @@ fn unique_kinds(records: &[Record]) -> Vec<DiscoveredKind> {
 
 pub fn record(kind: &str, key: &str, position: Position, payload: &str) -> Record {
     Record {
+        source: None,
         kind: kind.into(),
         key: key.into(),
         source_ts_ms: position as i64 * 10,

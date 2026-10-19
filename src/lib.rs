@@ -26,7 +26,8 @@ pub use buffer::StoreAndForward;
 pub use checkpoint::{Checkpoint, CheckpointStore, FileCheckpoint, QuarantineRow};
 pub use connector::Connector;
 pub use contract::{
-    CONTRACT_VERSION, CheckReport, DiscoveredKind, IdempotencyKey, Position, Record,
+    CONTRACT_VERSION, Change, CheckReport, DiscoveredKind, IdempotencyKey, Operation, Position,
+    Record, SourceMetadata,
 };
 pub use fake::FakeSource;
 pub use jsonl::JsonLinesSink;

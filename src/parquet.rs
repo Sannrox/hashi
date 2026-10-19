@@ -86,7 +86,13 @@ impl Sink for ParquetSink {
 }
 
 fn write_parquet(path: &Path, rows: &[(Record, IdempotencyKey)]) -> Result<(), Error> {
-    let schema = Arc::new(parse_message_type(SCHEMA).map_err(pq_err)?);
+    let extended = rows.iter().any(|(record, _)| record.source.is_some());
+    let schema_text = if extended {
+        SCHEMA.replacen("REQUIRED BYTE_ARRAY idempotency_key (UTF8);", "REQUIRED BYTE_ARRAY idempotency_key (UTF8); OPTIONAL BYTE_ARRAY source_metadata (UTF8);", 1)
+    } else {
+        SCHEMA.to_string()
+    };
+    let schema = Arc::new(parse_message_type(&schema_text).map_err(pq_err)?);
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     let file = File::create(&tmp)?;
     let mut writer = SerializedFileWriter::new(file, schema, Default::default()).map_err(pq_err)?;
@@ -151,6 +157,21 @@ fn write_parquet(path: &Path, rows: &[(Record, IdempotencyKey)]) -> Result<(), E
         None,
     )?;
 
+    if extended {
+        let mut values = Vec::new();
+        let mut levels = Vec::new();
+        for (record, _) in rows {
+            if let Some(source) = &record.source {
+                levels.push(1);
+                values.push(ByteArray::from(
+                    serde_json::json!(source).to_string().as_str(),
+                ));
+            } else {
+                levels.push(0);
+            }
+        }
+        write_bytes(&mut row_group, values, Some(&levels))?;
+    }
     row_group.close().map_err(pq_err)?;
     writer.close().map_err(pq_err)?;
     let completed = File::open(&tmp)?;
@@ -205,7 +226,22 @@ fn read_parquet(path: &Path) -> Result<Vec<(Record, IdempotencyKey)>, Error> {
         } else {
             Some(row.get_string(4).map_err(pq_err)?.clone())
         };
+        let source = if row.len() == 8 {
+            None
+        } else if row.len() == 9 {
+            if row.is_null(8).map_err(pq_err)? {
+                None
+            } else {
+                Some(
+                    serde_json::from_str(row.get_string(8).map_err(pq_err)?)
+                        .map_err(|_| Error::new("invalid Parquet source metadata"))?,
+                )
+            }
+        } else {
+            return Err(Error::new("unsupported Parquet record columns"));
+        };
         let record = Record {
+            source,
             kind: row.get_string(0).map_err(pq_err)?.clone(),
             key: row.get_string(1).map_err(pq_err)?.clone(),
             source_ts_ms: row.get_long(2).map_err(pq_err)?,

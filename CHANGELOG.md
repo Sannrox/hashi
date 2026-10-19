@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Contract v2 commits an opaque source cursor with each order position and
+  carries optional change operations, before images, transaction ids, and
+  commit times through every sink and quarantine. V1 state remains readable;
+  records without source metadata retain their previous encodings (#19).
+
 - Optional OPC UA secure session and bounded address-space discovery. Explicit
   application trust stores reject and retain unknown certificates; username
   and X.509 user authentication support the three modern security policies.
