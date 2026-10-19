@@ -58,6 +58,48 @@ impl IdempotencyKey {
             self.position
         )
     }
+
+    pub fn decode(encoded: &str) -> Result<Self, crate::Error> {
+        let (connector, rest) = take_len_field(encoded)?;
+        let (instance, rest) = take_len_field(rest)?;
+        let (record_kind, rest) = take_len_field(rest)?;
+        let (key, rest) = take_len_field(rest)?;
+        let position = rest
+            .parse()
+            .map_err(|error: std::num::ParseIntError| crate::Error::new(error.to_string()))?;
+        Ok(Self {
+            connector,
+            instance,
+            record_kind,
+            key,
+            position,
+        })
+    }
+}
+
+fn take_len_field(input: &str) -> Result<(String, &str), crate::Error> {
+    let colon = input
+        .find(':')
+        .ok_or_else(|| crate::Error::new("idempotency key is unreadable"))?;
+    let len: usize = input[..colon]
+        .parse()
+        .map_err(|error: std::num::ParseIntError| crate::Error::new(error.to_string()))?;
+    let start = colon + 1;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| crate::Error::new("idempotency key is unreadable"))?;
+    if end > input.len() {
+        return Err(crate::Error::new("idempotency key is unreadable"));
+    }
+    let value = input
+        .get(start..end)
+        .ok_or_else(|| crate::Error::new("idempotency key is unreadable"))?
+        .to_string();
+    let rest = &input[end..];
+    match rest.strip_prefix('/') {
+        Some(rest) => Ok((value, rest)),
+        None => Err(crate::Error::new("idempotency key is unreadable")),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,5 +134,11 @@ mod tests {
         let slash_instance = record.idempotency_key("a", "b/c");
         let slash_connector = record.idempotency_key("a/b", "c");
         assert_ne!(slash_instance.encode(), slash_connector.encode());
+        assert_eq!(IdempotencyKey::decode(&key.encode()).unwrap(), key);
+        assert_eq!(
+            IdempotencyKey::decode(&slash_instance.encode()).unwrap(),
+            slash_instance
+        );
+        assert!(IdempotencyKey::decode("1:é/0").is_err());
     }
 }

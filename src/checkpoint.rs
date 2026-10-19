@@ -226,7 +226,7 @@ fn parse_quarantine(line: &str) -> Result<QuarantineRow, Error> {
     })
 }
 
-fn repair_log_tail(path: &Path) -> Result<(), Error> {
+pub(crate) fn repair_log_tail(path: &Path) -> Result<(), Error> {
     if !path.exists() {
         return Ok(());
     }
@@ -250,7 +250,7 @@ fn repair_log_tail(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn path_token(value: &str) -> String {
+pub(crate) fn path_token(value: &str) -> String {
     let mut out = String::with_capacity(value.len() * 2);
     for byte in value.bytes() {
         out.push_str(&format!("{byte:02X}"));
@@ -258,7 +258,7 @@ fn path_token(value: &str) -> String {
     out
 }
 
-fn escape_field(value: &str) -> String {
+pub(crate) fn escape_field(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
         match ch {
@@ -272,7 +272,7 @@ fn escape_field(value: &str) -> String {
     out
 }
 
-fn unescape_field(value: &str) -> Result<String, Error> {
+pub(crate) fn unescape_field(value: &str) -> Result<String, Error> {
     let mut out = String::new();
     let mut chars = value.chars();
     while let Some(ch) = chars.next() {
@@ -291,7 +291,7 @@ fn unescape_field(value: &str) -> Result<String, Error> {
     Ok(out)
 }
 
-fn atomic_write(path: &Path, body: &str) -> Result<(), Error> {
+pub(crate) fn atomic_write(path: &Path, body: &str) -> Result<(), Error> {
     let tmp = path.with_extension(format!(
         "tmp-{}-{}",
         std::process::id(),
@@ -308,7 +308,7 @@ fn atomic_write(path: &Path, body: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn sync_dir(dir: &Path) -> Result<(), Error> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), Error> {
     File::open(dir)?.sync_all()?;
     Ok(())
 }

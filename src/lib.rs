@@ -1,22 +1,34 @@
 //! Connector runtime: check, discover, read, durable checkpoints, at-least-once delivery.
 //!
-//! Protocol connectors, pluggable production sinks, schema drift, and ops
-//! surfaces live in later Issues. This crate owns the versioned record
-//! contract and the runtime that drives a connector against a sink.
+//! Protocol connectors, schema drift, and ops surfaces live in later Issues.
+//! This crate owns the versioned record contract, the runtime, and pluggable
+//! sinks (JSON Lines, Parquet, Kafka-compatible, platform SDK) plus a
+//! store-and-forward buffer.
 
+pub mod buffer;
 pub mod checkpoint;
 pub mod connector;
 pub mod contract;
+pub mod delivery;
 pub mod fake;
+pub mod jsonl;
+pub mod kafka;
+pub mod parquet;
+pub mod platform;
 pub mod runtime;
 pub mod sink;
 
+pub use buffer::StoreAndForward;
 pub use checkpoint::{Checkpoint, CheckpointStore, FileCheckpoint, QuarantineRow};
 pub use connector::Connector;
 pub use contract::{
     CONTRACT_VERSION, CheckReport, DiscoveredKind, IdempotencyKey, Position, Record,
 };
 pub use fake::FakeSource;
+pub use jsonl::JsonLinesSink;
+pub use kafka::KafkaCompatibleSink;
+pub use parquet::ParquetSink;
+pub use platform::{CapturePeer, PLATFORM_SINK_PROTOCOL, PlatformPeer, PlatformSdkSink};
 pub use runtime::{NullClock, RunReport, Runtime, RuntimeConfig, SystemClock};
 pub use sink::{DeliverError, MemorySink, Sink};
 
