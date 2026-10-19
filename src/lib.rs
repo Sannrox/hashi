@@ -13,6 +13,7 @@ pub mod delivery;
 pub mod fake;
 pub mod jsonl;
 pub mod kafka;
+pub mod modbus;
 pub mod parquet;
 pub mod platform;
 pub mod runtime;
