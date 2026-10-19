@@ -112,6 +112,8 @@ pub struct CheckReport {
 pub struct DiscoveredKind {
     pub kind: String,
     pub schema: crate::schema::Schema,
+    /// Source-owned descriptive hints, never authority or payload schema.
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 #[cfg(test)]

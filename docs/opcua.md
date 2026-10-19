@@ -1,0 +1,104 @@
+# OPC UA sessions and discovery
+
+Enable the `opcua` Cargo feature to use `opcua::OpcUaConnector::connect(Config)`.
+The async-opcua 0.19 client supplies framing, secure channels, certificate
+validation, and services. Hashi owns policy selection, bounds, lifecycle, and
+the connector contract. The server stack is only for `opcua-simulator` fixtures.
+
+## Configure a session
+
+Supply a stable id, endpoint, application URI, PKI directory, authentication,
+object-container roots, nonzero schema revision, node limit, and timeout:
+
+```rust,ignore
+let config = Config {
+    id: "equipment".into(),
+    endpoint,
+    application_uri: "urn:hashi:equipment".into(),
+    pki_dir,
+    policy: Policy::Basic256Sha256,
+    allow_insecure_lab: false,
+    authentication: Authentication::UserName { user, password },
+    roots: vec![opcua::types::ObjectId::ObjectsFolder.into()],
+    max_nodes: 1000,
+    timeout: Duration::from_secs(10),
+    schema_version: 1,
+};
+```
+
+Obtain credentials from the embedding application's credential custody. X.509
+user authentication instead supplies `Authentication::X509 { certificate,
+private_key }`; these paths identify the user's certificate and key, separately
+from the application's certificate.
+
+Select Basic256Sha256, Aes128Sha256RsaOaep, or Aes256Sha256RsaPss. All require
+SignAndEncrypt and an exact endpoint match. None requires the explicit
+`allow_insecure_lab` flag; reserve it for disposable fixtures. No policy
+fallback or automatic trust is enabled. The selected URL, including its port,
+must match the configured URL before the session starts. Original discovery
+descriptions are filtered before session construction, without hostname rewrites. Userinfo, queries,
+and fragments are refused in endpoint configuration.
+
+The adapter owns a two-thread runtime. Call its synchronous APIs from a
+dedicated OS thread when embedding in an async application. Runtime-attached
+calls, including runtime blocking-pool tasks, are rejected before IO. `check` reports connected session state.
+Drop stops reconnects and performs bounded shutdown. `read` returns None;
+subscriptions, history, and value collection are separate work.
+
+## Provision and approve certificates
+
+Provision the application certificate as `own/cert.der` and private key as
+`private/private.pem` inside the configured PKI directory. Issue them with your
+certificate tooling: the certificate must bind the configured application URI,
+use an appropriate RSA key and validity interval, and contain applicable host
+names. Restrict private-key permissions to the connector owner. The connector
+requires these files and never generates sample keys. The server must also
+trust the client's application certificate.
+
+Use a distinct PKI directory per connector instance; an exclusive OS file lock
+prevents concurrent mutation. Unknown server certificates are refused and kept
+in `rejected/`. After independent fingerprint and scope review, move the
+approved certificate from `rejected/` into `trusted/`, keeping the filename
+computed by `CertificateStore::cert_file_name`. An arbitrary filename does not
+establish trust. A duplicate left in `rejected/` continues to deny the
+certificate even if another copy is trusted. Reconnect after approval.
+Hostname, application URI, validity, and key checks remain enabled. Connector
+diagnostics omit credentials and raw protocol errors.
+
+## Discovery bounds
+
+Roots must be Object containers; variable roots fail explicitly. Expanded
+node ids on the current server may use namespace URIs: these resolve through
+the session namespace map. References to another server are refused.
+Discovery follows hierarchical references and continuation pages, deduplicates
+cycles, and enforces total time, message, node count, and browse-path limits.
+Any failure or timeout closes the session to release outstanding server
+continuations, including tokens hidden by a cancelled response. Reconnect
+before retrying discovery.
+
+Each kind has a normalized `value` schema plus descriptive metadata: resolved
+node id, browse path, raw data-type id, value rank, and optional engineering
+units. Arrays use an opaque byte schema rather than a scalar type. Unknown or
+custom scalar types and UInt64 use text. Later readers must preserve the raw
+metadata when normalizing those values. A declared but unreadable or malformed
+namespace-zero EngineeringUnits property reached through HasProperty fails
+discovery. Application-defined children with similar names remain ordinary
+nodes. Increment the source revision when
+its payload schema changes.
+
+## Simulator conformance
+
+```sh
+CARGO_TARGET_DIR="$PWD/target" cargo test --locked --features opcua-simulator --test opcua_discovery
+bash scripts/test-opcua-container.sh
+```
+
+The shared fixture is `examples/support/opcua_simulator.rs`. Each run generates
+disposable keys in a unique temporary directory and binds port 0. It checks
+rejected-certificate retention and explicit trust, three secure policies,
+username and X.509 users, lab-only None, local namespace URI resolution,
+metadata, and discovery bounds. No private keys are checked in.
+
+The container harness runs the same client/server fixture with `--network none`,
+a unique image tag, and no host ports or state mounts, then removes its image.
+This proves protocol behavior, not equipment interoperability.

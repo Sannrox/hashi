@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Optional OPC UA secure session and bounded address-space discovery. Explicit
+  application trust stores reject and retain unknown certificates; username
+  and X.509 user authentication support the three modern security policies.
+  Policy None requires an explicit lab flag. Discovery includes node ids,
+  browse paths, raw data types, value rank, and engineering units. A shared
+  simulator fixture runs natively and in an isolated container (#16).
+
 - Read-only Modbus TCP and serial RTU polling with declarative maps, all four
   data tables, integer/float decoding, independent word/byte order, scaling,
   units, bounded batches, per-device rate limits, and failure backoff. Samples

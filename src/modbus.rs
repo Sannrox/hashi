@@ -607,6 +607,7 @@ impl<T: Transport, C: Clock> Connector for ModbusConnector<T, C> {
             .flat_map(|d| &d.groups)
             .map(|g| DiscoveredKind {
                 kind: g.kind.clone(),
+                metadata: Default::default(),
                 schema: Schema {
                     version: g.schema_version,
                     key_fields: vec![],

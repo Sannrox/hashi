@@ -10,7 +10,8 @@ under `docs/decisions/` before changing system boundaries.
 
 - `cargo fmt` formats Rust code before review.
 - `cargo test` runs the test suite.
-- `cargo clippy --all-targets --locked -- -D warnings` matches CI.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings` matches CI.
+- `make test-integration` includes optional protocol features and simulator fixtures.
 - `make validate`, `make test` and `make test-integration` are the local gates.
 
 GitHub Issues are the planning source of truth. Project-specific Skills live
