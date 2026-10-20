@@ -1,8 +1,10 @@
-//! Secure OPC UA sessions and bounded discovery. No value collection or writes.
+//! Secure OPC UA sessions, bounded discovery, and durable subscription reads.
+mod subscription;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+pub use subscription::SubscriptionConfig;
 
 use crate::contract::{CheckReport, DiscoveredKind, Position, Record};
 use crate::schema::{FieldType, Schema};
@@ -67,12 +69,30 @@ pub struct OpcUaConnector {
     max_nodes: usize,
     timeout: Duration,
     schema_version: u64,
+    subscription: Option<subscription::Reader>,
     _pki_lease: std::fs::File,
 }
 impl OpcUaConnector {
     /// Synchronous embedding API. Use a dedicated OS thread when called by an async host.
     /// Runtime-attached calls are rejected before IO to keep nested runtimes out of this adapter.
     pub fn connect(config: Config) -> Result<Self, Error> {
+        Self::connect_inner(config, false)
+    }
+
+    /// Starts a source with an explicit monitored-node set and a durable replay spool.
+    pub fn subscribe(config: Config, subscription: SubscriptionConfig) -> Result<Self, Error> {
+        subscription.validate()?;
+        let mut connector = Self::connect_inner(config, true)?;
+        let runtime = connector
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Error::new("OPC UA runtime closed"))?;
+        let reader = runtime.block_on(subscription::Reader::open(&connector, subscription))?;
+        connector.subscription = Some(reader);
+        Ok(connector)
+    }
+
+    fn connect_inner(config: Config, reconnect: bool) -> Result<Self, Error> {
         if matches!(config.policy, Policy::None) && !config.allow_insecure_lab {
             return Err(Error::new("OPC UA policy None requires allow_insecure_lab"));
         }
@@ -127,7 +147,8 @@ impl OpcUaConnector {
             .create_sample_keypair(false)
             .trust_server_certs(false)
             .verify_server_certs(true)
-            .session_retry_limit(0)
+            .session_retry_limit(if reconnect { -1 } else { 0 })
+            .recreate_subscriptions(false)
             .request_timeout(config.timeout)
             .max_array_length(10000)
             .max_string_length(65536)
@@ -161,7 +182,9 @@ impl OpcUaConnector {
         let (session, event_loop) = client
             .connect_to_endpoint_directly(endpoint, token)
             .map_err(|_| Error::new("OPC UA session configuration failed"))?;
-        session.disable_reconnects();
+        if !reconnect {
+            session.disable_reconnects();
+        }
         let event_loop = {
             let _entered = runtime.enter();
             event_loop.spawn()
@@ -176,6 +199,7 @@ impl OpcUaConnector {
             ));
         }
         Ok(Self {
+            subscription: None,
             id: config.id,
             session,
             event_loop,
@@ -485,7 +509,11 @@ impl Connector for OpcUaConnector {
             .runtime
             .as_ref()
             .ok_or_else(|| Error::new("OPC UA runtime closed"))?;
-        let good = !self.event_loop.is_finished()
+        let good = self
+            .subscription
+            .as_ref()
+            .is_none_or(|reader| reader.healthy())
+            && !self.event_loop.is_finished()
             && runtime
                 .block_on(async {
                     tokio::time::timeout(self.timeout, self.session.wait_for_connection()).await
@@ -511,6 +539,9 @@ impl Connector for OpcUaConnector {
             .runtime
             .as_ref()
             .ok_or_else(|| Error::new("OPC UA runtime closed"))?;
+        if let Some(reader) = &self.subscription {
+            return Ok(reader.kinds.clone());
+        }
         runtime.block_on(async {
             let result = tokio::time::timeout(self.timeout, self.discover_inner())
                 .await
@@ -526,12 +557,20 @@ impl Connector for OpcUaConnector {
             result
         })
     }
-    fn read(
-        &mut self,
-        _: Option<Position>,
-        _source_cursor: Option<&str>,
-    ) -> Result<Option<Record>, Error> {
-        Ok(None)
+    fn read(&mut self, from: Option<Position>, _: Option<&str>) -> Result<Option<Record>, Error> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(Error::new(
+                "call OPC UA synchronous API outside an async runtime",
+            ));
+        }
+        let Some(reader) = self.subscription.as_mut() else {
+            return Ok(None);
+        };
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Error::new("OPC UA runtime closed"))?;
+        runtime.block_on(reader.read(&self.session, from, self.timeout))
     }
 }
 impl Drop for OpcUaConnector {

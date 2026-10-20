@@ -58,6 +58,9 @@ pub struct Simulator {
 }
 impl Simulator {
     pub fn start(dir: &Path, host: &str, port: u16) -> Self {
+        Self::start_with_nodes(dir, host, port, 0)
+    }
+    pub fn start_with_nodes(dir: &Path, host: &str, port: u16, count: usize) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -69,7 +72,10 @@ impl Simulator {
         let port = listener.local_addr().unwrap().port();
         let endpoint = format!("opc.tcp://127.0.0.1:{port}/");
         let entered = runtime.enter();
+        let mut limits = opcua::server::Limits::default();
+        limits.subscriptions.max_monitored_items_per_sub = count.max(1000);
         let mut builder = ServerBuilder::new()
+            .limits(limits)
             .application_name("Hashi simulator")
             .application_uri(SERVER_URI)
             .product_uri("urn:hashi:simulator-product")
@@ -194,6 +200,43 @@ impl Simulator {
                 .insert(&mut *space)
             );
         }
+        {
+            let mut space = manager.address_space().write();
+            for (name, data_type, value) in [
+                ("Duration", DataTypeId::Duration, Variant::Double(5.0)),
+                ("Counter", DataTypeId::UInt64, Variant::UInt64(u64::MAX)),
+            ] {
+                assert!(
+                    VariableBuilder::new(
+                        &NodeId::new(ns, name),
+                        opcua::types::QualifiedName::new(ns, name),
+                        name
+                    )
+                    .data_type(data_type)
+                    .value(value)
+                    .access_level(AccessLevel::CURRENT_READ)
+                    .user_access_level(AccessLevel::CURRENT_READ)
+                    .organized_by(root.clone())
+                    .insert(&mut *space)
+                );
+            }
+            for index in 0..count {
+                let name = format!("Sample{index}");
+                assert!(
+                    VariableBuilder::new(
+                        &NodeId::new(ns, name.clone()),
+                        opcua::types::QualifiedName::new(ns, name.clone()),
+                        name
+                    )
+                    .data_type(DataTypeId::Double)
+                    .value(index as f64)
+                    .access_level(AccessLevel::CURRENT_READ)
+                    .user_access_level(AccessLevel::CURRENT_READ)
+                    .organized_by(root.clone())
+                    .insert(&mut *space)
+                );
+            }
+        }
         runtime.spawn(server.run_with(listener));
         drop(entered);
         Self {
@@ -203,6 +246,56 @@ impl Simulator {
             handle,
             _runtime: runtime,
         }
+    }
+    #[allow(dead_code)]
+    pub fn update_samples(&self, count: usize) {
+        let timestamp = opcua::types::DateTime::now();
+        let nodes: Vec<_> = (0..count)
+            .map(|index| NodeId::new(self.value.namespace, format!("Sample{index}")))
+            .collect();
+        self.handle
+            .node_managers()
+            .get_of_type::<SimpleNodeManager>()
+            .unwrap()
+            .set_values(
+                self.handle.subscriptions(),
+                nodes.iter().enumerate().map(|(index, node)| {
+                    (
+                        node,
+                        None,
+                        opcua::types::DataValue {
+                            value: Some((100_000.0 + index as f64).into()),
+                            source_timestamp: Some(timestamp),
+                            ..Default::default()
+                        },
+                    )
+                }),
+            )
+            .unwrap();
+    }
+    #[allow(dead_code)]
+    pub fn set_value(
+        &self,
+        value: f64,
+        status: opcua::types::StatusCode,
+        timestamp: opcua::types::DateTime,
+    ) {
+        self.handle
+            .node_managers()
+            .get_of_type::<SimpleNodeManager>()
+            .unwrap()
+            .set_value(
+                self.handle.subscriptions(),
+                &self.value,
+                None,
+                opcua::types::DataValue {
+                    value: Some(value.into()),
+                    status: Some(status),
+                    source_timestamp: Some(timestamp),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
     }
 }
 impl Drop for Simulator {

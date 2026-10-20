@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add durable OPC UA monitored-item reads with sampling, absolute deadband, status quality, reconnect recovery, and a 10,000-item simulator measurement.
+
 - Contract v2 commits an opaque source cursor with each order position and
   carries optional change operations, before images, transaction ids, and
   commit times through every sink and quarantine. V1 state remains readable;
