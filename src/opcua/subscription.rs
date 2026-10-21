@@ -56,10 +56,20 @@ pub(super) struct Reader {
     ack: Vec<SubscriptionAcknowledgement>,
     fingerprint: String,
     failed: bool,
+    history: Option<history::History>,
+    needs_history: bool,
+    requires_full_history: bool,
     _lease: std::fs::File,
 }
 impl Reader {
-    pub async fn open(source: &OpcUaConnector, config: SubscriptionConfig) -> Result<Self, Error> {
+    pub async fn open(
+        source: &OpcUaConnector,
+        config: SubscriptionConfig,
+        history: Option<HistoryConfig>,
+    ) -> Result<Self, Error> {
+        let mut history = history
+            .map(|history| history::History::new(history, config.nodes.len()))
+            .transpose()?;
         std::fs::create_dir_all(&config.state_dir)?;
         let lease = std::fs::OpenOptions::new()
             .create(true)
@@ -71,7 +81,7 @@ impl Reader {
             .try_lock()
             .map_err(|_| Error::new("OPC UA subscription spool is already owned"))?;
         let kinds = inspect_kinds(&source.session, &config.nodes, source.schema_version).await?;
-        let fingerprint = serde_json::json!([
+        let mut fingerprint = serde_json::json!([
             source.id,
             source
                 .session
@@ -90,10 +100,17 @@ impl Reader {
             config.queue_size,
             source.schema_version,
             kinds.iter().map(|kind| &kind.metadata).collect::<Vec<_>>()
-        ])
-        .to_string();
-        let (high_water, pending) =
-            recover(&config.state_dir, &fingerprint, config.max_pending_bytes)?;
+        ]);
+        if let (Some(parts), Some(history)) = (fingerprint.as_array_mut(), &history) {
+            parts.push(serde_json::json!(history.fingerprint()));
+        }
+        let fingerprint = fingerprint.to_string();
+        let (high_water, pending) = recover(
+            &config.state_dir,
+            &fingerprint,
+            config.max_pending_bytes,
+            &mut history,
+        )?;
         let mut reader = Self {
             config,
             kinds,
@@ -105,6 +122,9 @@ impl Reader {
             ack: Vec::new(),
             fingerprint,
             failed: false,
+            needs_history: history.is_some(),
+            requires_full_history: history.is_some() && high_water > 0,
+            history,
             _lease: lease,
         };
         reader.create(&source.session).await?;
@@ -113,6 +133,7 @@ impl Reader {
 
     async fn create(&mut self, session: &Session) -> Result<(), Error> {
         if self.subscription_id != 0 {
+            self.requires_full_history = self.history.is_some();
             let revision = self.kinds[0].schema.version;
             let current = inspect_kinds(session, &self.config.nodes, revision).await?;
             if current != self.kinds {
@@ -191,13 +212,36 @@ impl Reader {
 
     fn persist(&self) -> Result<(), Error> {
         let mut text = format!("{}\n{}\n", self.fingerprint, self.high_water);
+        if let Some(history) = &self.history {
+            text.push_str(
+                &serde_json::to_string(history)
+                    .map_err(|_| Error::new("OPC UA history state encoding failed"))?,
+            );
+            text.push('\n');
+        }
         for record in &self.pending {
             text.push_str(&crate::delivery::encode(
                 record,
                 &record.idempotency_key("opcua", "spool"),
             ));
         }
+        if text.len()
+            > self
+                .config
+                .max_pending_bytes
+                .saturating_mul(if self.history.is_some() { 4 } else { 1 })
+                .saturating_add(self.fingerprint.len())
+                .saturating_add(64)
+        {
+            return Err(Error::new(
+                "OPC UA receipt and history state exceed configured bound",
+            ));
+        }
         crate::checkpoint::atomic_write(&self.config.state_dir.join("opcua.pending.v1"), &text)
+    }
+
+    pub fn history_notice(&self) -> Option<String> {
+        self.history.as_ref().and_then(|history| history.notice())
     }
 
     pub fn healthy(&self) -> bool {
@@ -241,14 +285,59 @@ impl Reader {
             return Ok(Some(record.clone()));
         }
         loop {
-            if let Err(error) = self.collect(session, timeout).await {
+            let collected = if self.history.is_some() {
+                tokio::time::timeout(
+                    timeout.max(self.publish_timeout),
+                    self.collect(session, timeout),
+                )
+                .await
+                .map_err(|_| Error::new("OPC UA history recovery timed out"))
+                .and_then(|result| result)
+            } else {
+                self.collect(session, timeout).await
+            };
+            if let Err(error) = collected {
                 self.failed = true;
                 return Err(error);
             }
             if let Some(record) = self.pending.front() {
                 return Ok(Some(record.clone()));
             }
+            if self.history.is_some() {
+                return Ok(None);
+            }
         }
+    }
+
+    async fn fill_history(&mut self, session: &Session) -> Result<(), Error> {
+        let history = self
+            .history
+            .as_mut()
+            .ok_or_else(|| Error::new("OPC UA history unavailable"))?;
+        let records = history
+            .collect(
+                session,
+                &self.config.nodes,
+                &self.kinds,
+                self.config.max_pending_bytes,
+            )
+            .await?;
+        if self.requires_full_history && !history.covers_all_nodes() {
+            return Err(Error::new(
+                "OPC UA replaced subscription includes nodes without history; explicit gap recovery required",
+            ));
+        }
+        self.requires_full_history = false;
+        for mut record in records {
+            self.high_water = self
+                .high_water
+                .checked_add(1)
+                .ok_or_else(|| Error::new("OPC UA position exhausted"))?;
+            record.position = self.high_water;
+            self.pending.push_back(record);
+        }
+        self.needs_history = false;
+        Ok(())
     }
 
     async fn collect(&mut self, session: &Session, timeout: Duration) -> Result<(), Error> {
@@ -260,6 +349,7 @@ impl Reader {
         {
             Ok(response) => response,
             Err(_) => {
+                self.needs_history = self.history.is_some();
                 if !tokio::time::timeout(timeout, session.wait_for_connection())
                     .await
                     .is_ok_and(|v| v)
@@ -309,6 +399,9 @@ impl Reader {
                 }
             }
         };
+        if self.needs_history {
+            self.fill_history(session).await?;
+        }
         if response.subscription_id != self.subscription_id {
             return Err(Error::new("OPC UA unexpected subscription response"));
         }
@@ -328,11 +421,25 @@ impl Reader {
             if *sequence != response.notification_message.sequence_number
                 && !self.ack.iter().any(|ack| ack.sequence_number == *sequence)
             {
-                let message = Republish::new(self.subscription_id, *sequence, session)
+                match Republish::new(self.subscription_id, *sequence, session)
                     .send(session.channel())
                     .await
-                    .map_err(|_| Error::new("OPC UA notification recovery unavailable"))?;
-                messages.push(message.notification_message);
+                {
+                    Ok(message) => messages.push(message.notification_message),
+                    Err(_) if self.history.is_some() => {
+                        self.fill_history(session).await?;
+                        if !self
+                            .history
+                            .as_ref()
+                            .is_some_and(|history| history.covers_all_nodes())
+                        {
+                            return Err(Error::new(
+                                "OPC UA notification gap includes nodes without history",
+                            ));
+                        }
+                    }
+                    Err(_) => return Err(Error::new("OPC UA notification recovery unavailable")),
+                }
             }
         }
         if !self
@@ -344,6 +451,23 @@ impl Reader {
         }
         self.ack
             .retain(|ack| available.contains(&ack.sequence_number));
+        if self.history.is_some()
+            && messages.iter().any(|message| {
+                message.notification_data.iter().flatten().any(|object| {
+                    object
+                        .inner_as::<DataChangeNotification>()
+                        .is_some_and(|data| {
+                            data.monitored_items.iter().flatten().any(|item| {
+                                item.value.status.is_some_and(|status| status.overflow())
+                            })
+                        })
+                })
+            })
+        {
+            return Err(Error::new(
+                "OPC UA queue Overflow; restart to recover history before accepting this batch",
+            ));
+        }
         let mut bytes = 0usize;
         let mut received = Vec::new();
         for message in messages {
@@ -352,7 +476,22 @@ impl Reader {
                 .as_ref()
                 .is_some_and(|v| !v.is_empty());
             self.next_sequence =
-                advance_sequence(self.next_sequence, message.sequence_number, has_data)?;
+                match advance_sequence(self.next_sequence, message.sequence_number, has_data) {
+                    Ok(sequence) => sequence,
+                    Err(error) if self.history.is_some() => {
+                        self.fill_history(session).await?;
+                        if !self
+                            .history
+                            .as_ref()
+                            .is_some_and(|history| history.covers_all_nodes())
+                        {
+                            return Err(error);
+                        }
+                        advance_sequence(message.sequence_number, message.sequence_number, has_data)
+                            .map_err(|_| error)?
+                    }
+                    Err(error) => return Err(error),
+                };
             if !has_data {
                 continue;
             }
@@ -374,34 +513,20 @@ impl Reader {
                         .config
                         .nodes
                         .get(index)
-                        .ok_or_else(|| Error::new("OPC UA unknown monitored item handle"))?;
+                        .ok_or_else(|| Error::new("OPC UA unknown monitored item handle"))?
+                        .clone();
                     let value = item.value;
-                    let timestamp = value
-                        .source_timestamp
-                        .ok_or_else(|| Error::new("OPC UA source timestamp missing"))?
-                        .as_chrono()
-                        .timestamp_millis();
-                    let payload =
-                        serde_json::json!({"value": value.value.map(|value| json_value(value, &self.kinds[index].schema.fields["value"])).transpose()?})
-                            .to_string();
+                    let mut record = sample(&node, &self.kinds[index], value.clone())?;
+                    if let Some(history) = &mut self.history
+                        && !history.accept_live(index, &value, &record)?
+                    {
+                        continue;
+                    }
                     self.high_water = self
                         .high_water
                         .checked_add(1)
                         .ok_or_else(|| Error::new("OPC UA position exhausted"))?;
-                    let record = Record {
-                        source: None,
-                        kind: node.to_string(),
-                        key: node.to_string(),
-                        source_ts_ms: timestamp,
-                        ingest_ts_ms: 0,
-                        quality: Some(format!(
-                            "{} (0x{:08x})",
-                            value.status.unwrap_or(StatusCode::Good),
-                            value.status.unwrap_or(StatusCode::Good).bits()
-                        )),
-                        position: self.high_water,
-                        payload,
-                    };
+                    record.position = self.high_water;
                     bytes = bytes.saturating_add(
                         crate::delivery::encode(&record, &record.idempotency_key("opcua", "spool"))
                             .len(),
@@ -413,8 +538,18 @@ impl Reader {
                 }
             }
         }
+        let pending_bytes: usize = self
+            .pending
+            .iter()
+            .map(|record| {
+                crate::delivery::encode(record, &record.idempotency_key("opcua", "spool")).len()
+            })
+            .sum();
+        if pending_bytes > self.config.max_pending_bytes {
+            return Err(Error::new("OPC UA pending batch exceeds configured bound"));
+        }
         // The next Publish can acknowledge these messages only after file and directory fsync.
-        if !received.is_empty() {
+        if !received.is_empty() || self.history.is_some() {
             self.persist()?;
         }
         self.ack.extend(received);
@@ -426,12 +561,14 @@ fn recover(
     dir: &Path,
     fingerprint: &str,
     max_pending_bytes: usize,
+    history: &mut Option<history::History>,
 ) -> Result<(Position, VecDeque<Record>), Error> {
     let path = dir.join("opcua.pending.v1");
     match std::fs::metadata(&path) {
         Ok(metadata)
             if metadata.len()
                 > max_pending_bytes
+                    .saturating_mul(if history.is_some() { 4 } else { 1 })
                     .saturating_add(fingerprint.len())
                     .saturating_add(64) as u64 =>
         {
@@ -466,6 +603,16 @@ fn recover(
     if !text.ends_with('\n') {
         return Err(Error::new("OPC UA incomplete spool"));
     }
+    if let Some(expected) = history.as_ref() {
+        let recovered: history::History = serde_json::from_str(
+            lines
+                .next()
+                .ok_or_else(|| Error::new("OPC UA history state missing"))?,
+        )
+        .map_err(|_| Error::new("OPC UA invalid history state"))?;
+        recovered.validate_against(expected)?;
+        *history = Some(recovered);
+    }
     let mut pending = VecDeque::new();
     for line in lines {
         let (record, key) = crate::delivery::decode(line)?;
@@ -486,6 +633,24 @@ fn recover(
         return Err(Error::new("OPC UA spool high-water mismatch"));
     }
     Ok((high_water, pending))
+}
+
+pub(super) fn sample(
+    node: &NodeId,
+    kind: &DiscoveredKind,
+    value: ::opcua::types::DataValue,
+) -> Result<Record, Error> {
+    let timestamp = value
+        .source_timestamp
+        .ok_or_else(|| Error::new("OPC UA source timestamp missing"))?
+        .as_chrono()
+        .timestamp_millis();
+    Ok(Record {
+        source: None, kind: node.to_string(), key: node.to_string(), source_ts_ms: timestamp,
+        ingest_ts_ms: 0, position: 0,
+        quality: Some(format!("{} (0x{:08x})", value.status.unwrap_or(StatusCode::Good), value.status.unwrap_or(StatusCode::Good).bits())),
+        payload: serde_json::json!({"value": value.value.map(|value| json_value(value, &kind.schema.fields["value"])).transpose()?}).to_string(),
+    })
 }
 
 fn json_value(value: Variant, field: &FieldType) -> Result<serde_json::Value, Error> {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add optional paged OPC UA raw-history backfill and durable reconnect gap recovery before monitored tail delivery.
+
 - Add optional MySQL consistent snapshots and GTID change capture with durable
   staged batches, before images, transaction markers, schema drift boundaries,
   strict source/key validation, and disposable crash/retention fixtures (#7).

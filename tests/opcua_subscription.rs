@@ -238,3 +238,269 @@ fn subscription_payload_matches_discovered_text_for_numeric_subtypes_and_uint64(
     drop(server);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn historical_pages_replay_durably_and_fill_server_restart_before_subscription_tail() {
+    use hashi::opcua::HistoryConfig;
+    use opcua::types::DataValue;
+    use std::sync::{Arc, Mutex};
+    let (path, server) = fixture(0);
+    drop(server);
+    let start = DateTime::now().ticks() - 10_000_000;
+    let sample = |value: f64, tick: i64| DataValue::new_at(value, DateTime::from(tick));
+    let samples = Arc::new(Mutex::new(vec![sample(1.0, start), sample(2.0, start + 1)]));
+    let server = simulator::Simulator::start_with_history(
+        &path.join("server"),
+        "127.0.0.1",
+        0,
+        samples.clone(),
+    );
+    let node = server.history_value();
+    let state = path.join("history-state");
+    let open = |server: &simulator::Simulator| {
+        let mut settings = subscription(vec![node.clone()], &state);
+        settings.deadband = None;
+        OpcUaConnector::subscribe_with_history(
+            config(server, &path.join("client")),
+            settings,
+            HistoryConfig {
+                start: DateTime::from(start),
+                page_rows: 1,
+            },
+        )
+        .unwrap()
+    };
+    let payload = |record: &hashi::Record| {
+        serde_json::from_str::<serde_json::Value>(&record.payload).unwrap()["value"]
+            .as_f64()
+            .unwrap()
+    };
+    let mut source = open(&server);
+    let first = source.read(None, None).unwrap().unwrap();
+    assert_eq!(payload(&first), 1.0);
+    let second = source.read(Some(first.position), None).unwrap().unwrap();
+    assert_eq!(payload(&second), 2.0);
+    drop(source);
+    let mut source = open(&server);
+    assert_eq!(
+        source.read(Some(first.position), None).unwrap().unwrap(),
+        second
+    );
+    let port = url::Url::parse(&server.endpoint).unwrap().port().unwrap();
+    drop(server);
+    samples
+        .lock()
+        .unwrap()
+        .extend([sample(3.0, start + 2), sample(4.0, start + 3)]);
+    let server = simulator::Simulator::start_with_history(
+        &path.join("server"),
+        "127.0.0.1",
+        port,
+        samples.clone(),
+    );
+    let third = source.read(Some(second.position), None).unwrap().unwrap();
+    let fourth = source.read(Some(third.position), None).unwrap().unwrap();
+    assert_eq!([payload(&third), payload(&fourth)], [3.0, 4.0]);
+    assert_eq!(
+        [third.position, fourth.position],
+        [second.position + 1, second.position + 2]
+    );
+    server.set_history_value(sample(5.0, DateTime::now().ticks()));
+    let fifth = source.read(Some(fourth.position), None).unwrap().unwrap();
+    assert_eq!(
+        payload(&fifth),
+        5.0,
+        "subscription initial overlap must not become a duplicate"
+    );
+    let caught_up = source.read(Some(fifth.position), None).unwrap();
+    assert!(caught_up.is_none());
+    assert!(source.check().unwrap().ok);
+    drop(source);
+    let overflow_state = path.join("overflow-history");
+    let overflow_settings = || {
+        let mut settings = subscription(vec![node.clone()], &overflow_state);
+        settings.queue_size = 2;
+        settings.deadband = None;
+        settings
+    };
+    let mut overflow_source = OpcUaConnector::subscribe_with_history(
+        config(&server, &path.join("client")),
+        overflow_settings(),
+        HistoryConfig {
+            start: DateTime::from(start),
+            page_rows: 1,
+        },
+    )
+    .unwrap();
+    let mut overflow_last = overflow_source.read(None, None).unwrap().unwrap();
+    for _ in 1..5 {
+        overflow_last = overflow_source
+            .read(Some(overflow_last.position), None)
+            .unwrap()
+            .unwrap();
+    }
+    let burst_start = DateTime::now().ticks();
+    for number in 6..=25 {
+        server.set_history_value(sample(
+            number as f64,
+            burst_start + (number - 6) * 1_000_000,
+        ));
+    }
+    assert!(
+        overflow_source
+            .read(Some(overflow_last.position), None)
+            .unwrap_err()
+            .message
+            .contains("queue Overflow")
+    );
+    assert!(!overflow_source.check().unwrap().ok);
+    drop(overflow_source);
+    std::thread::sleep(Duration::from_secs(2));
+    let mut overflow_source = OpcUaConnector::subscribe_with_history(
+        config(&server, &path.join("client")),
+        overflow_settings(),
+        HistoryConfig {
+            start: DateTime::from(start),
+            page_rows: 1,
+        },
+    )
+    .unwrap();
+    for number in 6..=25 {
+        let record = overflow_source
+            .read(Some(overflow_last.position), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            payload(&record),
+            number as f64,
+            "restart must recover values dropped before the overflow marker"
+        );
+        overflow_last = record;
+    }
+    drop(overflow_source);
+    let fifth_time = samples
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|value| value.value == Some(opcua::types::Variant::Double(5.0)))
+        .unwrap()
+        .source_timestamp
+        .unwrap();
+    samples
+        .lock()
+        .unwrap()
+        .retain(|sample| sample.source_timestamp != Some(fifth_time));
+    samples
+        .lock()
+        .unwrap()
+        .push(sample(6.0, DateTime::now().ticks()));
+    let mut source = open(&server);
+    assert!(
+        source
+            .read(Some(fifth.position), None)
+            .unwrap_err()
+            .message
+            .contains("retained historical boundary")
+    );
+    drop(source);
+    let mut bounded = subscription(vec![node.clone()], &path.join("bounded-history"));
+    bounded.max_pending_bytes = 1;
+    let mut source = OpcUaConnector::subscribe_with_history(
+        config(&server, &path.join("client")),
+        bounded,
+        HistoryConfig {
+            start: DateTime::from(start),
+            page_rows: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        source
+            .read(None, None)
+            .unwrap_err()
+            .message
+            .contains("batch bound")
+    );
+    assert!(!source.check().unwrap().ok);
+    assert!(!path.join("bounded-history/opcua.pending.v1").exists());
+    drop(source);
+    let mut source = OpcUaConnector::subscribe_with_history(
+        config(&server, &path.join("client")),
+        subscription(vec![node.clone()], &path.join("empty-history")),
+        HistoryConfig {
+            start: DateTime::now(),
+            page_rows: 1,
+        },
+    )
+    .unwrap();
+    assert!(source.read(None, None).unwrap().is_none());
+    assert!(source.check().unwrap().ok);
+    drop(source);
+    samples.lock().unwrap().push(DataValue::new_at_status(
+        6.0,
+        DateTime::now(),
+        StatusCode::BadDataUnavailable.set_overflow(true),
+    ));
+    let mut source = OpcUaConnector::subscribe_with_history(
+        config(&server, &path.join("client")),
+        subscription(vec![node.clone()], &path.join("unavailable-history")),
+        HistoryConfig {
+            start: DateTime::from(start),
+            page_rows: 1,
+        },
+    )
+    .unwrap();
+    assert!(
+        source
+            .read(None, None)
+            .unwrap_err()
+            .message
+            .contains("historical range is incomplete")
+    );
+    assert!(!path.join("unavailable-history/opcua.pending.v1").exists());
+    drop(source);
+    drop(server);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn history_unsupported_is_reported_while_subscription_keeps_running() {
+    let (path, server) = fixture(0);
+    let history_start = DateTime::from(DateTime::now().ticks() - 10_000_000);
+    let mut source = OpcUaConnector::subscribe_with_history(
+        config(&server, &path.join("client")),
+        subscription(vec![server.value.clone()], &path.join("state")),
+        hashi::opcua::HistoryConfig {
+            start: history_start,
+            page_rows: 2,
+        },
+    )
+    .unwrap();
+    let first = source.read(None, None).unwrap().unwrap();
+    let report = source.check().unwrap();
+    assert!(report.ok);
+    assert!(report.message.contains("history unsupported for 1"));
+    server.set_value(30.0, StatusCode::Good, DateTime::now());
+    let next = source.read(Some(first.position), None).unwrap().unwrap();
+    assert!(next.payload.contains("30.0"));
+    drop(source);
+    let mut source = OpcUaConnector::subscribe_with_history(
+        config(&server, &path.join("client")),
+        subscription(vec![server.value.clone()], &path.join("state")),
+        hashi::opcua::HistoryConfig {
+            start: history_start,
+            page_rows: 2,
+        },
+    )
+    .unwrap();
+    assert!(
+        source
+            .read(Some(next.position), None)
+            .unwrap_err()
+            .message
+            .contains("nodes without history")
+    );
+    drop(source);
+    drop(server);
+    std::fs::remove_dir_all(path).unwrap();
+}

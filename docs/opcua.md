@@ -143,9 +143,10 @@ when transfer is unavailable. Available unreceipted messages are republished
 before accepting newer notifications; recovery is bounded to 64 messages. Sequence continuity includes keepalives
 and rollover; an unavailable sequence fails visibly before newer samples are
 acknowledged.
-A recreated subscription emits current values. History gap-fill is separate:
-values changed while a server is unavailable or after its queue overflows
-cannot be reconstructed by this adapter. Overflow status remains visible.
+A recreated subscription emits current values. Plain subscriptions cannot recover
+values changed while a server is unavailable or after its queue overflows.
+Use the optional historical access path below when the nodes retain raw history.
+Overflow status remains visible.
 A failed reader reports unhealthy and must restart to recover durable state.
 
 Reads wait through keepalives until a sample arrives. The embedding runtime
@@ -168,3 +169,46 @@ or end-to-end sink guarantee; the command prints fresh measurements per run.
 For nonfinite-value fixture cases under absolute deadband, also change status:
 a NaN value-difference comparison can suppress a value-only notification. Force
 an actual notification before asserting that the reader rejects its value.
+
+## Historical backfill and reconnect gaps
+
+`OpcUaConnector::subscribe_with_history` adds a `HistoryConfig` with an explicit
+source start time and page size (1–1024). It creates monitored items first, reads
+raw history through the server's current time, and stages that history before
+subscription values. History pages use continuation points; the complete recovered
+gap must fit `max_pending_bytes` and the recovery deadline. No partial gap is
+published if decoding, paging, capacity, or availability fails.
+
+History uses the same leased receipt spool and runtime checkpoint as subscriptions.
+The spool atomically persists pending records, watermarks, and overlap identities
+before acknowledging notifications. Process restart replays the same positions and
+idempotency keys; reconnect reads inclusive history from each node's last durable
+source timestamp before resuming its monitored tail. Source timestamp ticks,
+picoseconds, status, and normalized value identify overlap. Equal timestamps with
+different values remain distinct. Cross-node ordering is deterministic by timestamp
+and node; the protocol supplies no transaction order across nodes.
+
+The historical source must retain the requested raw range and use monotonically
+ordered source timestamps. Corrections to already emitted historical samples and
+indistinguishable repeated samples are outside this append-only contract. Unknown
+older values fail visibly. Explicit lost-data markers, unavailable previously
+supported history, malformed pages, and unrecoverable mixed-node gaps also fail.
+A successful raw read cannot independently prove the server's retention completeness;
+configure retention to cover the requested backfill and expected outage window.
+
+A node without advertised history read access, or an initially unsupported history
+service, stays on subscription-only capture. `check` remains healthy and reports
+the count of unsupported nodes after the first read; the choice is durable for
+that source generation. A known notification gap involving such nodes still fails visibly. History mode
+checks the whole notification batch for queue overflow before receipt publication;
+overflow fails visibly and requires restart, so history starts from the last durable
+watermarks rather than from partially accepted values. Changing support policy requires explicit source recovery.
+History-enabled reads return `None` on quiet keepalive boundaries so the embedding
+runtime can regain control.
+
+The subscription-only fingerprint and spool layout remain compatible. History
+mode changes the fingerprint and adds state inside the same atomic spool file;
+earlier readers refuse it rather than silently resetting positions. Start history
+as a new source generation with a dedicated state directory and compatible consumer
+recovery. Preserve both receipt spool and runtime checkpoint on restart. This adds
+no cross-node ownership protocol.
