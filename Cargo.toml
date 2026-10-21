@@ -7,6 +7,10 @@ description = "Connector engine: industrial protocols and change data capture wi
 publish = false
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "binlog"], optional = true }
+mysql_common = { version = "0.37.1", default-features = false, features = ["binlog"], optional = true }
+futures-util = { version = "0.3.34", optional = true }
 async-opcua = { version = "0.19.0", features = ["client"], optional = true }
 parquet = { version = "60.0.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -16,5 +20,6 @@ tokio = { version = "1.54.0", features = ["rt-multi-thread", "time"], optional =
 url = { version = "2.5.8", optional = true }
 
 [features]
+mysql = ["dep:chrono", "dep:mysql_async", "dep:mysql_common", "dep:futures-util", "dep:tokio"]
 opcua = ["dep:async-opcua", "dep:tokio", "dep:url"]
 opcua-simulator = ["opcua", "async-opcua/server", "tokio/net", "tokio/macros"]

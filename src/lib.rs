@@ -14,6 +14,8 @@ pub mod fake;
 pub mod jsonl;
 pub mod kafka;
 pub mod modbus;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 #[cfg(feature = "opcua")]
 pub mod opcua;
 pub mod parquet;
