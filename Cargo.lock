@@ -841,6 +841,7 @@ name = "hashi"
 version = "0.0.0"
 dependencies = [
  "async-opcua",
+ "async-trait",
  "chrono",
  "futures-util",
  "mysql_async",

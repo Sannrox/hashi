@@ -1,5 +1,7 @@
 //! Secure OPC UA sessions, bounded discovery, and durable subscription reads.
+mod history;
 mod subscription;
+pub use history::HistoryConfig;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,13 +83,33 @@ impl OpcUaConnector {
 
     /// Starts a source with an explicit monitored-node set and a durable replay spool.
     pub fn subscribe(config: Config, subscription: SubscriptionConfig) -> Result<Self, Error> {
+        Self::subscribe_inner(config, subscription, None)
+    }
+
+    pub fn subscribe_with_history(
+        config: Config,
+        subscription: SubscriptionConfig,
+        history: HistoryConfig,
+    ) -> Result<Self, Error> {
+        Self::subscribe_inner(config, subscription, Some(history))
+    }
+
+    fn subscribe_inner(
+        config: Config,
+        subscription: SubscriptionConfig,
+        history: Option<HistoryConfig>,
+    ) -> Result<Self, Error> {
         subscription.validate()?;
         let mut connector = Self::connect_inner(config, true)?;
         let runtime = connector
             .runtime
             .as_ref()
             .ok_or_else(|| Error::new("OPC UA runtime closed"))?;
-        let reader = runtime.block_on(subscription::Reader::open(&connector, subscription))?;
+        let reader = runtime.block_on(subscription::Reader::open(
+            &connector,
+            subscription,
+            history,
+        ))?;
         connector.subscription = Some(reader);
         Ok(connector)
     }
@@ -522,11 +544,13 @@ impl Connector for OpcUaConnector {
         Ok(CheckReport {
             ok: good,
             message: if good {
-                "session connected"
+                self.subscription
+                    .as_ref()
+                    .and_then(|reader| reader.history_notice())
+                    .unwrap_or_else(|| "session connected".into())
             } else {
-                "session disconnected"
-            }
-            .into(),
+                "session disconnected".into()
+            },
         })
     }
     fn discover(&self) -> Result<Vec<DiscoveredKind>, Error> {

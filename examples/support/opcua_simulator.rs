@@ -1,3 +1,5 @@
+#[path = "opcua_history.rs"]
+mod history;
 use opcua::crypto::SecurityPolicy;
 use opcua::crypto::{CertificateStore, X509Data};
 use opcua::nodes::AccessLevel;
@@ -61,6 +63,24 @@ impl Simulator {
         Self::start_with_nodes(dir, host, port, 0)
     }
     pub fn start_with_nodes(dir: &Path, host: &str, port: u16, count: usize) -> Self {
+        Self::start_inner(dir, host, port, count, None)
+    }
+    #[allow(dead_code)]
+    pub fn start_with_history(
+        dir: &Path,
+        host: &str,
+        port: u16,
+        samples: std::sync::Arc<std::sync::Mutex<Vec<opcua::types::DataValue>>>,
+    ) -> Self {
+        Self::start_inner(dir, host, port, 0, Some(samples))
+    }
+    fn start_inner(
+        dir: &Path,
+        host: &str,
+        port: u16,
+        count: usize,
+        samples: Option<std::sync::Arc<std::sync::Mutex<Vec<opcua::types::DataValue>>>>,
+    ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -102,6 +122,9 @@ impl Simulator {
                 },
                 "fixture",
             ));
+        if let Some(samples) = samples {
+            builder = builder.with_node_manager(history::builder(samples));
+        }
         for (name, policy, mode) in [
             (
                 "basic",
@@ -270,6 +293,32 @@ impl Simulator {
                         },
                     )
                 }),
+            )
+            .unwrap();
+    }
+    #[allow(dead_code)]
+    pub fn history_value(&self) -> NodeId {
+        NodeId::new(
+            self.handle
+                .get_namespace_index("urn:hashi:history-fixture")
+                .unwrap(),
+            "HistoricalValue",
+        )
+    }
+    #[allow(dead_code)]
+    pub fn set_history_value(&self, value: opcua::types::DataValue) {
+        let manager = self
+            .handle
+            .node_managers()
+            .get_of_type::<history::Manager>()
+            .unwrap();
+        manager.inner().samples.lock().unwrap().push(value.clone());
+        manager
+            .set_value(
+                self.handle.subscriptions(),
+                &self.history_value(),
+                None,
+                value,
             )
             .unwrap();
     }
