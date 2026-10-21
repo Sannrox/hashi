@@ -104,6 +104,24 @@ The container harness runs the same client/server fixture with `--network none`,
 a unique image tag, and no host ports or state mounts, then removes its image.
 This proves protocol behavior, not equipment interoperability.
 
+### Acceptance coverage
+
+The parent connector scope in #3 is delivered by #16, #17, and #18. The same
+fixture commands above exercise these capabilities without an external server.
+
+| Capability | Evidence |
+| --- | --- |
+| Explicit certificate trust, rejected certificates, secure policies, username/X.509 authentication, and lab-only None | [Session/discovery fixture](../tests/opcua_discovery.rs) |
+| Typed browse metadata, engineering units, namespace resolution, and discovery bounds | [Session/discovery fixture](../tests/opcua_discovery.rs) |
+| Monitored values, sampling/deadband, source timestamps, quality, and durable replay | [Subscription fixture](../tests/opcua_subscription.rs) |
+| Recreated subscriptions and historical backfill across server restart, with overlap deduplication | [Historical restart fixture](../tests/opcua_subscription.rs) |
+| Unsupported history, unavailable ranges, retained boundaries, bounded receipts, and overflow recovery after restart | [Historical recovery fixture](../tests/opcua_subscription.rs) |
+| Throughput and latency for 10,000 monitored items | [Measurement procedure](#10000-item-fixture-measurements) |
+
+These checks establish simulator conformance. Historical retention and append-only
+source identity remain requirements of the source described below; this evidence
+does not certify arbitrary equipment or historian behavior.
+
 ## Durable subscription reads
 
 Use `OpcUaConnector::subscribe(config, SubscriptionConfig { ... })` for value
@@ -138,8 +156,8 @@ committed position. Spool recovery retains uncommitted samples across process
 restart and rejects missing or regressed checkpoint state. The spool has its
 own exclusive lease; preserve it together with the runtime checkpoint.
 
-Reconnect first attempts subscription transfer, then recreates monitored items
-when transfer is unavailable. Available unreceipted messages are republished
+Reconnect first retries the existing session's subscription, then attempts transfer
+and recreates monitored items when transfer is unavailable. Available unreceipted messages are republished
 before accepting newer notifications; recovery is bounded to 64 messages. Sequence continuity includes keepalives
 and rollover; an unavailable sequence fails visibly before newer samples are
 acknowledged.
