@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add optional MySQL consistent snapshots and GTID change capture with durable
+  staged batches, before images, transaction markers, schema drift boundaries,
+  strict source/key validation, and disposable crash/retention fixtures (#7).
+
 - Add durable OPC UA monitored-item reads with sampling, absolute deadband, status quality, reconnect recovery, and a 10,000-item simulator measurement.
 
 - Contract v2 commits an opaque source cursor with each order position and

@@ -38,3 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/test-opcua-container.sh
+  mysql-container:
+    name: MySQL container fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/test-mysql-container.sh
