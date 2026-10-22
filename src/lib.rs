@@ -12,6 +12,7 @@ pub mod connector;
 pub mod contract;
 pub mod credential;
 pub mod delivery;
+pub mod diagnostics;
 pub mod fake;
 pub mod historian;
 pub mod jsonl;
@@ -21,6 +22,7 @@ pub mod modbus;
 pub mod mqtt;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+pub mod observe;
 #[cfg(feature = "opcua")]
 pub mod opcua;
 pub mod parquet;
