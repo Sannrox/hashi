@@ -17,6 +17,8 @@ pub mod historian;
 pub mod jsonl;
 pub mod kafka;
 pub mod modbus;
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "opcua")]

@@ -23,4 +23,5 @@ licenses; `cargo deny check licenses` enforces it (`deny.toml`).
 - [Modbus polling](docs/modbus.md)
 - [OPC UA sessions, discovery, and subscriptions](docs/opcua.md)
 - [MySQL snapshot and change capture](docs/mysql.md)
+- [MQTT subscriptions](docs/mqtt.md)
 - [Historian backfill and live tail](docs/historian.md)
