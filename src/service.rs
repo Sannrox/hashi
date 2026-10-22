@@ -23,6 +23,13 @@ struct Running {
     _sink_lock: File,
 }
 
+/// One instance's pass. `progress` counts what was committed even when `outcome` is an error.
+pub struct Pass {
+    pub instance: String,
+    pub outcome: Result<RunReport, Error>,
+    pub progress: RunReport,
+}
+
 pub struct Service {
     checkpoint_dir: PathBuf,
     instances: Vec<(InstanceConfig, Option<Running>)>,
@@ -44,16 +51,33 @@ impl Service {
 
     /// Run every instance until caught up, in config order.
     pub fn pass(&mut self) -> Vec<(String, Result<RunReport, Error>)> {
+        self.pass_with_progress()
+            .into_iter()
+            .map(|pass| (pass.instance, pass.outcome))
+            .collect()
+    }
+
+    /// Like [`Service::pass`], plus what each instance committed before an error.
+    pub fn pass_with_progress(&mut self) -> Vec<Pass> {
         let checkpoint_dir = &self.checkpoint_dir;
         self.instances
             .iter_mut()
             .map(|(instance, runtime)| {
-                let outcome = match runtime {
-                    Some(running) => running.runtime.run(),
-                    None => open(checkpoint_dir, instance)
-                        .and_then(|opened| runtime.insert(opened).runtime.run()),
+                let (outcome, progress) = match runtime {
+                    Some(running) => (running.runtime.run(), running.runtime.progress().clone()),
+                    None => match open(checkpoint_dir, instance) {
+                        Ok(opened) => {
+                            let running = runtime.insert(opened);
+                            (running.runtime.run(), running.runtime.progress().clone())
+                        }
+                        Err(error) => (Err(error), RunReport::default()),
+                    },
                 };
-                (instance.name.clone(), outcome)
+                Pass {
+                    instance: instance.name.clone(),
+                    outcome,
+                    progress,
+                }
             })
             .collect()
     }
@@ -78,6 +102,12 @@ fn lock_sink_dir(dir: &Path) -> Result<File, Error> {
     Ok(lock)
 }
 
+/// The connector id an instance checkpoints under.
+pub(crate) fn connector_id(instance: &InstanceConfig) -> String {
+    let SourceConfig::Fixture(_) = &instance.source;
+    format!("fixture-{}", instance.name)
+}
+
 fn open(checkpoint_dir: &Path, instance: &InstanceConfig) -> Result<Running, Error> {
     let SourceConfig::Fixture(fixture) = &instance.source;
     let records = (1..=fixture.records)
@@ -91,7 +121,7 @@ fn open(checkpoint_dir: &Path, instance: &InstanceConfig) -> Result<Running, Err
         })
         .collect();
     let source = FakeSource::with_live_credential(
-        format!("fixture-{}", instance.name),
+        connector_id(instance),
         records,
         FileCredential::new(&fixture.credential_file),
         fixture.accept_sha256.clone(),

@@ -18,6 +18,7 @@ licenses; `cargo deny check licenses` enforces it (`deny.toml`).
 ## Connector contracts
 
 - [Running from a config file](docs/run.md)
+- [Health, metrics, diagnostics and offline packaging](docs/operations.md)
 - [Source cursors and change records](docs/source-cursors.md)
 - [Schema drift and quarantine](docs/schema-drift.md)
 - [Modbus polling](docs/modbus.md)

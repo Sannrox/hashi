@@ -69,6 +69,8 @@ pub struct RunReport {
     pub delivered: u64,
     pub quarantined: u64,
     pub checkpoint: Position,
+    /// Source timestamp of the last record committed in this run.
+    pub last_source_ts_ms: Option<i64>,
 }
 
 pub struct Runtime<C, S, K, T> {
@@ -77,6 +79,7 @@ pub struct Runtime<C, S, K, T> {
     store: K,
     clock: T,
     config: RuntimeConfig,
+    progress: RunReport,
 }
 
 impl<C, S, K, T> Runtime<C, S, K, T>
@@ -93,7 +96,13 @@ where
             store,
             clock,
             config,
+            progress: RunReport::default(),
         }
+    }
+
+    /// What the current or last run committed, also when it ended in an error.
+    pub fn progress(&self) -> &RunReport {
+        &self.progress
     }
 
     pub fn into_parts(self) -> (C, S, K) {
@@ -110,6 +119,7 @@ where
         &mut self,
         mut keep_going: impl FnMut(&RunReport) -> bool,
     ) -> Result<RunReport, Error> {
+        self.progress = RunReport::default();
         let check = self.connector.check()?;
         if !check.ok {
             return Err(Error::new(format!("check failed: {}", check.message)));
@@ -125,11 +135,12 @@ where
             .as_ref()
             .and_then(|checkpoint| checkpoint.source_cursor.clone());
         let mut committed: Option<Position> = loaded.map(|checkpoint| checkpoint.position);
-        let mut report = RunReport {
+        self.progress = RunReport {
             discovered: discovered.len(),
             delivered: 0,
             quarantined: 0,
             checkpoint: committed.unwrap_or(0),
+            last_source_ts_ms: None,
         };
         if self.config.in_flight_limit == 0 {
             return Err(Error::new("in_flight_limit must be >= 1"));
@@ -146,7 +157,7 @@ where
         // Sequential deliver-then-commit is a buffer of one. The next read
         // waits for the sink ack; `in_flight_limit` is the configured bound.
         loop {
-            if !keep_going(&report) {
+            if !keep_going(&self.progress) {
                 break;
             }
             let discovered = self.connector.discover()?;
@@ -204,19 +215,21 @@ where
                 Dispatch::Delivered => {
                     self.commit(&connector_id, record.position, next_cursor.clone())?;
                     committed = Some(record.position);
-                    report.delivered += 1;
-                    report.checkpoint = record.position;
+                    self.progress.delivered += 1;
+                    self.progress.checkpoint = record.position;
+                    self.progress.last_source_ts_ms = Some(record.source_ts_ms);
                 }
                 Dispatch::Quarantined => {
                     self.commit(&connector_id, record.position, next_cursor.clone())?;
                     committed = Some(record.position);
-                    report.quarantined += 1;
-                    report.checkpoint = record.position;
+                    self.progress.quarantined += 1;
+                    self.progress.checkpoint = record.position;
+                    self.progress.last_source_ts_ms = Some(record.source_ts_ms);
                 }
             }
             source_cursor = next_cursor;
         }
-        Ok(report)
+        Ok(self.progress.clone())
     }
 
     /// Accept only the exact quarantined schema, under the same instance lease as reads.

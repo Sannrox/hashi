@@ -6,6 +6,9 @@ hashi run --config hashi.toml --once    # one pass, exit nonzero if any instance
 hashi run --config hashi.toml --interval-ms 5000
 ```
 
+Add `--listen <addr>` for health and metrics, and use `hashi diagnostics
+--config hashi.toml` for a support bundle; see [operations](operations.md).
+
 ## Config
 
 TOML. Relative paths resolve against the config file's directory.

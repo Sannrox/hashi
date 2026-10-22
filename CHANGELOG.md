@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `hashi run --listen <addr>` serves `/healthz` and Prometheus `/metrics` per
+  instance: delivered and quarantined counts, errors, records per second,
+  checkpoint position and age, and source lag. `hashi diagnostics` prints a
+  support bundle without secrets, keys or payloads. A `Dockerfile` builds a
+  static binary on an empty, digest-pinned image that runs with no network
+  beyond configured sources and sinks (#27).
+
 - Optional MQTT 3.1.1 and 5 connector with verified TLS, client certificates or
   user name and password, persistent QoS 1 sessions, shared subscriptions for
   scale-out, and topic filters mapped to record kinds with JSON or raw
