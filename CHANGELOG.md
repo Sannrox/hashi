@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Sparkplug B decoding on the MQTT connector: births, deaths, metric
+  aliases and sequence numbers, with NCMD rebirth requests on a gap or an
+  unknown node. Birth state is durable, so a restart still resolves aliases.
+  A metric that cannot be resolved is quarantined, never guessed (#21).
+
 - `hashi run --listen <addr>` serves `/healthz` and Prometheus `/metrics` per
   instance: delivered and quarantined counts, errors, records per second,
   checkpoint position and age, and source lag. `hashi diagnostics` prints a

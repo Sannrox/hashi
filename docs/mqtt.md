@@ -25,6 +25,7 @@ let config = Config {
     timeout: Duration::from_secs(10),
     max_packet_bytes: 1024 * 1024,
     schema_version: 1,
+    sparkplug_state_dir: None,
 };
 ```
 
@@ -44,6 +45,45 @@ as compact JSON text; a payload that is not JSON is emitted as hex with quality
 Routes of one kind must share a decoder. A message on a topic no route matches
 (for example from a subscription left in the persistent session by an older
 config) gets the kind `__mqtt_unrouted`; the runtime quarantines and commits it.
+
+## Sparkplug B
+
+A route with `Decoder::SparkplugB` reads the `spBv1.0/<group>/<type>/<edge
+node>[/<device>]` namespace, for example `spBv1.0/plant-1/#`. It needs
+`sparkplug_state_dir` and cannot use `shared_group`: births and the data that
+refers to them must reach the same instance.
+
+- Each metric becomes a record of the route's kind keyed
+  `<group>/<edge node>[/<device>]/<metric>`, with JSON `type` (message type),
+  `seq`, `name`, `datatype` and `value`. Signed integers are decoded from their
+  two's complement encoding; bytes and files as hex. Data sets and templates
+  are emitted with a `bad:` quality and a null value.
+- NBIRTH, DBIRTH, DDEATH and NDEATH also emit a record keyed by the node or
+  device path. An NDEATH whose `bdSeq` does not match the current NBIRTH comes
+  from an older session and is ignored; a redelivered one emits its record
+  again. An NDEATH invalidates the node's certificates and a DDEATH the
+  device's, until the next birth. A data metric whose datatype differs from
+  its birth certificate gets a null value and a `bad:` quality.
+  NCMD, DCMD and STATE are ignored.
+- Births register each metric's name, alias and datatype per edge node, so
+  data may carry only the alias. Birth state is written atomically to
+  `sparkplug_state_dir` on every birth and death and read back on connect, so a
+  restarted connector resolves aliases of messages queued while it was away.
+  An exclusive lease on the directory fences a second instance.
+- A data message from a node without a birth, one whose sequence number skips,
+  or one with a metric missing from the certificates makes the connector
+  publish an NCMD `Node Control/Rebirth` request (QoS 0, at most once per
+  `timeout` per node). Known aliases keep resolving.
+- An NBIRTH without `seq` or `bdSeq`, a topic whose shape does not match its
+  message type, or a `seq` above 255 changes no state. A birth that declares an
+  alias or a name twice leaves that identity unresolved.
+- A metric whose alias or name is not in a birth certificate (a name and
+  datatype on a data message do not count; a name and alias must match the
+  same certificate), or a message that
+  is not Sparkplug B, becomes a `__sparkplug_unresolved` record: the runtime
+  quarantines it with its alias and reason. It is never guessed.
+
+A message is acknowledged after the last of its records is committed.
 
 ## Acknowledgment after the sink
 
@@ -84,3 +124,7 @@ killed between the sink ack and the broker ack gets the message redelivered
 with nothing lost, a reconnect at QoS 1 on both protocols loses nothing, two
 instances on a shared subscription split the load without loss, and TLS refuses
 a client without a trusted certificate.
+The Sparkplug B proofs use an edge node simulator that answers rebirth
+requests: birth, alias resolution and device lifecycle, a sequence gap that
+triggers one rebirth with an unknown alias quarantined, and a reconnect at
+QoS 1 that resolves queued alias-only data from durable birth state.

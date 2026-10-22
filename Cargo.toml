@@ -15,6 +15,7 @@ futures-util = { version = "0.3.34", optional = true }
 async-opcua = { version = "0.19.0", features = ["client"], optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+prost = { version = "0.14.4", default-features = false, features = ["derive", "std"], optional = true }
 parquet = { version = "60.0.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -26,6 +27,6 @@ url = { version = "2.5.8", optional = true }
 
 [features]
 mysql = ["dep:chrono", "dep:mysql_async", "dep:mysql_common", "dep:futures-util", "dep:tokio"]
-mqtt = ["dep:rumqttc", "dep:rustls", "dep:tokio"]
+mqtt = ["dep:prost", "dep:rumqttc", "dep:rustls", "dep:tokio"]
 opcua = ["dep:async-opcua", "dep:tokio", "dep:url"]
 opcua-simulator = ["dep:async-trait", "opcua", "async-opcua/server", "tokio/net", "tokio/macros"]
