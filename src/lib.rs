@@ -8,6 +8,7 @@
 pub mod buffer;
 pub mod checkpoint;
 pub mod config;
+pub mod conformance;
 pub mod connector;
 pub mod contract;
 pub mod credential;

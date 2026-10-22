@@ -730,3 +730,116 @@ fn mysql_snapshot_worker() {
         std::thread::park();
     }
 }
+
+/// Conformance kit (#28) driver: rows keyed by id; repeating a key updates its row;
+/// drift adds a column.
+struct MySqlFamily {
+    opts: Opts,
+    database: String,
+    state: std::path::PathBuf,
+    ids: std::collections::BTreeMap<String, (u32, u64)>,
+    columns: u32,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl MySqlFamily {
+    fn execute(&self, sql: String) {
+        let opts = self.opts.clone();
+        self.runtime.block_on(async move {
+            let mut conn = Conn::new(opts).await.unwrap();
+            conn.query_drop(sql).await.unwrap();
+            conn.disconnect().await.unwrap();
+        });
+    }
+}
+
+impl hashi::conformance::Family for MySqlFamily {
+    type Source = MySqlConnector;
+
+    fn connect(&mut self) -> Result<MySqlConnector, hashi::Error> {
+        let mut config = config(self.opts.clone(), &self.database, self.state.clone());
+        config.id = "mysql-conformance".into();
+        config.server_id = 2048;
+        config.timeout = Duration::from_secs(5);
+        MySqlConnector::connect(config)
+    }
+
+    /// Rows that exist before the first connect, so the snapshot path delivers them.
+    fn seed(&mut self) -> Result<Vec<hashi::conformance::Change>, hashi::Error> {
+        self.produce(&["s1", "s2"])
+    }
+
+    fn produce(&mut self, keys: &[&str]) -> Result<Vec<hashi::conformance::Change>, hashi::Error> {
+        let mut expected = Vec::new();
+        for key in keys {
+            let next = self.ids.len() as u32 + 1;
+            let entry = self.ids.entry(key.to_string()).or_insert((next, 0));
+            entry.1 += 1;
+            let (id, count) = *entry;
+            self.execute(format!(
+                "INSERT INTO `{}`.items (id, value, count) VALUES ({id}, '{key}', 1) \
+                 ON DUPLICATE KEY UPDATE count = count + 1",
+                self.database
+            ));
+            expected.push(hashi::conformance::Change::new(
+                format!("[{id}]"),
+                "count",
+                count,
+            ));
+        }
+        Ok(expected)
+    }
+
+    fn drift(&mut self) -> Result<hashi::conformance::Drift, hashi::Error> {
+        self.columns += 1;
+        self.execute(format!(
+            "ALTER TABLE `{}`.items ADD COLUMN extra{} INT NOT NULL DEFAULT 0",
+            self.database, self.columns
+        ));
+        Ok(hashi::conformance::Drift::Reported(format!(
+            "{}.items",
+            self.database
+        )))
+    }
+}
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mysql-container.sh"]
+fn mysql_passes_the_conformance_kit() {
+    assert_eq!(std::env::var("HASHI_MYSQL_DISPOSABLE").as_deref(), Ok("1"));
+    let port = std::env::var("HASHI_MYSQL_TEST_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .pass(Some("hashi-fixture-only"))
+        .into();
+    let database = format!("hashi_conformance_{}", std::process::id());
+    let path = std::env::temp_dir().join(format!(
+        "hashi-mysql-conformance-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let family = MySqlFamily {
+        opts,
+        database: database.clone(),
+        state: path.join("source"),
+        ids: Default::default(),
+        columns: 0,
+        runtime: tokio::runtime::Runtime::new().unwrap(),
+    };
+    family.execute(format!("CREATE DATABASE `{database}`"));
+    family.execute(format!(
+        "CREATE TABLE `{database}`.items (id INT PRIMARY KEY, value VARCHAR(100) NOT NULL, \
+         count BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB"
+    ));
+    let mut family = family;
+    let passed = hashi::conformance::run(&mut family, &path.join("checkpoints")).unwrap();
+    assert_eq!(passed, hashi::conformance::CHECKS);
+}

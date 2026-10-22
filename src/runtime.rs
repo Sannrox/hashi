@@ -105,6 +105,10 @@ where
         &self.progress
     }
 
+    pub fn connector(&self) -> &C {
+        &self.connector
+    }
+
     pub fn into_parts(self) -> (C, S, K) {
         (self.connector, self.sink, self.store)
     }

@@ -22,4 +22,4 @@ for attempt in $(seq 1 90); do
 done
 port="$(docker port "$container" 3306/tcp | sed 's/.*://')"
 HASHI_MYSQL_DISPOSABLE=1 HASHI_MYSQL_TEST_PORT="$port" CARGO_TARGET_DIR="$PWD/target" \
-  cargo test --locked --features mysql --test mysql_cdc -- --ignored --nocapture
+  cargo test --locked --features mysql --test mysql_cdc -- --ignored --nocapture --test-threads=1
