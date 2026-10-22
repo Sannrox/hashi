@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- OPC UA servers with history support backfill through the historian trait
+  (`opcua::historian::OpcUaHistorian`). Discovered variables without the
+  history access bit are reported by `check`, and the connector still runs
+  over the rest (#23).
+
 - One historian trait (tag discovery, paged raw and interpolated reads, live
   tail) and a connector that backfills in rate-limited time chunks with a
   checkpoint per tag in the cursor, then hands over to the live tail with no

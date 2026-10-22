@@ -85,6 +85,11 @@ pub trait Historian {
     ) -> Result<Vec<Sample>, Error> {
         self.read_raw(tag, after_ms, until_ms, limit)
     }
+    /// Series the source knows but cannot read history for. `check` reports
+    /// them; the connector still runs over the tags it has.
+    fn without_history(&self) -> &[String] {
+        &[]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,13 +389,20 @@ impl<H: Historian, T: Clock> Connector for HistorianConnector<H, T> {
     }
 
     fn check(&self) -> Result<CheckReport, Error> {
+        let mut message = if self.tags.is_empty() {
+            "historian reports no tags".to_string()
+        } else {
+            format!("{} tags", self.tags.len())
+        };
+        let without = self.historian.without_history();
+        if !without.is_empty() {
+            message.push_str(&format!("; {} without history", without.len()));
+        }
+        // Series without history are a reported condition, not a failure:
+        // the source answered, and the connector runs over what it has.
         Ok(CheckReport {
-            ok: !self.tags.is_empty(),
-            message: if self.tags.is_empty() {
-                "historian reports no tags".into()
-            } else {
-                format!("{} tags", self.tags.len())
-            },
+            ok: !self.tags.is_empty() || !without.is_empty(),
+            message,
         })
     }
 

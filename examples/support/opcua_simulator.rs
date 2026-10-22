@@ -305,6 +305,11 @@ impl Simulator {
             "HistoricalValue",
         )
     }
+    /// The folder that organizes the history fixture's variable.
+    #[allow(dead_code)]
+    pub fn history_root(&self) -> NodeId {
+        NodeId::new(self.history_value().namespace, "History")
+    }
     #[allow(dead_code)]
     pub fn set_history_value(&self, value: opcua::types::DataValue) {
         let manager = self
