@@ -30,6 +30,13 @@ pub fn builder(samples: Arc<Mutex<Vec<DataValue>>>) -> impl NodeManagerBuilder {
             .add_namespace(uri);
         space.add_namespace(uri, index);
         let value = samples.lock().unwrap().last().cloned().unwrap();
+        let folder = NodeId::new(index, "History");
+        assert!(space.add_folder(
+            &folder,
+            opcua::types::QualifiedName::new(index, "History"),
+            "History",
+            &ObjectId::ObjectsFolder.into()
+        ));
         VariableBuilder::new(
             &NodeId::new(index, "HistoricalValue"),
             opcua::types::QualifiedName::new(index, "HistoricalValue"),
@@ -40,7 +47,7 @@ pub fn builder(samples: Arc<Mutex<Vec<DataValue>>>) -> impl NodeManagerBuilder {
         .historizing(true)
         .access_level(AccessLevel::CURRENT_READ | AccessLevel::HISTORY_READ)
         .user_access_level(AccessLevel::CURRENT_READ | AccessLevel::HISTORY_READ)
-        .organized_by(ObjectId::ObjectsFolder)
+        .organized_by(folder)
         .insert(space);
         HistoryManager {
             namespace: NamespaceMetadata {

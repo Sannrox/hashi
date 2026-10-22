@@ -1,4 +1,5 @@
 //! Secure OPC UA sessions, bounded discovery, and durable subscription reads.
+pub mod historian;
 mod history;
 mod subscription;
 pub use history::HistoryConfig;
@@ -37,6 +38,7 @@ impl Policy {
     }
 }
 /// Never format credential contents into diagnostics.
+#[derive(Clone)]
 pub enum Authentication {
     UserName {
         user: String,
@@ -47,6 +49,7 @@ pub enum Authentication {
         private_key: PathBuf,
     },
 }
+#[derive(Clone)]
 pub struct Config {
     pub id: String,
     pub endpoint: String,
