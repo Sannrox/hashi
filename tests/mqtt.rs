@@ -637,3 +637,51 @@ mod sparkplug_b {
         );
     }
 }
+
+/// Conformance kit (#28) driver: JSON messages per key topic; drift is a schema revision.
+struct MqttFamily {
+    produced: u64,
+    prefix: String,
+    client_id: String,
+    schema_version: u64,
+}
+
+impl hashi::conformance::Family for MqttFamily {
+    type Source = MqttConnector;
+
+    fn connect(&mut self) -> Result<MqttConnector, hashi::Error> {
+        let mut config = config(Protocol::V5, &self.client_id, &self.prefix);
+        config.timeout = Duration::from_secs(1);
+        config.schema_version = self.schema_version;
+        MqttConnector::connect(config)
+    }
+
+    fn produce(&mut self, keys: &[&str]) -> Result<Vec<hashi::conformance::Change>, hashi::Error> {
+        let mut changes = Vec::new();
+        for key in keys {
+            self.produced += 1;
+            let topic = format!("{}/json/{key}", self.prefix);
+            publish(&topic, [format!("{{\"n\":{}}}", self.produced)]);
+            changes.push(hashi::conformance::Change::new(topic, "n", self.produced));
+        }
+        Ok(changes)
+    }
+
+    fn drift(&mut self) -> Result<hashi::conformance::Drift, hashi::Error> {
+        self.schema_version += 1;
+        Ok(hashi::conformance::Drift::Reported("reading".into()))
+    }
+}
+
+#[test]
+#[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
+fn mqtt_passes_the_conformance_kit() {
+    let mut family = MqttFamily {
+        produced: 0,
+        prefix: unique("hashi/conformance"),
+        client_id: unique("conformance"),
+        schema_version: 1,
+    };
+    let passed = hashi::conformance::run(&mut family, &temp_dir("hashi-mqtt-conformance")).unwrap();
+    assert_eq!(passed, hashi::conformance::CHECKS);
+}

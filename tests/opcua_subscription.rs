@@ -504,3 +504,66 @@ fn history_unsupported_is_reported_while_subscription_keeps_running() {
     drop(server);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+/// Conformance kit (#28) driver: one monitored node whose value changes past the
+/// deadband; drift is a schema revision.
+struct OpcUaFamily {
+    server: simulator::Simulator,
+    path: std::path::PathBuf,
+    value: f64,
+    schema_version: u64,
+}
+
+impl hashi::conformance::Family for OpcUaFamily {
+    type Source = OpcUaConnector;
+
+    fn connect(&mut self) -> Result<OpcUaConnector, hashi::Error> {
+        let mut config = config(&self.server, &self.path.join("client"));
+        config.schema_version = self.schema_version;
+        OpcUaConnector::subscribe(
+            config,
+            subscription(vec![self.server.value.clone()], &self.path.join("state")),
+        )
+    }
+
+    /// Each change writes a new value past the deadband; the value tells it apart
+    /// from the initial sample and from earlier changes.
+    fn produce(&mut self, keys: &[&str]) -> Result<Vec<hashi::conformance::Change>, hashi::Error> {
+        let mut changes = Vec::new();
+        for _ in keys {
+            self.value += 2.0;
+            self.server
+                .set_value(self.value, StatusCode::Good, DateTime::now());
+            changes.push(hashi::conformance::Change::new(
+                self.server.value.to_string(),
+                "value",
+                self.value,
+            ));
+            // Past the sampling interval, so every change is its own sample.
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(changes)
+    }
+
+    /// A schema revision on an existing spool fails closed until an operator
+    /// recovers its state (docs/opcua.md), so the kit checks the refusal.
+    fn drift(&mut self) -> Result<hashi::conformance::Drift, hashi::Error> {
+        self.schema_version += 1;
+        Ok(hashi::conformance::Drift::Refused)
+    }
+}
+
+#[test]
+fn opcua_passes_the_conformance_kit() {
+    let (path, server) = fixture(0);
+    let mut family = OpcUaFamily {
+        server,
+        path: path.clone(),
+        value: 21.5,
+        schema_version: 1,
+    };
+    let passed = hashi::conformance::run(&mut family, &path.join("checkpoints")).unwrap();
+    assert_eq!(passed, hashi::conformance::CHECKS);
+    drop(family);
+    std::fs::remove_dir_all(path).unwrap();
+}

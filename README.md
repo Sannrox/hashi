@@ -26,3 +26,4 @@ licenses; `cargo deny check licenses` enforces it (`deny.toml`).
 - [MySQL snapshot and change capture](docs/mysql.md)
 - [MQTT subscriptions](docs/mqtt.md)
 - [Historian backfill and live tail](docs/historian.md)
+- [Connector conformance kit](docs/conformance.md)

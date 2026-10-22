@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A connector conformance kit (`hashi::conformance`) checks every v0.1 family
+  against a live fixture: check, discover, snapshot, incremental, interruption
+  and resume, duplicate keys and schema drift. Modbus and OPC UA run it on
+  every pull request; MQTT and MySQL run it in their container jobs (#28).
+
 - Sparkplug B decoding on the MQTT connector: births, deaths, metric
   aliases and sequence numbers, with NCMD rebirth requests on a gap or an
   unknown node. Birth state is durable, so a restart still resolves aliases.
