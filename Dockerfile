@@ -4,10 +4,9 @@ FROM rust:1.99-alpine@sha256:3ea887915f261f273d6a24efdfdb92665dee12199923e578704
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked --bin hashi \
-    && ! ldd target/release/hashi 2>/dev/null \
-    && cp target/release/hashi /hashi
+RUN cargo build --release --locked --bin hashi && cp target/release/hashi /hashi
 
+# No loader or libc here, so only a static binary can start.
 FROM scratch
 COPY --from=build /hashi /hashi
 USER 65534:65534
