@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Optional MQTT 3.1.1 and 5 connector with verified TLS, client certificates or
+  user name and password, persistent QoS 1 sessions, shared subscriptions for
+  scale-out, and topic filters mapped to record kinds with JSON or raw
+  decoders. A message is acknowledged to the broker only after the runtime
+  committed it, so a crash redelivers instead of losing it (#20).
+
 - OPC UA servers with history support backfill through the historian trait
   (`opcua::historian::OpcUaHistorian`). Discovered variables without the
   history access bit are reported by `check`, and the connector still runs
