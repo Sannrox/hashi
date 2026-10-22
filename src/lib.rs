@@ -13,6 +13,7 @@ pub mod contract;
 pub mod credential;
 pub mod delivery;
 pub mod fake;
+pub mod historian;
 pub mod jsonl;
 pub mod kafka;
 pub mod modbus;

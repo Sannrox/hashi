@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- One historian trait (tag discovery, paged raw and interpolated reads, live
+  tail) and a connector that backfills in rate-limited time chunks with a
+  checkpoint per tag in the cursor, then hands over to the live tail with no
+  gap or overlap (#22).
+
 - `hashi run --config <file>` runs connector instances from a TOML config
   that declares sources, sinks and the checkpoint directory, and resumes
   after a restart. Credentials are file paths read on every use, so a rotated
