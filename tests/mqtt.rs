@@ -58,6 +58,7 @@ fn config(protocol: Protocol, client_id: &str, prefix: &str) -> Config {
         timeout: Duration::from_secs(3),
         max_packet_bytes: 64 * 1024,
         schema_version: 1,
+        sparkplug_state_dir: None,
     }
 }
 
@@ -308,4 +309,331 @@ fn tls_requires_a_trusted_client_certificate() {
     publish(&format!("{prefix}/json/a"), numbered(0..3));
     let (_, records) = drain(connector, &temp_dir("hashi-mqtt-tls"));
     assert_eq!(payloads(&records), numbered(0..3));
+}
+
+mod sparkplug_b {
+    use super::*;
+    use hashi::CheckpointStore;
+    use hashi::mqtt::sparkplug::{Metric, Payload, UNRESOLVED_KIND, Value};
+    use prost::Message as _;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Edge node simulator: publishes at QoS 1 and answers NCMD rebirth requests
+    /// with a fresh NBIRTH, as a Sparkplug B edge node does.
+    struct EdgeNode {
+        client: rumqttc::Client,
+        prefix: String,
+        seq: Arc<AtomicU64>,
+        published: Arc<AtomicUsize>,
+        acked: Arc<AtomicUsize>,
+        rebirths: Arc<AtomicUsize>,
+    }
+
+    fn metric(name: Option<&str>, alias: u64, datatype: Option<u32>, value: Value) -> Metric {
+        Metric {
+            name: name.map(str::to_string),
+            alias: Some(alias),
+            datatype,
+            value: Some(value),
+            ..Metric::default()
+        }
+    }
+
+    fn birth_metrics() -> Vec<Metric> {
+        vec![
+            metric(Some("bdSeq"), 0, Some(8), Value::Long(1)),
+            metric(Some("temp"), 1, Some(10), Value::Double(20.0)),
+            metric(Some("count"), 2, Some(3), Value::Int(-1i32 as u32)),
+        ]
+    }
+
+    impl EdgeNode {
+        fn start(group: &str) -> Self {
+            let prefix = format!("spBv1.0/{group}");
+            let mut options =
+                rumqttc::MqttOptions::new(unique("edge"), "127.0.0.1", port("HASHI_MQTT_PORT"));
+            options.set_keep_alive(Duration::from_secs(30));
+            let (client, mut connection) = rumqttc::Client::new(options, 256);
+            client
+                .subscribe(format!("{prefix}/NCMD/edge"), rumqttc::QoS::AtLeastOnce)
+                .unwrap();
+            let node = Self {
+                client: client.clone(),
+                prefix: prefix.clone(),
+                seq: Arc::new(AtomicU64::new(0)),
+                published: Arc::new(AtomicUsize::new(0)),
+                acked: Arc::new(AtomicUsize::new(0)),
+                rebirths: Arc::new(AtomicUsize::new(0)),
+            };
+            let responder = Self {
+                client,
+                prefix,
+                seq: node.seq.clone(),
+                published: node.published.clone(),
+                acked: node.acked.clone(),
+                rebirths: node.rebirths.clone(),
+            };
+            let (subscribed_tx, subscribed) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for event in connection.iter() {
+                    match event {
+                        Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_))) => {
+                            let _ = subscribed_tx.send(());
+                        }
+                        Ok(rumqttc::Event::Incoming(rumqttc::Packet::PubAck(_))) => {
+                            responder.acked.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
+                            let request = Payload::decode(publish.payload.as_ref()).unwrap();
+                            if request.metrics[0].name.as_deref() == Some("Node Control/Rebirth") {
+                                responder.rebirths.fetch_add(1, Ordering::SeqCst);
+                                responder.birth();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+            });
+            subscribed.recv_timeout(Duration::from_secs(10)).unwrap();
+            node
+        }
+
+        fn publish(
+            &self,
+            message: &str,
+            device: Option<&str>,
+            seq: Option<u64>,
+            metrics: Vec<Metric>,
+        ) {
+            let topic = match device {
+                Some(device) => format!("{}/{message}/edge/{device}", self.prefix),
+                None => format!("{}/{message}/edge", self.prefix),
+            };
+            let payload = Payload {
+                timestamp: Some(1_000),
+                metrics,
+                seq,
+            };
+            self.published.fetch_add(1, Ordering::SeqCst);
+            self.client
+                .publish(
+                    topic,
+                    rumqttc::QoS::AtLeastOnce,
+                    false,
+                    payload.encode_to_vec(),
+                )
+                .unwrap();
+        }
+
+        fn next_seq(&self) -> u64 {
+            self.seq.fetch_add(1, Ordering::SeqCst) % 256
+        }
+
+        fn birth(&self) {
+            self.seq.store(0, Ordering::SeqCst);
+            let seq = self.next_seq();
+            self.publish("NBIRTH", None, Some(seq), birth_metrics());
+        }
+
+        fn data(&self, metrics: Vec<Metric>) {
+            let seq = self.next_seq();
+            self.publish("NDATA", None, Some(seq), metrics);
+        }
+
+        /// Waits until the broker acknowledged everything published so far.
+        fn flush(&self) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while self.acked.load(Ordering::SeqCst) < self.published.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "edge node publishes were not acknowledged"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    fn sparkplug_config(client_id: &str, group: &str, state: &Path) -> Config {
+        let mut config = config(Protocol::V311, client_id, "unused");
+        config.routes = vec![Route {
+            filter: format!("spBv1.0/{group}/#"),
+            kind: "plant".into(),
+            decoder: Decoder::SparkplugB,
+        }];
+        config.sparkplug_state_dir = Some(state.join("sparkplug"));
+        config
+    }
+
+    fn json(record: &Record) -> serde_json::Value {
+        serde_json::from_str(&record.payload).unwrap()
+    }
+
+    fn alias(alias: u64, value: Value) -> Metric {
+        Metric {
+            alias: Some(alias),
+            value: Some(value),
+            ..Metric::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
+    fn birth_aliases_device_lifecycle_and_death() {
+        let group = unique("g");
+        let state = temp_dir("hashi-sparkplug-life");
+        let connector =
+            MqttConnector::connect(sparkplug_config(&unique("host"), &group, &state)).unwrap();
+        let node = EdgeNode::start(&group);
+        node.birth();
+        let seq = node.next_seq();
+        node.publish(
+            "DBIRTH",
+            Some("pump"),
+            Some(seq),
+            vec![metric(Some("level"), 3, Some(9), Value::Float(0.25))],
+        );
+        node.data(vec![
+            alias(1, Value::Double(21.5)),
+            alias(2, Value::Int(-7i32 as u32)),
+        ]);
+        let seq = node.next_seq();
+        node.publish(
+            "DDATA",
+            Some("pump"),
+            Some(seq),
+            vec![alias(3, Value::Float(0.5))],
+        );
+        let seq = node.next_seq();
+        node.publish("DDEATH", Some("pump"), Some(seq), vec![]);
+        node.publish(
+            "NDEATH",
+            None,
+            None,
+            vec![metric(Some("bdSeq"), 0, Some(8), Value::Long(1))],
+        );
+        node.flush();
+
+        let (_, records) = drain(connector, &state);
+        let summary: Vec<(String, serde_json::Value)> = records
+            .iter()
+            .map(|record| {
+                let payload = json(record);
+                (
+                    record.key.clone(),
+                    payload
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(payload["type"].clone()),
+                )
+            })
+            .collect();
+        let g = |key: &str| format!("{group}/edge{key}");
+        assert_eq!(
+            summary,
+            vec![
+                (g(""), "NBIRTH".into()),
+                (g("/temp"), 20.0.into()),
+                (g("/count"), (-1).into()),
+                (g("/pump"), "DBIRTH".into()),
+                (g("/pump/level"), 0.25.into()),
+                (g("/temp"), 21.5.into()),
+                (g("/count"), (-7).into()),
+                (g("/pump/level"), 0.5.into()),
+                (g("/pump"), "DDEATH".into()),
+                (g(""), "NDEATH".into()),
+            ]
+        );
+        assert!(records.iter().all(|record| record.kind == "plant"));
+        assert_eq!(node.rebirths.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
+    fn a_sequence_gap_requests_a_rebirth_and_unknown_aliases_are_quarantined() {
+        let group = unique("g");
+        let state = temp_dir("hashi-sparkplug-gap");
+        let connector =
+            MqttConnector::connect(sparkplug_config(&unique("host"), &group, &state)).unwrap();
+        let node = EdgeNode::start(&group);
+        node.birth();
+        node.data(vec![alias(1, Value::Double(1.0))]);
+        node.next_seq(); // lost on the way: the host sees a gap
+        node.data(vec![
+            alias(1, Value::Double(2.0)),
+            alias(9, Value::Double(9.0)),
+        ]);
+        node.flush();
+
+        let (_, records) = drain(connector, &state);
+        assert_eq!(
+            node.rebirths.load(Ordering::SeqCst),
+            1,
+            "one rebirth request for the gap"
+        );
+        let births = records
+            .iter()
+            .filter(|r| {
+                json(r)["type"] == "NBIRTH"
+                    && !r.key.ends_with("/temp")
+                    && !r.key.ends_with("/count")
+            })
+            .count();
+        assert_eq!(births, 2, "the node answered the rebirth request");
+        let temps: Vec<f64> = records
+            .iter()
+            .filter(|r| r.key.ends_with("/temp"))
+            .map(|r| json(r)["value"].as_f64().unwrap())
+            .collect();
+        assert_eq!(temps, vec![20.0, 1.0, 2.0, 20.0]);
+        let quarantined = FileCheckpoint::open(&state)
+            .unwrap()
+            .quarantined("mqtt-fixture", "line-a")
+            .unwrap();
+        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined[0].kind, UNRESOLVED_KIND);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&quarantined[0].payload).unwrap()["alias"],
+            9
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
+    fn reconnect_at_qos1_resolves_aliases_from_durable_births() {
+        let group = unique("g");
+        let client_id = unique("host");
+        let state = temp_dir("hashi-sparkplug-reconnect");
+        let connector =
+            MqttConnector::connect(sparkplug_config(&client_id, &group, &state)).unwrap();
+        let node = EdgeNode::start(&group);
+        node.birth();
+        node.data(vec![alias(1, Value::Double(1.0))]);
+        node.flush();
+        let (connector, first) = drain(connector, &state);
+        assert_eq!(first.len(), 4);
+        drop(connector);
+
+        // Offline: alias-only data waits in the persistent session.
+        for value in [2.0, 3.0, 4.0] {
+            node.data(vec![alias(1, Value::Double(value))]);
+        }
+        node.flush();
+        let connector =
+            MqttConnector::connect(sparkplug_config(&client_id, &group, &state)).unwrap();
+        let (_, second) = drain(connector, &state);
+        let values: Vec<serde_json::Value> =
+            second.iter().map(|r| json(r)["value"].clone()).collect();
+        assert_eq!(values, vec![2.0, 3.0, 4.0]);
+        assert!(second.iter().all(|r| r.key.ends_with("/edge/temp")));
+        assert_eq!(node.rebirths.load(Ordering::SeqCst), 0);
+        assert!(
+            FileCheckpoint::open(&state)
+                .unwrap()
+                .quarantined("mqtt-fixture", "line-a")
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

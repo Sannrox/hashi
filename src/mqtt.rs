@@ -4,6 +4,10 @@
 //! checkpoint reached its position. Only then is the QoS 1 acknowledgment sent,
 //! so a crash between the sink ack and the broker ack makes the broker redeliver.
 //! Delivery is at least once: a redelivered message gets a new position.
+//! One message can yield several records (Sparkplug B); it is acknowledged
+//! after the last of them is committed.
+pub mod sparkplug;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +38,9 @@ pub enum Decoder {
     Json,
     /// Payload is emitted as lowercase hex.
     Raw,
+    /// Sparkplug B: one record per metric plus birth and death records. Needs
+    /// `sparkplug_state_dir` and cannot share a subscription; see [`sparkplug`].
+    SparkplugB,
 }
 
 /// Messages on topics matching `filter` become records of `kind`. The first
@@ -77,6 +84,8 @@ pub struct Config {
     pub timeout: Duration,
     pub max_packet_bytes: usize,
     pub schema_version: u64,
+    /// Durable Sparkplug B birth state, owned by one instance. Required by Sparkplug B routes.
+    pub sparkplug_state_dir: Option<PathBuf>,
 }
 
 pub struct MqttConnector {
@@ -89,10 +98,19 @@ pub struct MqttConnector {
     /// Bumped on every ConnAck and disconnect. An ack is only valid on the connection that received the message.
     generation: u64,
     queue: VecDeque<Message>,
-    held: Option<(Position, Message)>,
+    held: Option<Held>,
     pending_subacks: usize,
     connected: bool,
     ack_sent: Option<u16>,
+    sparkplug: Option<sparkplug::Hosts>,
+}
+
+/// A message whose records are being handed to the runtime.
+struct Held {
+    message: Message,
+    pending: VecDeque<Record>,
+    /// The last record handed out and its position, until the runtime commits it.
+    emitted: Option<(Position, Record)>,
 }
 
 struct Message {
@@ -185,6 +203,13 @@ impl MqttConnector {
                 None => route.filter.clone(),
             })
             .collect();
+        let sparkplug = match &config.sparkplug_state_dir {
+            Some(dir) => Some(sparkplug::Hosts::open(
+                dir,
+                i64::try_from(config.timeout.as_millis()).unwrap_or(i64::MAX),
+            )?),
+            None => None,
+        };
         let mut connector = Self {
             id: config.id,
             routes: config.routes,
@@ -198,6 +223,7 @@ impl MqttConnector {
             pending_subacks: 0,
             connected: false,
             ack_sent: None,
+            sparkplug,
         };
         let deadline = Instant::now() + config.timeout;
         while !connector.connected || connector.pending_subacks > 0 {
@@ -277,7 +303,9 @@ impl MqttConnector {
         Ok(())
     }
 
-    fn record(&self, position: Position, message: &Message) -> Record {
+    /// The records of one message, positions unset. A Sparkplug B message may
+    /// yield none (commands, stale deaths) or several, and may publish a rebirth request.
+    fn records(&mut self, message: &Message) -> Result<Vec<Record>, Error> {
         let (topic, payload) = message.publish.topic_and_payload();
         let route = self
             .routes
@@ -285,21 +313,35 @@ impl MqttConnector {
             .find(|route| topic_matches(&route.filter, &topic));
         let (kind, payload, quality) = match route {
             None => (UNROUTED_KIND.to_string(), hex(payload), None),
+            Some(route) if route.decoder == Decoder::SparkplugB => {
+                let hosts = self
+                    .sparkplug
+                    .as_mut()
+                    .ok_or_else(|| Error::new("Sparkplug B route without state"))?;
+                let (records, rebirth) =
+                    hosts.decode(&route.kind, &topic, payload, message.received_ms)?;
+                // Best effort: a full request channel skips it, and the next
+                // unresolved message after the interval asks again.
+                if let Some(rebirth) = rebirth {
+                    self.session.try_publish(rebirth.topic, rebirth.payload);
+                }
+                return Ok(records);
+            }
             Some(route) => {
                 let (payload, quality) = decode(route.decoder, payload);
                 (route.kind.clone(), payload, quality)
             }
         };
-        Record {
+        Ok(vec![Record {
             source: None,
             kind,
             key: topic,
             source_ts_ms: message.received_ms,
             ingest_ts_ms: 0,
             quality,
-            position,
+            position: 0,
             payload,
-        }
+        }])
     }
 }
 
@@ -333,7 +375,7 @@ impl Connector for MqttConnector {
                     fields: BTreeMap::from([(
                         "payload".into(),
                         match decoder {
-                            Decoder::Json => FieldType::Text,
+                            Decoder::Json | Decoder::SparkplugB => FieldType::Text,
                             Decoder::Raw => FieldType::Bytes,
                         },
                     )]),
@@ -343,8 +385,8 @@ impl Connector for MqttConnector {
             .collect())
     }
 
-    /// `from` at or past the held message's position is the runtime's commit
-    /// proof, so the held message is acknowledged before the next one is read.
+    /// `from` at or past the last handed-out position is the runtime's commit
+    /// proof. A message is acknowledged once its last record is committed.
     fn read(
         &mut self,
         from: Option<Position>,
@@ -356,35 +398,56 @@ impl Connector for MqttConnector {
                 .checked_add(1)
                 .ok_or_else(|| Error::new("MQTT position exhausted"))?,
         };
-        if let Some((held, message)) = self.held.take() {
-            if from.is_some_and(|committed| committed >= held) {
-                self.acknowledge(&message)?;
-            } else {
-                // Not committed (a failed run left it): emit it again at the resumed position.
-                let record = self.record(position, &message);
-                self.held = Some((position, message));
-                return Ok(Some(record));
-            }
-        }
         let deadline = Instant::now() + self.timeout;
-        while self.queue.is_empty() || self.pending_subacks > 0 {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                // Caught up only counts on a live session; an outage must stay visible.
-                return if self.connected {
-                    Ok(None)
+        loop {
+            if let Some(mut held) = self.held.take() {
+                let committed = held
+                    .emitted
+                    .as_ref()
+                    .is_none_or(|(at, _)| from.is_some_and(|committed| committed >= *at));
+                // Not committed (a failed run left it): emit it again at the resumed position.
+                let next = if committed {
+                    held.pending.pop_front()
                 } else {
-                    Err(Error::new("MQTT broker unreachable"))
+                    held.emitted.take().map(|(_, record)| record)
                 };
+                if let Some(mut record) = next {
+                    record.position = position;
+                    held.emitted = Some((position, record.clone()));
+                    self.held = Some(held);
+                    return Ok(Some(record));
+                }
+                self.acknowledge(&held.message)?;
             }
-            self.poll(remaining)?;
+            while self.queue.is_empty() || self.pending_subacks > 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    // Caught up only counts on a live session; an outage must stay visible.
+                    return if self.connected {
+                        Ok(None)
+                    } else {
+                        Err(Error::new("MQTT broker unreachable"))
+                    };
+                }
+                self.poll(remaining)?;
+            }
+            let Some(message) = self.queue.pop_front() else {
+                continue;
+            };
+            match self.records(&message) {
+                Ok(records) => {
+                    self.held = Some(Held {
+                        message,
+                        pending: records.into(),
+                        emitted: None,
+                    })
+                }
+                Err(error) => {
+                    self.queue.push_front(message);
+                    return Err(error);
+                }
+            }
         }
-        let Some(message) = self.queue.pop_front() else {
-            return Ok(None);
-        };
-        let record = self.record(position, &message);
-        self.held = Some((position, message));
-        Ok(Some(record))
     }
 }
 
@@ -470,6 +533,19 @@ impl Session {
                 .map_err(|_| ()),
         };
         result.map_err(|()| Error::new("MQTT client closed"))
+    }
+
+    /// QoS 0 and nonblocking: never waits on the request channel that only `poll`
+    /// drains. A full or closed channel drops the request; callers retry later.
+    fn try_publish(&self, topic: String, payload: Vec<u8>) {
+        let _ = match self {
+            Self::V311(client, _) => client
+                .try_publish(topic, rumqttc::QoS::AtMostOnce, false, payload)
+                .map_err(|_| ()),
+            Self::V5(client, _) => client
+                .try_publish(topic, v5::mqttbytes::QoS::AtMostOnce, false, payload)
+                .map_err(|_| ()),
+        };
     }
 
     fn ack(&self, publish: &Publish) -> Result<(), Error> {
@@ -579,6 +655,7 @@ fn validate(config: &Config) -> Result<(), Error> {
     for route in &config.routes {
         if route.kind.trim().is_empty()
             || route.kind == UNROUTED_KIND
+            || route.kind == sparkplug::UNRESOLVED_KIND
             || route.filter.starts_with("$share/")
             || !valid_filter(&route.filter)
         {
@@ -586,6 +663,13 @@ fn validate(config: &Config) -> Result<(), Error> {
                 "invalid MQTT route for filter {:?}",
                 route.filter
             )));
+        }
+        if route.decoder == Decoder::SparkplugB
+            && (config.sparkplug_state_dir.is_none() || config.shared_group.is_some())
+        {
+            return Err(Error::new(
+                "Sparkplug B routes need sparkplug_state_dir and no shared_group",
+            ));
         }
         if *decoders.entry(&route.kind).or_insert(route.decoder) != route.decoder {
             return Err(Error::new(format!(
@@ -630,7 +714,8 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
 
 fn decode(decoder: Decoder, payload: &[u8]) -> (String, Option<String>) {
     match decoder {
-        Decoder::Raw => (hex(payload), None),
+        // Sparkplug B is decoded with its birth state in `MqttConnector::records`.
+        Decoder::Raw | Decoder::SparkplugB => (hex(payload), None),
         Decoder::Json => match serde_json::from_slice::<serde_json::Value>(payload) {
             Ok(value) => (value.to_string(), None),
             Err(_) => (hex(payload), Some("bad: payload is not JSON".into())),
@@ -691,6 +776,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_packet_bytes: 1024,
             schema_version: 1,
+            sparkplug_state_dir: None,
         };
         assert!(validate(&config(true, vec![route("a/+", Decoder::Json)])).is_ok());
         assert!(validate(&config(false, vec![route("a/+", Decoder::Json)])).is_err());
