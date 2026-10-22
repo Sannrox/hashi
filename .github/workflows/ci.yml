@@ -32,6 +32,27 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+  licenses:
+    # Copyleft and proprietary licenses never reach the default build (#25).
+    name: License gate (default build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --locked
+  licenses-optional:
+    # Optional features are reported separately and never block the gate.
+    name: License report (optional features)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          arguments: --locked --all-features
   opcua-container:
     name: OPC UA container fixture
     runs-on: ubuntu-latest

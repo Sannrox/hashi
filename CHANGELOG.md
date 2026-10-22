@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- CI refuses copyleft (GPL, LGPL, AGPL) and proprietary or unlicensed
+  dependencies in the default build with a `cargo deny` license gate
+  (`deny.toml`); optional features are reported separately and do not block
+  it (#25).
+
 - Add optional paged OPC UA raw-history backfill and durable reconnect gap recovery before monitored tail delivery.
 
 - Add optional MySQL consistent snapshots and GTID change capture with durable

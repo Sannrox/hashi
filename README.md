@@ -12,7 +12,8 @@ Hashi doesn't make governance decisions. It authenticates to sources, reads, nor
 
 Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues for planned work.
 
-License: Apache-2.0.
+License: Apache-2.0. The default build admits only permissive dependency
+licenses; `cargo deny check licenses` enforces it (`deny.toml`).
 
 ## Connector contracts
 
