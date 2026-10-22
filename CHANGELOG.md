@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `hashi run --config <file>` runs connector instances from a TOML config
+  that declares sources, sinks and the checkpoint directory, and resumes
+  after a restart. Credentials are file paths read on every use, so a rotated
+  file applies without a restart; their values never reach logs or errors.
+  Invalid configs are refused naming the field (#26).
+
 - CI refuses copyleft (GPL, LGPL, AGPL) and proprietary or unlicensed
   dependencies in the default build with a `cargo deny` license gate
   (`deny.toml`); optional features are reported separately and do not block

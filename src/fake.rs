@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::Error;
 use crate::connector::Connector;
 use crate::contract::{CheckReport, DiscoveredKind, Position, Record};
+use crate::credential::FileCredential;
 
 /// File-credentialed source that yields a programmed snapshot then incrementals.
 #[derive(Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct FakeSource {
     check_message: String,
     kinds: Vec<DiscoveredKind>,
     records: Vec<Record>,
+    /// Checked on every call, so a rotated file applies without a restart.
+    live_credential: Option<(FileCredential, Vec<String>)>,
 }
 
 impl FakeSource {
@@ -26,6 +29,29 @@ impl FakeSource {
             check_message: "reachable".into(),
             kinds,
             records,
+            live_credential: None,
+        }
+    }
+
+    /// A source readable only while `credential` holds a value whose
+    /// SHA-256 is in `accept_sha256`. The file is read on every call.
+    pub fn with_live_credential(
+        id: impl Into<String>,
+        records: Vec<Record>,
+        credential: FileCredential,
+        accept_sha256: Vec<String>,
+    ) -> Self {
+        let mut source = Self::new(id, records);
+        source.live_credential = Some((credential, accept_sha256));
+        source
+    }
+
+    fn credential_ok(&self) -> bool {
+        match &self.live_credential {
+            Some((credential, accepted)) => credential
+                .current()
+                .is_ok_and(|secret| accepted.contains(&secret.sha256())),
+            None => self.credential_ok,
         }
     }
 
@@ -69,14 +95,21 @@ impl Connector for FakeSource {
     }
 
     fn check(&self) -> Result<CheckReport, Error> {
+        let ok = self.credential_ok();
         Ok(CheckReport {
-            ok: self.credential_ok,
-            message: self.check_message.clone(),
+            ok,
+            message: if self.live_credential.is_none() {
+                self.check_message.clone()
+            } else if ok {
+                "reachable".into()
+            } else {
+                "credential missing or not accepted".into()
+            },
         })
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredKind>, Error> {
-        if !self.credential_ok {
+        if !self.credential_ok() {
             return Err(Error::new("discover refused: check failed"));
         }
         Ok(self.kinds.clone())
@@ -87,7 +120,7 @@ impl Connector for FakeSource {
         from: Option<Position>,
         _source_cursor: Option<&str>,
     ) -> Result<Option<Record>, Error> {
-        if !self.credential_ok {
+        if !self.credential_ok() {
             return Err(Error::new("read refused: check failed"));
         }
         Ok(self
