@@ -70,7 +70,7 @@ pub trait Family {
 /// One record a change must produce: its key, and a payload field holding the value
 /// the change wrote, so an older record for the same key cannot stand in for it.
 /// Numbers compare numerically, also when the payload encodes them as strings.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Change {
     pub key: String,
     pub field: String,
@@ -90,7 +90,7 @@ impl Change {
         }
     }
 
-    fn matches(&self, record: &Record) -> bool {
+    pub(crate) fn matches(&self, record: &Record) -> bool {
         if record.key != self.key || record.kind == CONTROL_KIND {
             return false;
         }

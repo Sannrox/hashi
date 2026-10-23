@@ -27,3 +27,4 @@ licenses; `cargo deny check licenses` enforces it (`deny.toml`).
 - [MQTT subscriptions](docs/mqtt.md)
 - [Historian backfill and live tail](docs/historian.md)
 - [Connector conformance kit](docs/conformance.md)
+- [Soak harness](docs/soak.md)

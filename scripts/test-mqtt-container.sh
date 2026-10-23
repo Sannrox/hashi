@@ -19,7 +19,9 @@ issue server localhost "subjectAltName=DNS:localhost,IP:127.0.0.1"
 issue client hashi-client "extendedKeyUsage=clientAuth"
 cat >"$certs/mosquitto.conf" <<'CONF'
 allow_anonymous true
-persistence false
+# Durable, so a soak's broker restart keeps acknowledged messages and sessions.
+persistence true
+persistence_location /mosquitto/data/
 listener 1883
 listener 8883
 cafile /mosquitto/config/ca.pem
@@ -41,6 +43,11 @@ for attempt in $(seq 1 30); do
   fi
   sleep 1
 done
-HASHI_MQTT_DISPOSABLE=1 HASHI_MQTT_PORT="$(port 1883)" HASHI_MQTT_TLS_PORT="$(port 8883)" HASHI_MQTT_CERTS="$certs" \
-  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}" \
-  cargo test --locked --features mqtt --test mqtt -- --ignored --nocapture
+export HASHI_MQTT_DISPOSABLE=1 HASHI_MQTT_PORT="$(port 1883)" HASHI_MQTT_TLS_PORT="$(port 8883)" \
+  HASHI_MQTT_CERTS="$certs" HASHI_MQTT_CONTAINER="$container" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+# HASHI_SOAK_ONLY=1 (the nightly soak) skips the proofs; the soak pauses and
+# restarts the broker, so it always runs alone, after them.
+if [ "${HASHI_SOAK_ONLY:-}" != 1 ]; then
+  cargo test --locked --features mqtt --test mqtt -- --ignored --nocapture --skip soak
+fi
+cargo test --locked --features mqtt --test mqtt -- --ignored --nocapture --exact mqtt_survives_a_soak_with_every_fault

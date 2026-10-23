@@ -1,0 +1,47 @@
+name: Soak
+# Nightly soak per family (#48): about five hours of produce and drain with
+# faults injected every ten minutes. Each run publishes its JSON report; a gap
+# fails the run. The 24-hour evidence run is separate (#29).
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Produce-and-drain time per family
+        default: "18000"
+permissions:
+  contents: read
+jobs:
+  soak:
+    name: Soak (${{ matrix.family }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [modbus, opcua, mqtt, mysql]
+    env:
+      HASHI_SOAK_SECS: ${{ inputs.seconds || '18000' }}
+      HASHI_SOAK_FAULT_SECS: "600"
+      HASHI_SOAK_REPORT_DIR: ${{ github.workspace }}/soak-reports
+      HASHI_SOAK_ONLY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - if: matrix.family == 'modbus'
+        run: cargo test --locked --test soak_modbus -- --nocapture
+      - if: matrix.family == 'opcua'
+        run: >-
+          cargo test --locked --features opcua-simulator --test opcua_subscription --
+          --exact opcua_survives_a_soak_with_every_fault --nocapture
+      - if: matrix.family == 'mqtt'
+        run: bash scripts/test-mqtt-container.sh
+      - if: matrix.family == 'mysql'
+        run: bash scripts/test-mysql-container.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report-${{ matrix.family }}
+          path: soak-reports/
+          if-no-files-found: error

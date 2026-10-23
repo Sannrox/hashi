@@ -505,24 +505,36 @@ fn history_unsupported_is_reported_while_subscription_keeps_running() {
     std::fs::remove_dir_all(path).unwrap();
 }
 
-/// Conformance kit (#28) driver: one monitored node whose value changes past the
-/// deadband; drift is a schema revision.
+/// Conformance kit (#28) and soak (#48) driver: one monitored node whose value
+/// changes past the deadband; drift is a schema revision.
 struct OpcUaFamily {
-    server: simulator::Simulator,
+    /// `None` while a soak's source restart has the server stopped.
+    server: Option<simulator::Simulator>,
+    /// The server's port, kept so a restart serves the same endpoint.
+    port: u16,
     path: std::path::PathBuf,
     value: f64,
     schema_version: u64,
+}
+
+impl OpcUaFamily {
+    fn server(&self) -> Result<&simulator::Simulator, hashi::Error> {
+        self.server
+            .as_ref()
+            .ok_or_else(|| hashi::Error::new("simulator stopped"))
+    }
 }
 
 impl hashi::conformance::Family for OpcUaFamily {
     type Source = OpcUaConnector;
 
     fn connect(&mut self) -> Result<OpcUaConnector, hashi::Error> {
-        let mut config = config(&self.server, &self.path.join("client"));
+        let server = self.server()?;
+        let mut config = config(server, &self.path.join("client"));
         config.schema_version = self.schema_version;
         OpcUaConnector::subscribe(
             config,
-            subscription(vec![self.server.value.clone()], &self.path.join("state")),
+            subscription(vec![server.value.clone()], &self.path.join("state")),
         )
     }
 
@@ -532,10 +544,10 @@ impl hashi::conformance::Family for OpcUaFamily {
         let mut changes = Vec::new();
         for _ in keys {
             self.value += 2.0;
-            self.server
-                .set_value(self.value, StatusCode::Good, DateTime::now());
+            let server = self.server()?;
+            server.set_value(self.value, StatusCode::Good, DateTime::now());
             changes.push(hashi::conformance::Change::new(
-                self.server.value.to_string(),
+                server.value.to_string(),
                 "value",
                 self.value,
             ));
@@ -557,13 +569,61 @@ impl hashi::conformance::Family for OpcUaFamily {
 fn opcua_passes_the_conformance_kit() {
     let (path, server) = fixture(0);
     let mut family = OpcUaFamily {
-        server,
+        port: url::Url::parse(&server.endpoint).unwrap().port().unwrap(),
+        server: Some(server),
         path: path.clone(),
         value: 21.5,
         schema_version: 1,
     };
     let passed = hashi::conformance::run(&mut family, &path.join("checkpoints")).unwrap();
     assert_eq!(passed, hashi::conformance::CHECKS);
+    drop(family);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// The in-process server can only restart: it has no pause, and its user is fixed.
+impl hashi::soak::Faults for OpcUaFamily {
+    fn faults(&self) -> Vec<hashi::soak::Fault> {
+        vec![hashi::soak::Fault::SourceRestart]
+    }
+
+    fn inject(&mut self, _: hashi::soak::Fault) -> Result<(), hashi::Error> {
+        self.server = None;
+        Ok(())
+    }
+
+    /// Starts the server again on its old port, so the endpoint is unchanged,
+    /// serving the current value: a device's process value outlives its server.
+    fn heal(&mut self, _: hashi::soak::Fault) -> Result<(), hashi::Error> {
+        let server = simulator::Simulator::start(&self.path.join("server"), "127.0.0.1", self.port);
+        server.set_value(self.value, StatusCode::Good, DateTime::now());
+        self.server = Some(server);
+        Ok(())
+    }
+}
+
+#[test]
+fn opcua_survives_a_soak_with_every_fault() {
+    let (path, server) = fixture(0);
+    let mut family = OpcUaFamily {
+        port: url::Url::parse(&server.endpoint).unwrap().port().unwrap(),
+        server: Some(server),
+        path: path.clone(),
+        value: 21.5,
+        schema_version: 1,
+    };
+    let report = hashi::soak::soak_from_env(
+        &mut family,
+        "opcua",
+        &path.join("checkpoints"),
+        Duration::from_secs(6),
+    );
+    assert!(report.passed, "{report:#?}");
+    assert!(
+        report
+            .faults
+            .contains_key(&hashi::soak::Fault::SourceRestart)
+    );
     drop(family);
     std::fs::remove_dir_all(path).unwrap();
 }
