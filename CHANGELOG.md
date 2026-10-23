@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- A soak harness (`hashi::soak`) loops produce and drain over a family's
+  conformance driver for a configured duration, injects network drops, source
+  restarts and credential rotations through per-family hooks, and writes a JSON
+  report with lag percentiles, throughput and gaps. Any undelivered change
+  fails the run. Every family runs a short soak on pull requests; a nightly
+  workflow runs about five hours per family and publishes the reports (#48).
+
 - A connector conformance kit (`hashi::conformance`) checks every v0.1 family
   against a live fixture: check, discover, snapshot, incremental, interruption
   and resume, duplicate keys and schema drift. Modbus and OPC UA run it on

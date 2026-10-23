@@ -21,5 +21,11 @@ for attempt in $(seq 1 90); do
   sleep 1
 done
 port="$(docker port "$container" 3306/tcp | sed 's/.*://')"
-HASHI_MYSQL_DISPOSABLE=1 HASHI_MYSQL_TEST_PORT="$port" CARGO_TARGET_DIR="$PWD/target" \
-  cargo test --locked --features mysql --test mysql_cdc -- --ignored --nocapture --test-threads=1
+export HASHI_MYSQL_DISPOSABLE=1 HASHI_MYSQL_TEST_PORT="$port" HASHI_MYSQL_CONTAINER="$container" \
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
+# HASHI_SOAK_ONLY=1 (the nightly soak) skips the proofs; the soak pauses the
+# server and kills sessions, so it always runs alone, after them.
+if [ "${HASHI_SOAK_ONLY:-}" != 1 ]; then
+  cargo test --locked --features mysql --test mysql_cdc -- --ignored --nocapture --test-threads=1 --skip soak
+fi
+cargo test --locked --features mysql --test mysql_cdc -- --ignored --nocapture --exact mysql_survives_a_soak_with_every_fault

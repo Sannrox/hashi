@@ -843,3 +843,193 @@ fn mysql_passes_the_conformance_kit() {
     let passed = hashi::conformance::run(&mut family, &path.join("checkpoints")).unwrap();
     assert_eq!(passed, hashi::conformance::CHECKS);
 }
+
+/// Runs `docker` against the fixture container and returns its trimmed stdout.
+fn docker(args: &[&str]) -> Result<String, hashi::Error> {
+    let output = std::process::Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|error| hashi::Error::new(format!("docker: {error}")))?;
+    if !output.status.success() {
+        return Err(hashi::Error::new(format!(
+            "docker {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+const SOAK_USER: &str = "hashi_soak";
+
+/// Soak (#48) driver over the conformance rows. The connector reads as its own
+/// user, so a credential rotation changes that user's password. The fixture's
+/// data lives on tmpfs, which a container restart would wipe, so a source
+/// restart kills every session of that user instead: the connector sees what a
+/// restarting server does to its clients.
+struct MySqlSoak {
+    rows: MySqlFamily,
+    container: String,
+    password: u64,
+}
+
+impl MySqlSoak {
+    fn password(&self) -> String {
+        format!("hashi-soak-{}", self.password)
+    }
+
+    fn admin<T>(
+        &self,
+        work: impl AsyncFnOnce(&mut Conn) -> Result<T, mysql_async::Error>,
+    ) -> Result<T, hashi::Error> {
+        let opts = self.rows.opts.clone();
+        self.rows
+            .runtime
+            .block_on(async move {
+                let mut conn = Conn::new(opts).await?;
+                let out = work(&mut conn).await?;
+                conn.disconnect().await?;
+                Ok(out)
+            })
+            .map_err(|error: mysql_async::Error| hashi::Error::new(format!("mysql admin: {error}")))
+    }
+}
+
+impl hashi::conformance::Family for MySqlSoak {
+    type Source = MySqlConnector;
+
+    fn connect(&mut self) -> Result<MySqlConnector, hashi::Error> {
+        let reader: Opts = OptsBuilder::from_opts(self.rows.opts.clone())
+            .user(Some(SOAK_USER))
+            .pass(Some(self.password()))
+            .into();
+        let mut config = config(reader, &self.rows.database, self.rows.state.clone());
+        config.id = "mysql-soak".into();
+        config.server_id = 2049;
+        config.timeout = Duration::from_secs(5);
+        MySqlConnector::connect(config)
+    }
+
+    fn seed(&mut self) -> Result<Vec<hashi::conformance::Change>, hashi::Error> {
+        self.rows.seed()
+    }
+
+    fn produce(&mut self, keys: &[&str]) -> Result<Vec<hashi::conformance::Change>, hashi::Error> {
+        self.rows.produce(keys)
+    }
+
+    fn drift(&mut self) -> Result<hashi::conformance::Drift, hashi::Error> {
+        Err(hashi::Error::new("the soak harness never drifts"))
+    }
+}
+
+impl hashi::soak::Faults for MySqlSoak {
+    fn faults(&self) -> Vec<hashi::soak::Fault> {
+        vec![
+            hashi::soak::Fault::NetworkDrop,
+            hashi::soak::Fault::SourceRestart,
+            hashi::soak::Fault::CredentialRotation,
+        ]
+    }
+
+    fn inject(&mut self, fault: hashi::soak::Fault) -> Result<(), hashi::Error> {
+        match fault {
+            hashi::soak::Fault::NetworkDrop => docker(&["pause", &self.container]).map(drop),
+            hashi::soak::Fault::SourceRestart => self.admin(async |conn| {
+                let sessions: Vec<u64> = conn
+                    .exec(
+                        "SELECT id FROM information_schema.processlist WHERE user = ?",
+                        (SOAK_USER,),
+                    )
+                    .await?;
+                for id in sessions {
+                    // A session may end on its own first.
+                    let _ = conn.query_drop(format!("KILL {id}")).await;
+                }
+                Ok(())
+            }),
+            hashi::soak::Fault::CredentialRotation => {
+                self.password += 1;
+                // ALTER USER takes no placeholders; the password is generated here.
+                let statement = format!(
+                    "ALTER USER '{SOAK_USER}'@'%' IDENTIFIED BY '{}'",
+                    self.password()
+                );
+                // Kept out of the binlog: the connector fails closed on account
+                // statements there (#49), and this fault is about the new credential.
+                self.admin(async move |conn| {
+                    conn.query_drop("SET SESSION sql_log_bin = 0").await?;
+                    conn.query_drop(statement).await
+                })
+            }
+        }
+    }
+
+    fn heal(&mut self, fault: hashi::soak::Fault) -> Result<(), hashi::Error> {
+        match fault {
+            hashi::soak::Fault::NetworkDrop => docker(&["unpause", &self.container]).map(drop),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mysql-container.sh"]
+fn mysql_survives_a_soak_with_every_fault() {
+    assert_eq!(std::env::var("HASHI_MYSQL_DISPOSABLE").as_deref(), Ok("1"));
+    let container = std::env::var("HASHI_MYSQL_CONTAINER").unwrap();
+    let port = std::env::var("HASHI_MYSQL_TEST_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .pass(Some("hashi-fixture-only"))
+        .into();
+    let database = format!("hashi_soak_{}", std::process::id());
+    let path = std::env::temp_dir().join(format!(
+        "hashi-mysql-soak-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let rows = MySqlFamily {
+        opts,
+        database: database.clone(),
+        state: path.join("source"),
+        ids: Default::default(),
+        columns: 0,
+        runtime: tokio::runtime::Runtime::new().unwrap(),
+    };
+    rows.execute(format!("CREATE DATABASE `{database}`"));
+    rows.execute(format!(
+        "CREATE TABLE `{database}`.items (id INT PRIMARY KEY, value VARCHAR(100) NOT NULL, \
+         count BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB"
+    ));
+    let mut family = MySqlSoak {
+        rows,
+        container,
+        password: 0,
+    };
+    let password = family.password();
+    family.rows.execute(format!(
+        "CREATE USER '{SOAK_USER}'@'%' IDENTIFIED BY '{password}'"
+    ));
+    family.rows.execute(format!(
+        "GRANT SELECT, RELOAD, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO '{SOAK_USER}'@'%'"
+    ));
+    let report = hashi::soak::soak_from_env(
+        &mut family,
+        "mysql",
+        &path.join("checkpoints"),
+        Duration::from_secs(45),
+    );
+    assert!(report.passed, "{report:#?}");
+    for fault in hashi::soak::Faults::faults(&family) {
+        assert!(report.faults.contains_key(&fault), "{fault:?}: {report:#?}");
+    }
+}

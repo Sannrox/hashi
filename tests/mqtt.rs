@@ -70,9 +70,12 @@ fn temp_dir(label: &str) -> PathBuf {
 
 /// Publishes at QoS 1 and returns once the broker acknowledged every message.
 fn publish(topic: &str, payloads: impl IntoIterator<Item = String>) {
+    publish_to(port("HASHI_MQTT_PORT"), topic, payloads);
+}
+
+fn publish_to(port: u16, topic: &str, payloads: impl IntoIterator<Item = String>) {
     let payloads: Vec<String> = payloads.into_iter().collect();
-    let mut options =
-        rumqttc::MqttOptions::new(unique("publisher"), "127.0.0.1", port("HASHI_MQTT_PORT"));
+    let mut options = rumqttc::MqttOptions::new(unique("publisher"), "127.0.0.1", port);
     options.set_keep_alive(Duration::from_secs(30));
     let (client, mut connection) = rumqttc::Client::new(options, payloads.len() + 1);
     for payload in &payloads {
@@ -638,12 +641,29 @@ mod sparkplug_b {
     }
 }
 
-/// Conformance kit (#28) driver: JSON messages per key topic; drift is a schema revision.
+/// Conformance kit (#28) and soak (#48) driver: JSON messages per key topic;
+/// drift is a schema revision. With a container, the soak pauses and restarts it.
 struct MqttFamily {
     produced: u64,
     prefix: String,
     client_id: String,
     schema_version: u64,
+    /// Broker port; a restarted container may publish a new one.
+    port: u16,
+    container: Option<String>,
+}
+
+impl MqttFamily {
+    fn new(label: &str, container: Option<String>) -> Self {
+        Self {
+            produced: 0,
+            prefix: unique(&format!("hashi/{label}")),
+            client_id: unique(label),
+            schema_version: 1,
+            port: port("HASHI_MQTT_PORT"),
+            container,
+        }
+    }
 }
 
 impl hashi::conformance::Family for MqttFamily {
@@ -651,6 +671,7 @@ impl hashi::conformance::Family for MqttFamily {
 
     fn connect(&mut self) -> Result<MqttConnector, hashi::Error> {
         let mut config = config(Protocol::V5, &self.client_id, &self.prefix);
+        config.port = self.port;
         config.timeout = Duration::from_secs(1);
         config.schema_version = self.schema_version;
         MqttConnector::connect(config)
@@ -661,7 +682,7 @@ impl hashi::conformance::Family for MqttFamily {
         for key in keys {
             self.produced += 1;
             let topic = format!("{}/json/{key}", self.prefix);
-            publish(&topic, [format!("{{\"n\":{}}}", self.produced)]);
+            publish_to(self.port, &topic, [format!("{{\"n\":{}}}", self.produced)]);
             changes.push(hashi::conformance::Change::new(topic, "n", self.produced));
         }
         Ok(changes)
@@ -676,12 +697,87 @@ impl hashi::conformance::Family for MqttFamily {
 #[test]
 #[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
 fn mqtt_passes_the_conformance_kit() {
-    let mut family = MqttFamily {
-        produced: 0,
-        prefix: unique("hashi/conformance"),
-        client_id: unique("conformance"),
-        schema_version: 1,
-    };
+    let mut family = MqttFamily::new("conformance", None);
     let passed = hashi::conformance::run(&mut family, &temp_dir("hashi-mqtt-conformance")).unwrap();
     assert_eq!(passed, hashi::conformance::CHECKS);
+}
+
+/// Runs `docker` against the fixture container and returns its trimmed stdout.
+fn docker(args: &[&str]) -> Result<String, hashi::Error> {
+    let output = std::process::Command::new("docker")
+        .args(args)
+        .output()
+        .map_err(|error| hashi::Error::new(format!("docker: {error}")))?;
+    if !output.status.success() {
+        return Err(hashi::Error::new(format!(
+            "docker {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+impl hashi::soak::Faults for MqttFamily {
+    /// The anonymous fixture broker has no credential to rotate.
+    fn faults(&self) -> Vec<hashi::soak::Fault> {
+        match self.container {
+            Some(_) => vec![
+                hashi::soak::Fault::NetworkDrop,
+                hashi::soak::Fault::SourceRestart,
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    fn inject(&mut self, fault: hashi::soak::Fault) -> Result<(), hashi::Error> {
+        let container = self.container.as_deref().unwrap_or_default();
+        match fault {
+            hashi::soak::Fault::NetworkDrop => docker(&["pause", container]).map(drop),
+            hashi::soak::Fault::SourceRestart => docker(&["restart", container]).map(drop),
+            hashi::soak::Fault::CredentialRotation => {
+                Err(hashi::Error::new("no credential to rotate"))
+            }
+        }
+    }
+
+    /// Unpauses, or waits for the restarted broker on its possibly new port.
+    fn heal(&mut self, fault: hashi::soak::Fault) -> Result<(), hashi::Error> {
+        let container = self.container.as_deref().unwrap_or_default();
+        if fault == hashi::soak::Fault::NetworkDrop {
+            return docker(&["unpause", container]).map(drop);
+        }
+        for _ in 0..60 {
+            if let Ok(mapped) = docker(&["port", container, "1883/tcp"])
+                && let Some(port) = mapped
+                    .lines()
+                    .next()
+                    .and_then(|line| line.rsplit(':').next())
+                    .and_then(|port| port.parse::<u16>().ok())
+                && std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            {
+                self.port = port;
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Err(hashi::Error::new("restarted broker did not come back"))
+    }
+}
+
+#[test]
+#[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
+fn mqtt_survives_a_soak_with_every_fault() {
+    let container = std::env::var("HASHI_MQTT_CONTAINER").unwrap();
+    let mut family = MqttFamily::new("soak", Some(container));
+    let report = hashi::soak::soak_from_env(
+        &mut family,
+        "mqtt",
+        &temp_dir("hashi-mqtt-soak"),
+        Duration::from_secs(30),
+    );
+    assert!(report.passed, "{report:#?}");
+    for fault in hashi::soak::Faults::faults(&family) {
+        assert!(report.faults.contains_key(&fault), "{fault:?}: {report:#?}");
+    }
 }
