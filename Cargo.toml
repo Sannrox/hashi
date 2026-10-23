@@ -30,3 +30,9 @@ mysql = ["dep:chrono", "dep:mysql_async", "dep:mysql_common", "dep:futures-util"
 mqtt = ["dep:prost", "dep:rumqttc", "dep:rustls", "dep:tokio"]
 opcua = ["dep:async-opcua", "dep:tokio", "dep:url"]
 opcua-simulator = ["dep:async-trait", "opcua", "async-opcua/server", "tokio/net", "tokio/macros"]
+
+# Dependencies build without debug info in dev and test builds: backtraces
+# and debuggers keep full detail for workspace crates, and build directories
+# stay a fraction of the size.
+[profile.dev.package."*"]
+debug = false
