@@ -16,16 +16,19 @@ async-opcua = { version = "0.19.0", features = ["client"], optional = true }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 prost = { version = "0.14.4", default-features = false, features = ["derive", "std"], optional = true }
-parquet = { version = "60.0.0", default-features = false }
-serde = { version = "1.0.229", features = ["derive"] }
+parquet = { version = "60.0.0", default-features = false, optional = true }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = "1.0.154"
 sha2 = "0.10.9"
-serialport = { version = "4.10.1", default-features = false, features = ["serde"] }
+serialport = { version = "4.10.1", default-features = false, optional = true }
 toml = { version = "0.9.12", default-features = false, features = ["parse", "serde", "std"] }
-tokio = { version = "1.54.0", features = ["rt-multi-thread", "time"], optional = true }
+tokio = { version = "1.54.0", default-features = false, features = ["rt-multi-thread", "time"], optional = true }
 url = { version = "2.5.8", optional = true }
 
 [features]
+default = ["parquet", "modbus"]
+parquet = ["dep:parquet"]
+modbus = ["dep:serialport"]
 mysql = ["dep:chrono", "dep:mysql_async", "dep:mysql_common", "dep:futures-util", "dep:tokio"]
 mqtt = ["dep:prost", "dep:rumqttc", "dep:rustls", "dep:tokio"]
 opcua = ["dep:async-opcua", "dep:tokio", "dep:url"]

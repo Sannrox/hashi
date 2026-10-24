@@ -18,6 +18,7 @@ pub mod fake;
 pub mod historian;
 pub mod jsonl;
 pub mod kafka;
+#[cfg(feature = "modbus")]
 pub mod modbus;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
@@ -27,6 +28,7 @@ pub mod observe;
 #[cfg(feature = "opcua")]
 pub mod opcua;
 pub mod outbox;
+#[cfg(feature = "parquet")]
 pub mod parquet;
 pub mod platform;
 pub mod runtime;
@@ -47,6 +49,7 @@ pub use credential::{FileCredential, Secret};
 pub use fake::FakeSource;
 pub use jsonl::JsonLinesSink;
 pub use kafka::KafkaCompatibleSink;
+#[cfg(feature = "parquet")]
 pub use parquet::ParquetSink;
 pub use platform::{CapturePeer, PLATFORM_SINK_PROTOCOL, PlatformPeer, PlatformSdkSink};
 pub use runtime::{NullClock, RunReport, Runtime, RuntimeConfig, SystemClock};

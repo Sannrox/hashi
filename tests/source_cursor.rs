@@ -232,6 +232,7 @@ fn source_metadata_round_trips_through_every_sink_and_buffer_encoding() {
     assert_eq!(&frame[4..8], &1u32.to_le_bytes());
     sample.push(legacy);
     let mut json = hashi::JsonLinesSink::open(path.join("json")).unwrap();
+    #[cfg(feature = "parquet")]
     let mut parquet = hashi::ParquetSink::open(path.join("parquet")).unwrap();
     let mut kafka = hashi::KafkaCompatibleSink::open(path.join("kafka"), "records").unwrap();
     let mut platform = hashi::PlatformSdkSink::new(hashi::CapturePeer::new());
@@ -245,23 +246,21 @@ fn source_metadata_round_trips_through_every_sink_and_buffer_encoding() {
             *record
         );
         json.deliver(record, &key).unwrap();
+        #[cfg(feature = "parquet")]
         parquet.deliver(record, &key).unwrap();
         kafka.deliver(record, &key).unwrap();
         platform.deliver(record, &key).unwrap();
     }
-    for rows in [
-        json.replay().unwrap(),
-        parquet.replay().unwrap(),
-        kafka.replay().unwrap(),
-        platform.into_peer().decoded().unwrap(),
-    ] {
-        assert_eq!(
-            rows.into_iter()
-                .map(|(record, _)| record)
-                .collect::<Vec<_>>(),
-            sample
-        );
-    }
+    let decoded = |rows: Vec<(Record, IdempotencyKey)>| {
+        rows.into_iter()
+            .map(|(record, _)| record)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(decoded(json.replay().unwrap()), sample);
+    #[cfg(feature = "parquet")]
+    assert_eq!(decoded(parquet.replay().unwrap()), sample);
+    assert_eq!(decoded(kafka.replay().unwrap()), sample);
+    assert_eq!(decoded(platform.into_peer().decoded().unwrap()), sample);
     std::fs::remove_dir_all(path).unwrap();
 }
 

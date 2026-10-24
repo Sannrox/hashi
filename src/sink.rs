@@ -77,6 +77,7 @@ mod tests {
     use crate::fake::{FakeSource, record};
     use crate::jsonl::JsonLinesSink;
     use crate::kafka::KafkaCompatibleSink;
+    #[cfg(feature = "parquet")]
     use crate::parquet::ParquetSink;
     use crate::platform::{CapturePeer, PlatformSdkSink};
     use crate::runtime::{NullClock, Runtime, RuntimeConfig};
@@ -141,6 +142,7 @@ mod tests {
         assert_eq!(rows[3].0.position, 4);
     }
 
+    #[cfg(feature = "parquet")]
     #[test]
     fn parquet_ack_resume_and_per_key_order() {
         let dir = dir();

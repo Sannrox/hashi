@@ -36,7 +36,7 @@ return one key per change set, since it reports current state.
 | MQTT | Disposable broker | Schema revision | MQTT container fixture |
 | MySQL | Disposable database | `ALTER TABLE ... ADD COLUMN` | MySQL container fixture |
 
-Run one family locally with `cargo test --test conformance_modbus`,
+Run one family locally with `cargo test --test conformance_modbus` (default feature `modbus`),
 `cargo test --features opcua-simulator --test opcua_subscription opcua_passes`,
 or the family's container script (`scripts/test-mqtt-container.sh`,
 `scripts/test-mysql-container.sh`). The MySQL script runs its tests one at a

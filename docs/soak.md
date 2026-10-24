@@ -56,7 +56,7 @@ between faults; default one round spread over the run) and
 `HASHI_SOAK_REPORT_DIR` (where `<family>.json` is written):
 
 ```sh
-cargo test --test soak_modbus
+cargo test --test soak_modbus # default feature modbus
 cargo test --features opcua-simulator --test opcua_subscription opcua_survives
 bash scripts/test-mqtt-container.sh
 bash scripts/test-mysql-container.sh
