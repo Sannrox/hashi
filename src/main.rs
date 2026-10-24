@@ -1,7 +1,9 @@
 //! `hashi` prints its version; `hashi run --config <file> [--once]
 //! [--interval-ms <n>] [--listen <addr>]` runs the configured instances, once
 //! or until stopped, optionally serving `/healthz` and `/metrics` on `<addr>`;
-//! `hashi diagnostics --config <file>` prints a support bundle as JSON.
+//! `hashi diagnostics --config <file>` prints a support bundle as JSON;
+//! `hashi outbox` runs MySQL change capture once for a sandboxed host, from
+//! the files its `CONNECTOR_*` variables name (see `hashi::outbox`).
 
 use std::net::TcpListener;
 use std::process::ExitCode;
@@ -11,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hashi::observe::{Metrics, serve};
 use hashi::{Config, Service};
 
-const USAGE: &str = "usage: hashi run --config <file> [--once] [--interval-ms <n>] [--listen <addr>]\n       hashi diagnostics --config <file>";
+const USAGE: &str = "usage: hashi run --config <file> [--once] [--interval-ms <n>] [--listen <addr>]\n       hashi diagnostics --config <file>\n       hashi outbox";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -26,6 +28,7 @@ fn main() -> ExitCode {
     let outcome = match args[0].as_str() {
         "run" => run(&args[1..]),
         "diagnostics" => diagnostics(&args[1..]),
+        "outbox" => outbox(&args[1..]),
         _ => Err(USAGE.into()),
     };
     match outcome {
@@ -42,6 +45,29 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// One run into the host's outbox; the pages written go to stderr.
+fn outbox(args: &[String]) -> Result<ExitCode, String> {
+    if !args.is_empty() {
+        return Err(USAGE.into());
+    }
+    #[cfg(feature = "mysql")]
+    {
+        let files = hashi::outbox::HostFiles::from_env().map_err(|error| error.message)?;
+        match hashi::outbox::run_mysql_once(&files) {
+            Ok(pages) => {
+                eprintln!("hashi: wrote {pages} pages");
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(error) => {
+                eprintln!("hashi: {}", error.message);
+                Ok(ExitCode::FAILURE)
+            }
+        }
+    }
+    #[cfg(not(feature = "mysql"))]
+    Err("hashi outbox needs the mysql feature".into())
 }
 
 fn diagnostics(args: &[String]) -> Result<ExitCode, String> {

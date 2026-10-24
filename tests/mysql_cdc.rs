@@ -1033,3 +1033,157 @@ fn mysql_survives_a_soak_with_every_fault() {
         assert!(report.faults.contains_key(&fault), "{fault:?}: {report:#?}");
     }
 }
+
+/// One outbox run (#63) from `committed` into a fresh outbox: the pages it
+/// wrote, in order.
+fn outbox_run(
+    port: u16,
+    database: &str,
+    committed: &str,
+    work: &std::path::Path,
+    run: usize,
+) -> Vec<serde_json::Value> {
+    let dir = work.join(format!("run-{run}"));
+    let outbox = dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    std::fs::write(dir.join("checkpoint"), committed).unwrap();
+    std::fs::write(dir.join("credential"), "hashi-fixture-only\n").unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::json!({
+            "envelope": {
+                "namespace": "orders",
+                "producer_identity": "connector.hashi",
+                "source": "mysql",
+                "source_instance": "fixture",
+                "type_digest": format!("sha256:{}", "a".repeat(64)),
+            },
+            "url": format!("mysql://root@127.0.0.1:{port}"),
+            "tables": [{"database": database, "table": "orders"}],
+            "server_id": 2048,
+            "allow_insecure_lab": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let pages = hashi::outbox::run_mysql_once(&hashi::outbox::HostFiles {
+        checkpoint: dir.join("checkpoint"),
+        credential: dir.join("credential"),
+        config: dir.join("config.json"),
+        outbox: outbox.clone(),
+    })
+    .unwrap();
+    (1..=pages)
+        .map(|n| {
+            assert!(outbox.join(format!("{n:06}.ok")).exists());
+            serde_json::from_slice(&std::fs::read(outbox.join(format!("{n:06}.json"))).unwrap())
+                .unwrap()
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mysql-container.sh"]
+fn outbox_runs_page_an_insert_update_and_delete_cursor_to_cursor() {
+    assert_eq!(std::env::var("HASHI_MYSQL_DISPOSABLE").as_deref(), Ok("1"));
+    let port = std::env::var("HASHI_MYSQL_TEST_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .pass(Some("hashi-fixture-only"))
+        .into();
+    let database = format!("hashi_outbox_{}", std::process::id());
+    let work = std::env::temp_dir().join(format!(
+        "hashi-outbox-it-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let sql = |statements: Vec<String>| {
+        runtime.block_on(async {
+            let mut conn = Conn::new(opts.clone()).await.unwrap();
+            for statement in statements {
+                conn.query_drop(statement).await.unwrap();
+            }
+            conn.disconnect().await.unwrap();
+        })
+    };
+    sql(vec![
+        format!("CREATE DATABASE `{database}`"),
+        format!(
+            "CREATE TABLE `{database}`.orders (id INT PRIMARY KEY, status VARCHAR(20) NOT NULL) ENGINE=InnoDB"
+        ),
+        format!("INSERT INTO `{database}`.orders VALUES (1, 'open')"),
+    ]);
+
+    // The first run snapshots the table.
+    let snapshot = outbox_run(port, &database, "", &work, 1);
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0]["current_cursor"], "");
+    assert_eq!(snapshot[0]["records"][0]["properties"]["status"], "open");
+    let committed = snapshot[0]["proposed_next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    sql(vec![
+        format!("INSERT INTO `{database}`.orders VALUES (2, 'open')"),
+        format!("UPDATE `{database}`.orders SET status = 'paid' WHERE id = 1"),
+        format!("DELETE FROM `{database}`.orders WHERE id = 2"),
+    ]);
+    let changes = outbox_run(port, &database, &committed, &work, 2);
+    assert!(!changes.is_empty());
+    let mut expected = committed.clone();
+    let mut seen = Vec::new();
+    for page in &changes {
+        assert_eq!(page["current_cursor"], expected.as_str());
+        assert!(page.get("delivery").is_none());
+        expected = page["proposed_next_cursor"].as_str().unwrap().to_owned();
+        for record in page["records"].as_array().unwrap() {
+            seen.push((
+                record["external_id"].as_str().unwrap().to_owned(),
+                record["properties"]["status"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                record["deleted"].as_bool().unwrap(),
+            ));
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            ("[2]".to_owned(), "open".to_owned(), false),
+            ("[1]".to_owned(), "paid".to_owned(), false),
+            // A delete carries the key, not the row.
+            ("[2]".to_owned(), String::new(), true),
+        ]
+    );
+
+    // The host refused them: a rerun from the same cursor names its pages
+    // the same and carries the same records.
+    let again = outbox_run(port, &database, &committed, &work, 3);
+    let keys = |pages: &[serde_json::Value]| -> Vec<(String, String)> {
+        pages
+            .iter()
+            .map(|page| {
+                (
+                    page["idempotency_key"].as_str().unwrap().to_owned(),
+                    page["batch_digest"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(keys(&again), keys(&changes));
+    // Nothing new past the last cursor.
+    assert!(outbox_run(port, &database, &expected, &work, 4).is_empty());
+    sql(vec![format!("DROP DATABASE `{database}`")]);
+    let _ = std::fs::remove_dir_all(&work);
+}

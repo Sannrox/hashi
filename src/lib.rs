@@ -26,6 +26,7 @@ pub mod mysql;
 pub mod observe;
 #[cfg(feature = "opcua")]
 pub mod opcua;
+pub mod outbox;
 pub mod parquet;
 pub mod platform;
 pub mod runtime;
