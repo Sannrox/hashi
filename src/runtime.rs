@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::Error;
 use crate::checkpoint::{Checkpoint, CheckpointStore, QuarantineRow};
 use crate::connector::Connector;
-use crate::contract::{CONTRACT_VERSION, IdempotencyKey, Position, Record};
+use crate::contract::{CONTRACT_VERSION, Position, Record};
 use crate::sink::{DeliverError, Sink};
 
 pub trait Clock {
@@ -396,14 +396,11 @@ fn backoff_ms(attempt: u32, position: Position) -> u64 {
     base + jitter
 }
 
-pub fn idempotency(record: &Record, connector: &str, instance: &str) -> IdempotencyKey {
-    record.idempotency_key(connector, instance)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::checkpoint::FileCheckpoint;
+    use crate::contract::IdempotencyKey;
     use crate::fake::{FakeSource, record};
     use crate::sink::MemorySink;
     use std::fs;

@@ -106,7 +106,7 @@ pub fn encode_frame(record: &Record, idk: &IdempotencyKey) -> Vec<u8> {
     buf
 }
 
-pub fn decode_frame(frame: &[u8]) -> Result<(Record, IdempotencyKey), Error> {
+pub(crate) fn decode_frame(frame: &[u8]) -> Result<(Record, IdempotencyKey), Error> {
     let mut cur = frame;
     cur = take_magic(cur)?;
     let version = take_u32(&mut cur)?;
