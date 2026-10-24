@@ -1,6 +1,8 @@
 //! In-process source used to prove the runtime without a protocol connector.
 
+#[cfg(test)]
 use std::fs;
+#[cfg(test)]
 use std::path::Path;
 
 use crate::Error;
@@ -56,7 +58,8 @@ impl FakeSource {
     }
 
     /// `credential` must exist next to the instance and match `expected`.
-    pub fn with_credential_file(
+    #[cfg(test)]
+    pub(crate) fn with_credential_file(
         id: impl Into<String>,
         records: Vec<Record>,
         dir: &Path,

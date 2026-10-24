@@ -3,16 +3,21 @@
 ## Project Structure & Module Organization
 
 `hashi` is a Rust 2024 crate. Connector engine: industrial protocols and change data capture with one checkpointed contract. Source lives in `src/`. Integration
-tests go in `tests/`. Read `VISION.md` (vision and roadmap) and accepted ADRs
-under `docs/decisions/` before changing system boundaries.
+tests go in `tests/`. Read `VISION.md` (vision and roadmap), `README.md`, and
+accepted ADRs under `docs/decisions/` before changing system boundaries.
 
 ## Build, Test, and Development Commands
 
 - `cargo fmt` formats Rust code before review.
 - `cargo test` runs the test suite.
 - `cargo clippy --all-targets --all-features --locked -- -D warnings` matches CI.
-- `make test-integration` includes optional protocol features and simulator fixtures.
 - `make validate`, `make test` and `make test-integration` are the local gates.
+  They match the build, test, fmt and clippy jobs in `.github/workflows/ci.yml`:
+  `cargo build --all-targets --all-features --locked`,
+  `cargo test --all-features --locked`, `cargo fmt --check`, and
+  `cargo clippy --all-targets --all-features --locked -- -D warnings`. CI also
+  runs `cargo deny check licenses`, OPC UA/MySQL/MQTT container fixtures, and
+  the offline image.
 
 GitHub Issues are the planning source of truth. Project-specific Skills live
 under `.agents/skills/`. Never commit hostnames, home paths, secrets or
@@ -25,8 +30,7 @@ review. For non-trivial implementation work (any behavior, security, settings,
 or public-API change) that will be **committed, pushed, or opened as a PR**:
 
 1. Run `make update`, `make validate`, `make test`, and
-   `make test-integration` via the `verify-change` Skill. Run `make test-e2e`
-   when the host proof is affected.
+   `make test-integration` via the `verify-change` Skill.
 2. Run **`autoreview`** before the ship commit (or before push if the commit
    already exists). **Do not vendor** the autoreview skill into this repo;
    resolve the helper from the shared skill install (first match wins):
@@ -38,8 +42,6 @@ or public-API change) that will be **committed, pushed, or opened as a PR**:
      export AUTOREVIEW="$HOME/Projects/agent-skills/skills/autoreview/scripts/autoreview"
    elif [ -x "${AGENTS_HOME:-$HOME/.agents}/skills/autoreview/scripts/autoreview" ]; then
      export AUTOREVIEW="${AGENTS_HOME:-$HOME/.agents}/skills/autoreview/scripts/autoreview"
-   elif [ -x "$HOME/Projects/sekai-chisei/.agents/skills/autoreview/scripts/autoreview" ]; then
-     export AUTOREVIEW="$HOME/Projects/sekai-chisei/.agents/skills/autoreview/scripts/autoreview"
    else
      echo "autoreview helper not found; install shared agent-skills or set AUTOREVIEW" >&2
      exit 1
@@ -65,7 +67,7 @@ Docs-only typo fixes and pure formatting may skip structured review; state the
 waiver. The `deliver-ready-issue` Skill requires this same closeout before
 publish/land.
 
-Default review engine is Codex (`gpt-5.5` via the helper). Read the shared
+Default review engine is Codex (`gpt-6.1-sol` via the helper). Read the shared
 `autoreview` skill’s `SKILL.md` next to the resolved helper for engines and
 findings policy.
 
@@ -140,9 +142,9 @@ implementation Pull Requests plus claim branches without one. Assigned or
 planned work with neither is not a running lane.
 
 Parallel lanes must not collide. Collision surfaces in this repository are
-ports and settings, governance adapters, the workspace jail, the
-sekai-client proto pin, and the kekkai pin. Lanes that would both change one of these surfaces run
-in sequence, not in parallel.
+config, checkpoint and quarantine files, sink outputs, the store-and-forward
+buffer, protocol connectors, schema state, and outbox host files. Lanes that
+would both change one of these surfaces run in sequence, not in parallel.
 
 A lane publishes its first Verified commit to the claim branch as a draft Pull
 Request that closes the Issue. Public GitHub lane fields may list only: claim
@@ -173,49 +175,41 @@ procedure is `.agents/skills/deliver-ready-issue/references/parallel-delivery.md
 Follow standard Rust formatting with `cargo fmt` and keep modules aligned with
 the existing domain boundaries. Use `snake_case` for files, modules, functions,
 and variables; use `PascalCase` for types and traits; use
-`SCREAMING_SNAKE_CASE` for constants. Keep governance, workspace, model, and
-event behavior behind port traits and in-tree adapters. Prefer explicit
-fail-closed governance when required over silent degradation. Keep the binary thin; put logic in the library.
+`SCREAMING_SNAKE_CASE` for constants. Prefer explicit fail-closed checks
+(missing credentials, unreadable checkpoints, sink nack, schema drift) over
+silent degradation. Keep the CLI thin; put logic in the library so tests and
+hosts can embed the engine without shelling out.
 
 ## Testing Guidelines
 
-Add focused tests for changes touching the turn loop, tools, workspace
-materialization, settings resolution, or governance adapters. Prefer
-deterministic tests that do not require external services. Mark plane- or
-provider-dependent tests ignored, following `tests/plane_live.rs`, and document
-required local services in the test or related docs. Offline `cargo test` must
-stay green without sekai-chisei.
+Add focused tests for changes touching connectors, checkpoints, sinks, the
+buffer, schema drift, the outbox, or operations. Prefer deterministic tests
+that do not require a live source. Offline `cargo test` must stay green without
+optional protocol fixtures.
 
 ## Commit & Pull Request Guidelines
 
 Use short imperative subjects, often Conventional Commit style:
-`feat(run): jail bash to workspace`, `docs: document settings resolution`,
-`fix(governance): fail closed without plane endpoint`. Keep commits narrow and
-describe the affected subsystem when useful. Pull requests should include a
-concise behavior summary, **tests run**, **autoreview result** (for non-trivial
-code), linked issue or context, and any configuration or security implications.
-Do not put hostnames, FQDNs, home directories, absolute worktree paths, LAN
-or employer network names, or other private environment inventory on public
-Issues, Pull Requests, comments, or commit messages. Update
-[CHANGELOG.md](CHANGELOG.md) for user-visible changes.
+`feat(mysql): resume from stored GTID`, `docs: document schema quarantine`,
+`fix(checkpoint): fail closed when the store cannot lock`. Keep commits
+narrow and describe the affected subsystem when useful. Pull requests should
+include a concise behavior summary, **tests run**, **autoreview result** (for
+non-trivial code), linked issue or context, and any configuration or security
+implications. Do not put hostnames, FQDNs, home directories, absolute worktree
+paths, LAN or employer network names, or other private environment inventory on
+public Issues, Pull Requests, comments, or commit messages. Release notes
+belong in the pull request body; [CHANGELOG.md](CHANGELOG.md) is release-owned.
 
 ### Verified commits on GitHub
 
-Prefer publishing PR branch tips with GitHub-signed commits so GitHub shows
+Prefer publishing PR branch tips with signed commits so GitHub shows
 **Verified**:
 
 1. Implement and commit locally as usual (`commit.gpgsign` may still apply).
-2. Publish the branch tip with `scripts/gh-verified-push.sh` instead of a plain
-   `git push` when you want the hosted commit Verified (OpenClaw-style GraphQL
-   `createCommitOnBranch`). That path creates one server-side commit with the
-   local `HEAD` tree; committer is typically **GitHub**.
-3. New branch:
-   `scripts/gh-verified-push.sh --create-branch-from origin/main --branch <topic> --sync-local`
-4. Existing PR branch:
-   `scripts/gh-verified-push.sh --branch <topic> --sync-local`
-   (uses the current remote tip as `expectedHeadOid`).
-5. Never pass `--no-gpg-sign` for local commits; if GPG fails, stop and fix it.
-6. After publish, confirm `verification.verified=true` (the script prints this).
+2. Publish the claim branch with `git push -u origin HEAD` (or `git push` if
+   upstream is already set) unless the user asked for a different publish path.
+   This repository has no `scripts/gh-verified-push.sh`.
+3. Never pass `--no-gpg-sign` for local commits; if GPG fails, stop and fix it.
 
 When merging PRs, prefer **squash** (`gh pr merge --squash --delete-branch`) so
 the land commit on `main` is also GitHub-signed/Verified and history stays
@@ -228,11 +222,9 @@ immediately after the correction.
 
 ## Security & Configuration Tips
 
-Never commit secrets, tokens, provider credentials, logs, or local harness
-state (`.hashi-state/`). Do not treat delivery systems as runtime control
-dependencies. When profile `governed` or `governance.fail_closed` is set, missing or
-unhealthy governance must fail doctor and run. Never put hostnames, FQDNs,
-home directories, absolute worktree paths, LAN or employer network names, or
-other private environment inventory on public Issues, Pull Requests, comments,
-or commit messages. Report vulnerabilities through [SECURITY.md](SECURITY.md).
-Follow [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) in all project spaces.
+Never commit secrets, tokens, provider credentials, logs, or local state
+(`.hashi-state/`, credential files, checkpoint copies). Never put hostnames,
+FQDNs, home directories, absolute worktree paths, LAN or employer network
+names, or other private environment inventory on public Issues, Pull Requests,
+comments, or commit messages. Report suspected bypasses privately (GitHub
+private vulnerability reporting or the maintainer), never in a public Issue.
