@@ -52,6 +52,60 @@ pub struct MySqlConnector {
 impl MySqlConnector {
     /// Synchronous API; embed on a dedicated OS thread, outside a Tokio runtime.
     pub fn connect(config: Config) -> Result<Self, Error> {
+        Self::open(config, None)
+    }
+
+    /// Opens the stream at a committed stream boundary instead of a spool:
+    /// `position` and `gtids` as a record at a transaction end (or the end
+    /// of the snapshot) carried them. Nothing is snapshotted; table layouts
+    /// are read as they are now. The one-shot outbox mode uses this, where
+    /// the host's committed cursor is the only state across runs. `state_dir`
+    /// must not hold another spool.
+    pub fn resume(config: Config, position: Position, gtids: &str) -> Result<Self, Error> {
+        parse_gtids(gtids)?;
+        Self::open(config, Some((position, gtids.to_owned())))
+    }
+
+    /// The last position staged when the stream opened: after a fresh
+    /// snapshot, its final record.
+    pub fn opened_at(&self) -> Position {
+        self.state.high_water
+    }
+
+    /// The server's executed GTID set now: what a one-shot run reads up to.
+    pub fn executed_gtids(&self) -> Result<String, Error> {
+        self.query_text("SELECT @@GLOBAL.gtid_executed", Vec::new())
+    }
+
+    /// Whether `cursor` (a record's GTID set) contains `target`.
+    pub fn reached(&self, cursor: &str, target: &str) -> Result<bool, Error> {
+        Ok(self.query_text(
+            "SELECT CAST(GTID_SUBSET(?, ?) AS CHAR)",
+            vec![target.into(), cursor.into()],
+        )? == "1")
+    }
+
+    fn query_text(&self, sql: &str, params: Vec<Value>) -> Result<String, Error> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Error::new("MySQL runtime closed"))?;
+        runtime.block_on(async {
+            tokio::time::timeout(self.config.timeout, async {
+                let mut conn = Self::connection(&self.config).await?;
+                let value: Option<String> = conn
+                    .exec_first(sql, Params::Positional(params))
+                    .await
+                    .map_err(sql_error)?;
+                conn.disconnect().await.map_err(sql_error)?;
+                value.ok_or_else(|| Error::new("MySQL query returned nothing"))
+            })
+            .await
+            .map_err(|_| Error::new("MySQL query timed out"))?
+        })
+    }
+
+    fn open(config: Config, boundary: Option<(Position, String)>) -> Result<Self, Error> {
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(Error::new(
                 "call MySQL synchronous API outside an async runtime",
@@ -115,7 +169,36 @@ impl MySqlConnector {
             .enable_all()
             .build()?;
         let loaded = state::load(&config.state_dir, &fingerprint)?;
-        let state = if let Some(state) = loaded {
+        let state = if let Some((position, gtids)) = boundary {
+            if loaded.is_some() {
+                return Err(Error::new(
+                    "MySQL resume needs an empty state directory; it already holds a spool",
+                ));
+            }
+            let layouts = runtime
+                .block_on(async {
+                    tokio::time::timeout(config.timeout, async {
+                        let mut conn = Self::connection(&config).await?;
+                        let layouts =
+                            schema::layouts(&mut conn, &config.tables, config.schema_version)
+                                .await?;
+                        conn.disconnect().await.map_err(sql_error)?;
+                        Ok::<_, Error>(layouts)
+                    })
+                    .await
+                })
+                .map_err(|_| Error::new("MySQL resume timed out reading table layouts"))??;
+            let state = State {
+                version: 1,
+                fingerprint,
+                high_water: position,
+                gtids,
+                layouts,
+                batch: None,
+            };
+            state::save(&config.state_dir, &state)?;
+            state
+        } else if let Some(state) = loaded {
             state
         } else {
             runtime

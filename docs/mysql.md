@@ -108,6 +108,12 @@ not an automatic checkpoint reset. Do not remove a spool or replace a checkpoint
 with older state to bypass the check. Generation fencing and consumer remapping
 remain outside this adapter.
 
+## Sandboxed hosts
+
+A host with no network route to the plane can run change capture once per
+start with `hashi outbox`, from a committed cursor file into an outbox
+directory. See [the outbox run mode](outbox.md).
+
 ## Disposable conformance fixture
 
 ```sh
