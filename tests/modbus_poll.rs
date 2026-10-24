@@ -1,3 +1,4 @@
+#![cfg(feature = "modbus")]
 use std::sync::atomic::AtomicU64;
 static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 fn state_dir() -> std::path::PathBuf {
@@ -7,6 +8,8 @@ fn state_dir() -> std::path::PathBuf {
         DIR_SEQ.fetch_add(1, Ordering::Relaxed)
     ))
 }
+#[cfg(target_os = "linux")]
+use hashi::modbus::Parity;
 use hashi::modbus::{
     Device, Endpoint, ModbusConnector, NetworkTransport, Order, PollGroup, Register, Table,
     Transport, ValueType,
@@ -306,7 +309,7 @@ fn rtu_serial_simulator_checks_crc_and_rejects_corruption() {
         let endpoint = Endpoint::Rtu {
             path,
             baud: 9600,
-            parity: serialport::Parity::None,
+            parity: Parity::None,
         };
         let mut c = ModbusConnector::new(
             "modbus",

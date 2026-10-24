@@ -9,13 +9,30 @@ use crate::runtime::Clock;
 use crate::schema::{FieldType, Schema};
 use crate::{Connector, Error};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum Parity {
+    None,
+    Even,
+    Odd,
+}
+
+impl Parity {
+    fn serial(self) -> serialport::Parity {
+        match self {
+            Self::None => serialport::Parity::None,
+            Self::Even => serialport::Parity::Even,
+            Self::Odd => serialport::Parity::Odd,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum Endpoint {
     Tcp(SocketAddr),
     Rtu {
         path: String,
         baud: u32,
-        parity: serialport::Parity,
+        parity: Parity,
     },
 }
 
@@ -160,8 +177,8 @@ impl Transport for NetworkTransport {
                     return Err(Error::new("RTU baud must be nonzero"));
                 }
                 let mut port = serialport::new(path, *baud)
-                    .parity(*parity)
-                    .stop_bits(if *parity == serialport::Parity::None {
+                    .parity(parity.serial())
+                    .stop_bits(if *parity == Parity::None {
                         serialport::StopBits::Two
                     } else {
                         serialport::StopBits::One

@@ -1,3 +1,4 @@
+#![cfg(feature = "modbus")]
 //! Conformance kit (#28) for the Modbus family over an in-process register simulator.
 use hashi::conformance::{self, CHECKS, Change, Family, INSTANCE};
 use hashi::modbus::{

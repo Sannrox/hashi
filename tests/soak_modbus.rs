@@ -1,3 +1,4 @@
+#![cfg(feature = "modbus")]
 //! Soak harness (#48) for the Modbus family over an in-process register simulator.
 //! A network drop makes the device stop answering; a source restart also ends
 //! the session. Modbus has no credential to rotate.
