@@ -120,6 +120,9 @@ directory. See [the outbox run mode](outbox.md).
 bash scripts/test-mysql-container.sh
 ```
 
+A mapped SQL historian (`mysql::historian::SqlHistorian`) uses the same driver
+and disposable fixture; see [historian.md](historian.md).
+
 The harness owns a pinned database image, isolated container, ephemeral loopback
 port, memory-backed fixture data directory, and test process. Connector manifests,
 batches, and checkpoints remain on the test filesystem. Cleanup removes only that
