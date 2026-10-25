@@ -12,7 +12,7 @@ Default Cargo features are `parquet` and `modbus`. `mqtt`, `mysql`, `opcua`, and
 
 Hashi doesn't make governance decisions. It authenticates to sources, reads, normalizes and delivers. Mapping records to objects, markings and Actions belongs to the consumer. It runs as a single binary or as one process per connector, with no runtime network calls besides the configured sources and sinks.
 
-Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues for planned work.
+Status: v0.1 MVP families are in tree. SQL Server and Oracle CDC stay on the v0.2 roadmap. See [VISION.md](VISION.md).
 
 License: Apache-2.0. The default build admits only permissive dependency
 licenses; `cargo deny check licenses` enforces it (`deny.toml`).
