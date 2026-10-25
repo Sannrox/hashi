@@ -1,4 +1,5 @@
 //! Consistent staged snapshots and GTID-ordered row change capture.
+pub mod historian;
 mod schema;
 mod state;
 mod statement;

@@ -52,3 +52,23 @@ or before the watermark, or outside the requested range, is refused. Records
 use kind `historian.sample`, key `<tag>@<ts_ms>`, and a JSON payload with
 `tag`, `ts_ms` and `value` (a number, or `"NaN"`, `"Infinity"` or
 `"-Infinity"` for non-finite readings); the sample quality maps to the record quality.
+
+## SQL mapping (MySQL)
+
+Enable the `mysql` Cargo feature and construct
+`mysql::historian::SqlHistorian` with connection options and a mapping: the
+tag table (identity and name columns), the value table (tag, time, value, and
+quality columns), and the database that holds them. `connect` checks that
+mapping against the catalog and refuses a missing table, a missing column, a
+time/value/name column of the wrong type, a nullable identity, time, value, or
+name column, a tag identity or name that is not unique, or identity columns
+that do not share a type and collation, before any sample is read. Raw reads select by the tag identity
+column so a case-insensitive name collation cannot mix two tags. Time bounds
+are millisecond watermarks even when the time column stores microseconds.
+Call the synchronous API from a dedicated OS thread outside a Tokio runtime.
+Verified TLS is required unless `allow_insecure_lab` explicitly permits a
+disposable plaintext fixture.
+
+Raw reads are `SELECT`s over `(after_ms, until_ms]`, ordered by the time
+column, so a restart with the same window is replayable. Interpolated reads
+are not offered. SQL Server mapping is a later adapter.

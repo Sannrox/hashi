@@ -27,5 +27,6 @@ export HASHI_MYSQL_DISPOSABLE=1 HASHI_MYSQL_TEST_PORT="$port" HASHI_MYSQL_CONTAI
 # server and kills sessions, so it always runs alone, after them.
 if [ "${HASHI_SOAK_ONLY:-}" != 1 ]; then
   cargo test --locked --features mysql --test mysql_cdc -- --ignored --nocapture --test-threads=1 --skip soak
+  cargo test --locked --features mysql --test mysql_historian -- --ignored --nocapture --test-threads=1
 fi
 cargo test --locked --features mysql --test mysql_cdc -- --ignored --nocapture --exact mysql_survives_a_soak_with_every_fault
