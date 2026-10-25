@@ -72,3 +72,38 @@ disposable plaintext fixture.
 Raw reads are `SELECT`s over `(after_ms, until_ms]`, ordered by the time
 column, so a restart with the same window is replayable. Interpolated reads
 are not offered. SQL Server mapping is a later adapter.
+
+## OPC UA Historical Access
+
+Enable the `opcua` Cargo feature. `opcua::historian::OpcUaHistorian` discovers
+variables under the configured roots and reads paged raw history through the
+historian trait. Interpolated reads are not offered. Discovered variables
+without the history access bit are reported by `check`; the connector still
+runs over the rest. Session, trust, and PKI setup are the same as
+[opcua.md](opcua.md).
+
+## Acceptance coverage
+
+The parent historian scope in #6 is delivered by #22 (one trait, chunked
+backfill, per-tag checkpoints, tail handover), #23 (OPC UA Historical Access),
+and #24 (MySQL mapping). The REST historian adapter and SQL Server mapping
+stay later.
+
+```sh
+CARGO_TARGET_DIR="$PWD/target" cargo test --locked --test historian_backfill
+CARGO_TARGET_DIR="$PWD/target" cargo test --locked --features opcua-simulator --test opcua_historian
+bash scripts/test-mysql-container.sh
+```
+
+| Capability | Evidence |
+| --- | --- |
+| One trait: tag discovery, paged raw and interpolated reads, live tail by poll or subscription | [`Historian`](../src/historian.rs) |
+| One-year backfill of 1k tags, checkpoints, resume after a kill, handover to the tail with no gap or overlap beyond the idempotency key | [Backfill fixture](../tests/historian_backfill.rs) |
+| OPC UA Historical Access adapter: paged raw history, resume after a kill, tail handover, same-millisecond page refusal, session restart | [OPC UA historian fixture](../tests/opcua_historian.rs) |
+| Variables without history reported by `check`; connector still runs | [OPC UA historian fixture](../tests/opcua_historian.rs) |
+| Generic SQL historian adapter configured by mapping (tag table, value table, time column, quality column) on MySQL | [MySQL historian fixture](../tests/mysql_historian.rs) |
+| Wrong mapping refused at connect; interpolated SQL reads not offered | [MySQL historian fixture](../tests/mysql_historian.rs) |
+
+These checks establish fixture and simulator conformance. They do not certify
+arbitrary plant historians. Vendor client libraries stay out of the default
+build.
