@@ -803,6 +803,112 @@ impl hashi::conformance::Family for MySqlFamily {
     }
 }
 
+/// Account statements in the binlog, credential strings with backslashes
+/// among them, do not stop capture, and the rows around them arrive once and
+/// in order (#49).
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mysql-container.sh"]
+fn account_statements_in_the_binlog_do_not_stop_capture() {
+    assert_eq!(std::env::var("HASHI_MYSQL_DISPOSABLE").as_deref(), Ok("1"));
+    let port = std::env::var("HASHI_MYSQL_TEST_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let opts: Opts = OptsBuilder::default()
+        .ip_or_hostname("127.0.0.1")
+        .tcp_port(port)
+        .user(Some("root"))
+        .pass(Some("hashi-fixture-only"))
+        .into();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let id = std::process::id();
+    let database = format!("hashi_accounts_{id}");
+    let user = format!("hashi_rotated_{id}");
+    let path = std::env::temp_dir().join(format!(
+        "hashi-mysql-accounts-{id}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let run = |statements: Vec<String>| {
+        runtime.block_on(async {
+            let mut conn = Conn::new(opts.clone()).await.unwrap();
+            for statement in statements {
+                conn.query_drop(statement).await.unwrap();
+            }
+            conn.disconnect().await.unwrap();
+        })
+    };
+    run(vec![
+        format!("CREATE DATABASE `{database}`"),
+        format!(
+            "CREATE TABLE `{database}`.items (id INT PRIMARY KEY, value VARCHAR(100) NOT NULL, \
+             count BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB"
+        ),
+        format!("INSERT INTO `{database}`.items VALUES (1, 'one', 1)"),
+    ]);
+    let mut source = MySqlConnector::connect(config(opts.clone(), &database, path)).unwrap();
+    let first = loop {
+        if let Some(record) = source.read(None, None).unwrap() {
+            break record;
+        }
+    };
+    assert_eq!(first.key, "[1]");
+
+    run(vec![
+        format!("INSERT INTO `{database}`.items VALUES (10, 'before', 10)"),
+        format!("CREATE USER '{user}'@'%' IDENTIFIED BY 'first\\\\pass'"),
+        format!("ALTER USER '{user}'@'%' IDENTIFIED BY 'second\\\\pass'"),
+        format!("GRANT SELECT ON `{database}`.items TO '{user}'@'%'"),
+        format!("REVOKE SELECT ON `{database}`.items FROM '{user}'@'%'"),
+        format!("SET PASSWORD FOR '{user}'@'%' = 'third\\\\pass'"),
+        format!("DROP USER '{user}'@'%'"),
+        format!("INSERT INTO `{database}`.items VALUES (11, 'after', 11)"),
+    ]);
+    let mut keys = Vec::new();
+    let mut previous = first;
+    while keys.len() < 2 {
+        let record = next(&mut source, &previous).unwrap();
+        let marker = record
+            .source
+            .as_ref()
+            .and_then(|source| source.change.as_ref())
+            .is_some_and(|change| {
+                matches!(
+                    change.operation,
+                    Operation::TransactionBegin | Operation::TransactionEnd
+                )
+            });
+        if !marker {
+            keys.push(record.key.clone());
+        }
+        previous = record;
+    }
+    assert_eq!(keys, ["[10]", "[11]"]);
+    // Once: nothing but transaction markers follows.
+    let quiet = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < quiet {
+        let (position, cursor) = resume(&previous);
+        let Some(record) = source.read(position, cursor).unwrap() else {
+            continue;
+        };
+        let change = record
+            .source
+            .as_ref()
+            .and_then(|source| source.change.as_ref());
+        assert!(
+            change.is_some_and(|change| matches!(
+                change.operation,
+                Operation::TransactionBegin | Operation::TransactionEnd
+            )),
+            "unexpected record {}",
+            record.key
+        );
+        previous = record;
+    }
+}
+
 #[test]
 #[ignore = "requires the isolated database created by scripts/test-mysql-container.sh"]
 fn mysql_passes_the_conformance_kit() {
@@ -955,12 +1061,9 @@ impl hashi::soak::Faults for MySqlSoak {
                     "ALTER USER '{SOAK_USER}'@'%' IDENTIFIED BY '{}'",
                     self.password()
                 );
-                // Kept out of the binlog: the connector fails closed on account
-                // statements there (#49), and this fault is about the new credential.
-                self.admin(async move |conn| {
-                    conn.query_drop("SET SESSION sql_log_bin = 0").await?;
-                    conn.query_drop(statement).await
-                })
+                // Logged to the binlog: the connector skips account statements
+                // there and keeps reading as the rotated user (#49).
+                self.admin(async move |conn| conn.query_drop(statement).await)
             }
         }
     }

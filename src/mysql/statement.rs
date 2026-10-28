@@ -3,16 +3,39 @@ use crate::Error;
 pub(super) enum Statement {
     Begin,
     Commit,
-    Schema { altering: bool },
+    Schema {
+        altering: bool,
+    },
+    /// Account management (`ALTER USER`, `CREATE USER`, `DROP USER`,
+    /// `GRANT`, `REVOKE`, `SET PASSWORD`). MySQL commits implicitly around
+    /// it, so it is a transaction of its own with no row events (#49).
+    Account,
+}
+
+/// Leading keywords of the account statements capture skips. Exact pairs:
+/// `DROP TABLE` or `ALTER TABLE user` never match, and any other statement,
+/// `RENAME USER` and role statements included, keeps failing closed.
+fn is_account_statement(tokens: &[String]) -> bool {
+    let words: Vec<&str> = tokens.iter().take(2).map(String::as_str).collect();
+    matches!(
+        words.as_slice(),
+        ["ALTER" | "CREATE" | "DROP", "USER"] | ["GRANT" | "REVOKE", ..] | ["SET", "PASSWORD"]
+    )
 }
 
 /// Treat unrecognized or potentially destructive statements as a recovery gate.
 /// This lexer needs keywords only; quoted names/values cannot grant a safe classification.
+///
+/// A backslash inside quotes stops lexing: what follows depends on the
+/// session's escape mode. Account statements are named by their leading
+/// keywords, before any credential string, so they are still recognized;
+/// anything else fails closed as before.
 pub(super) fn classify(sql: &str) -> Result<Statement, Error> {
     let bytes = sql.as_bytes();
     let mut index = 0;
     let mut tokens = Vec::new();
-    while index < bytes.len() {
+    let mut escaped = false;
+    'lex: while index < bytes.len() {
         match bytes[index] {
             b'\'' | b'"' | b'`' => {
                 let quote = bytes[index];
@@ -20,9 +43,8 @@ pub(super) fn classify(sql: &str) -> Result<Statement, Error> {
                 let mut closed = false;
                 while index < bytes.len() {
                     if bytes[index] == b'\\' {
-                        return Err(Error::new(
-                            "MySQL DDL escape semantics require explicit recovery",
-                        ));
+                        escaped = true;
+                        break 'lex;
                     }
                     if bytes[index] == quote {
                         index += 1;
@@ -79,6 +101,14 @@ pub(super) fn classify(sql: &str) -> Result<Statement, Error> {
             }
             _ => index += 1,
         }
+    }
+    if is_account_statement(&tokens) {
+        return Ok(Statement::Account);
+    }
+    if escaped {
+        return Err(Error::new(
+            "MySQL DDL escape semantics require explicit recovery",
+        ));
     }
     let first = tokens.first().map(String::as_str);
     match first {
@@ -147,5 +177,34 @@ mod tests {
             classify("ALTER TABLE t ADD COLUMN `partition` INT DEFAULT 0"),
             Ok(Statement::Schema { .. })
         ));
+    }
+
+    /// Account statements, as the binlog logs them with credential strings
+    /// that may hold backslashes, are skipped; table DDL and unknown or
+    /// escaped statements still fail closed (#49).
+    #[test]
+    fn account_statements_are_skipped_and_nothing_else_is() {
+        for sql in [
+            r"ALTER USER 'hashi'@'%' IDENTIFIED WITH 'caching_sha2_password' AS '$A$005$a\b'c'",
+            r"CREATE USER IF NOT EXISTS 'reader'@'%' IDENTIFIED BY 'p\w'",
+            "DROP USER IF EXISTS 'reader'@'%'",
+            "GRANT SELECT ON shop.orders TO 'reader'@'%'",
+            "REVOKE SELECT ON shop.orders FROM 'reader'@'%'",
+            r"SET PASSWORD FOR 'hashi'@'%' = 'n\ew'",
+            "drop /* rotate */ user 'old'@'%'",
+        ] {
+            assert!(matches!(classify(sql), Ok(Statement::Account)), "{sql}");
+        }
+        for sql in [
+            "DROP TABLE user",
+            "ALTER TABLE user DROP COLUMN name",
+            "CREATE TABLE user (id INT)",
+            "RENAME USER 'a'@'%' TO 'b'@'%'",
+            "SET GLOBAL read_only = 1",
+            r"ALTER TABLE t COMMENT 'a\b'",
+            "/*!80000 DROP USER 'x'@'%' */ DROP TABLE t",
+        ] {
+            assert!(classify(sql).is_err(), "{sql}");
+        }
     }
 }

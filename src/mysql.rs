@@ -606,6 +606,15 @@ impl MySqlConnector {
                 EventData::QueryEvent(query) => match statement::classify(&query.query())? {
                     statement::Statement::Begin => {}
                     statement::Statement::Commit => complete = true,
+                    // Its own transaction with no row events (#49). It rewrites
+                    // the grant tables without row events too, so capturing
+                    // those keeps the recovery gate.
+                    statement::Statement::Account if captures_grant_tables(&self.config.tables) => {
+                        return Err(Error::new(
+                            "MySQL account statement changes captured grant tables without row events; explicit recovery required",
+                        ));
+                    }
+                    statement::Statement::Account => complete = true,
                     statement::Statement::Schema { altering } => {
                         // Table maps prove primary keys but omit secondary unique indexes.
                         if altering && self.config.tables.iter().any(|table| !table.key.is_empty())
@@ -925,4 +934,34 @@ fn binlog_row(
             .collect()
     })
     .transpose()
+}
+
+/// Whether capture includes the `mysql` system schema, whose grant tables
+/// account statements change without row events (#49).
+fn captures_grant_tables(tables: &[Table]) -> bool {
+    tables
+        .iter()
+        .any(|table| table.database.eq_ignore_ascii_case("mysql"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Table, captures_grant_tables};
+
+    fn table(database: &str) -> Table {
+        Table {
+            database: database.into(),
+            table: "t".into(),
+            key: Vec::new(),
+        }
+    }
+
+    /// Account statements are skipped only when no captured table is a grant
+    /// table they could change without row events (#49).
+    #[test]
+    fn grant_tables_in_capture_are_detected() {
+        assert!(!captures_grant_tables(&[table("shop")]));
+        assert!(captures_grant_tables(&[table("shop"), table("mysql")]));
+        assert!(captures_grant_tables(&[table("MySQL")]));
+    }
 }
