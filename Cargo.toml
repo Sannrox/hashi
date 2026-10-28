@@ -39,3 +39,10 @@ opcua-simulator = ["dep:async-trait", "opcua", "async-opcua/server", "tokio/net"
 # stay a fraction of the size.
 [profile.dev.package."*"]
 debug = false
+
+# rumqttc 0.25.1, the latest release, pins rustls-webpki 0.102, which has no
+# fix for RUSTSEC-2026-0382. This fork commit is the 0.25.1 release plus only
+# the bump to rustls-webpki 0.103.16. Remove this patch once a rumqttc release
+# ships on rustls-webpki 0.103.16 or later (#62).
+[patch.crates-io]
+rumqttc = { git = "https://github.com/Sannrox/rumqtt", rev = "5606f188d502117696f834f472970508e0988d1d" }
