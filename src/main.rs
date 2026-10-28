@@ -130,6 +130,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                 }
             }
             metrics.record(name, &pass.progress, pass.outcome.is_err(), now_ms());
+            metrics.record_buffer(name, pass.buffer);
         }
         drop(metrics);
         if once {

@@ -180,3 +180,56 @@ fn two_instances_cannot_write_one_sink_directory_through_an_alias() {
     assert!(second.pass()[0].1.is_ok());
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// With a buffer, an instance whose sink cannot open yet (its path is a
+/// file, as with an unmounted destination) still runs: records are buffered,
+/// the checkpoint advances, and the next pass after the sink returns drains
+/// them in order (#47).
+#[test]
+fn a_buffered_instance_runs_while_its_sink_is_unavailable_and_drains_after() {
+    let dir = work_dir();
+    fs::write(dir.join("secrets/line-1"), NEW).unwrap();
+    let config = write_config(&dir, 3, NEW);
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("buffer = { dir = \"buffer\", max_bytes = 65536 }\n");
+    fs::write(&config, text).unwrap();
+    fs::write(dir.join("out"), b"not a directory yet").unwrap();
+
+    let mut service = Service::from_config(&Config::load(&config).unwrap()).unwrap();
+    let passes = service.pass_with_progress();
+    let report = passes[0].outcome.as_ref().unwrap();
+    assert_eq!((report.delivered, report.checkpoint), (3, 3));
+    let buffer = passes[0].buffer.unwrap();
+    assert_eq!((buffer.records, buffer.drained), (3, 0));
+
+    fs::remove_file(dir.join("out")).unwrap();
+    let passes = service.pass_with_progress();
+    let buffer = passes[0].buffer.unwrap();
+    assert_eq!((buffer.records, buffer.drained), (0, 3));
+    drop(service);
+    assert_eq!(delivered(&dir), ["r1", "r2", "r3"]);
+}
+
+/// Records already buffered drain even while the source is unavailable:
+/// they were acknowledged and checkpointed, so they do not wait on it (#47).
+#[test]
+fn buffered_records_drain_while_the_source_credential_is_missing() {
+    let dir = work_dir();
+    fs::write(dir.join("secrets/line-1"), NEW).unwrap();
+    let config = write_config(&dir, 2, NEW);
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("buffer = { dir = \"buffer\", max_bytes = 65536 }\n");
+    fs::write(&config, text).unwrap();
+    fs::write(dir.join("out"), b"not a directory yet").unwrap();
+
+    let mut service = Service::from_config(&Config::load(&config).unwrap()).unwrap();
+    assert_eq!(service.pass_with_progress()[0].buffer.unwrap().records, 2);
+
+    fs::remove_file(dir.join("secrets/line-1")).unwrap();
+    fs::remove_file(dir.join("out")).unwrap();
+    let passes = service.pass_with_progress();
+    assert!(passes[0].outcome.is_err());
+    assert_eq!(passes[0].buffer.unwrap().records, 0);
+    drop(service);
+    assert_eq!(delivered(&dir), ["r1", "r2"]);
+}

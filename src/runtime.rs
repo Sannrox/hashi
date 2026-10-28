@@ -109,6 +109,14 @@ where
         &self.connector
     }
 
+    pub fn sink(&self) -> &S {
+        &self.sink
+    }
+
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     pub fn into_parts(self) -> (C, S, K) {
         (self.connector, self.sink, self.store)
     }
@@ -283,7 +291,9 @@ where
                 key: kind.clone(),
                 position: entry.event.sequence,
                 source_ts_ms: 0,
-                ingest_ts_ms: 0,
+                // When the control was emitted, so a store-and-forward
+                // buffer ages it like data (#47). The key ignores it.
+                ingest_ts_ms: self.clock.now_ms(),
                 quality: None,
                 payload: serde_json::to_string(&entry.event)
                     .map_err(|error| Error::new(error.to_string()))?,
