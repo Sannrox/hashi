@@ -5,6 +5,13 @@
 `hashi` is a Rust 2024 crate. Connector engine: industrial protocols and change data capture with one checkpointed contract. Source lives in `src/`. Integration
 tests go in `tests/`. Read `VISION.md` (vision and roadmap), `README.md`, and
 accepted ADRs under `docs/decisions/` before changing system boundaries.
+Operator docs live in `docs/`. A new ADR is the next numbered file following
+`0001-single-package-crate-graph.md` (there is no template file) and is added
+to the `docs/decisions/README.md` index.
+
+Affected areas used in Issues and impact notes: runtime, checkpoint, sink,
+buffer, modbus, opcua, mqtt, mysql, schema, outbox, and ops (configuration,
+CLI, metrics, diagnostics, and the static image).
 
 ## Build, Test, and Development Commands
 
@@ -19,8 +26,8 @@ accepted ADRs under `docs/decisions/` before changing system boundaries.
   runs `cargo deny check licenses`, OPC UA/MySQL/MQTT container fixtures, and
   the offline image.
 
-GitHub Issues are the planning source of truth. Project-specific Skills live
-under `.agents/skills/`. Never commit hostnames, home paths, secrets or
+GitHub Issues are the planning source of truth. Workflow Skills are shared;
+see `## Shared agent skills`. Never commit hostnames, home paths, secrets or
 private environment details.
 
 ## Agent delivery closeout (required)
@@ -97,7 +104,7 @@ confirmation, unless the lead of the same parallel run owns the stalled lane.
 
 A lane claims before it implements, under Publish or Land authority or with an
 explicit claim authorization under Implement, using
-`bash .agents/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh claim <issue>`:
 
 - the branch `<type>/<issue>` is created on GitHub from the default branch by
   an atomic ref creation, so when two machines race exactly one claim
@@ -159,16 +166,20 @@ it refreshes onto `main` only for a conflict, a failing gate, an explicit
 request, or a sibling landing on a shared surface, not merely because `main`
 advanced.
 
-Landing is sequential. After each merge, fetch, recompute the frontier, and let
-the remaining lanes recheck `mergeable` against the new `main`. A failed or
-timed-out merge response may still have merged; reconcile the remote state
-before retrying.
+Lanes publish with `issue-lane.sh push <issue>` and land with
+`issue-lane.sh land <issue> --pr <pr>` (see `### Verified commits on GitHub`).
+`land` merges only the reviewed head once its checks pass and reconciles an
+uncertain merge response from the Pull Request state, so it is safe to rerun;
+a lane that conflicts with a sibling's landing stops instead of merging. After
+each merge, fetch, recompute the frontier, and let the remaining lanes recheck
+`mergeable` against the new `main`.
 
 The lead of a parallel run keeps a ledger per lane: Issue, branch, base SHA,
 owner, state, Pull Request, evidence, blockers, and cleanup. Keep hostnames
 and absolute checkout paths in the session with the maintainer, never on
 GitHub. Report verified outcomes, not launched work. The executable lead
-procedure is `.agents/skills/deliver-ready-issue/references/parallel-delivery.md`.
+procedure is `references/parallel-delivery.md` in the shared
+`deliver-ready-issue` skill.
 
 ## Coding Style & Naming Conventions
 
@@ -184,8 +195,11 @@ hosts can embed the engine without shelling out.
 
 Add focused tests for changes touching connectors, checkpoints, sinks, the
 buffer, schema drift, the outbox, or operations. Prefer deterministic tests
-that do not require a live source. Offline `cargo test` must stay green without
-optional protocol fixtures.
+that do not require a live source. Connector and multi-component behavior is
+covered by integration tests under `tests/`; configuration changes get parsing
+and default tests. Keep service-dependent tests ignored unless their
+prerequisites are intentionally available. Offline `cargo test` must stay green
+without optional protocol fixtures.
 
 ## Commit & Pull Request Guidelines
 
@@ -202,23 +216,26 @@ belong in the pull request body; [CHANGELOG.md](CHANGELOG.md) is release-owned.
 
 ### Verified commits on GitHub
 
-Prefer publishing PR branch tips with signed commits so GitHub shows
-**Verified**:
+Publish and land lanes through the shared agent-kit lane tool so GitHub shows
+**Verified** commits and `main` stays linear:
 
-1. Implement and commit locally as usual (`commit.gpgsign` may still apply).
-2. Publish the claim branch with `git push -u origin HEAD` (or `git push` if
-   upstream is already set) unless the user asked for a different publish path.
-   This repository has no `scripts/gh-verified-push.sh`.
-3. Never pass `--no-gpg-sign` for local commits; if GPG fails, stop and fix it.
+1. Implement and commit locally as usual. Never pass `--no-gpg-sign`; if GPG
+   fails, stop and fix it.
+2. Publish the claim branch from the lane worktree:
+   `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh push <issue>`.
+   It creates GitHub-signed commits and resets the worktree to the published
+   commit, so local `HEAD` is the Pull Request head. Confirm it reports
+   `verification.verified=true`.
+3. Land with `bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"/skills/deliver-ready-issue/scripts/issue-lane.sh land <issue> --pr <pr>`.
+   It squash-merges the reviewed head once the required checks pass, and
+   deletes the claim branch only after the merge and the closed Issue are
+   confirmed.
 
-When merging PRs, prefer **squash** (`gh pr merge --squash --delete-branch`) so
-the land commit on `main` is also GitHub-signed/Verified and history stays
-linear. Use `gh pr merge --merge` only when multi-commit history must be kept
-(original SHAs preserved). Avoid GitHub **rebase** merges when Verified history
-matters: rebase-merge rewrites commits and drops signatures. Do not rewrite
-protected `main` after merging unless the user explicitly approves; if
-protection is temporarily relaxed, restore force-push and status-check settings
-immediately after the correction.
+Do not queue GitHub auto-merge, and do not use GitHub **rebase** merges:
+rebase-merge rewrites commits and drops signatures. Do not rewrite protected
+`main` after merging unless the user explicitly approves; if protection is
+temporarily relaxed, restore force-push and status-check settings immediately
+after the correction.
 
 ## Security & Configuration Tips
 
@@ -228,3 +245,72 @@ FQDNs, home directories, absolute worktree paths, LAN or employer network
 names, or other private environment inventory on public Issues, Pull Requests,
 comments, or commit messages. Report suspected bypasses privately (GitHub
 private vulnerability reporting or the maintainer), never in a public Issue.
+
+## Shared agent skills
+
+The workflow Skills (`advance-issue-frontier`, `assess-change-impact`,
+`capture-project-decision`, `deliver-ready-issue`, `prepare-release`,
+`refactor-docs`, `shape-work-item`, `technical-documentation`, `verify-change`)
+are canonical in [Sannrox/agent-kit](https://github.com/Sannrox/agent-kit).
+There is no pin: this repository always uses the latest `main`.
+`.agents/skills/<name>/` holds only a generated stub that points to the shared
+skill; read the installed skill under `~/.agents/agent-kit/` (or
+`$AGENT_KIT_HOME`). Run `bash scripts/validate-workflow-skills.sh` to clone or
+update it.
+
+- Repository-specific facts the shared Skills need come from this file: the
+  structure, build, parallel-lane and testing sections, plus
+  `## Agent skill profile` below for anything they do not already say. Edit
+  this file, not the stubs.
+- Never edit stubs or the vendored `scripts/validate-workflow-skills.sh` here;
+  change them upstream in agent-kit, then run
+  `bash scripts/validate-workflow-skills.sh --render` here when CI reports
+  drift.
+- Repository-only Skills live next to the stubs as full folders and stay local.
+
+## Agent skill profile
+
+Facts the shared agent-kit skills read that the sections above do not already
+state.
+
+Feature: a new observable operator or integration outcome.
+
+### Compatibility and failure obligations
+
+Old configuration, checkpoint and cursor formats, the outbox batch contract,
+and error semantics stay compatible. Fail-closed paths stay closed: missing
+credentials, unreadable checkpoints, sink nack, and schema drift never
+silently drop or duplicate data.
+
+### Additional impact boundaries
+
+- connector check/discover/read versus durable checkpoints;
+- at-least-once delivery versus sink ack and the store-and-forward buffer;
+- schema drift versus quarantine;
+- protocol adapters (Modbus, OPC UA, MQTT, MySQL) versus optional features;
+- configuration, CLI, metrics, diagnostics, and the static image.
+
+### Verification matrix
+
+Rows beyond `## Testing Guidelines`. The Makefile is the source of truth for
+the local gates (`make update`, `make validate`, `make test`,
+`make test-integration`); do not reproduce them from prose.
+
+| Surface | Required evidence |
+| --- | --- |
+| connector / sink | affected integration test under `tests/` plus the normal suite |
+| protocol fixture | the matching `scripts/test-*-container.sh` |
+| configuration | parsing/default tests, `docs/run.md`, README |
+| static image | `scripts/test-offline-image.sh` |
+| docs / Skills | links and commands; `bash scripts/validate-workflow-skills.sh` |
+
+### Release audit
+
+- `Cargo.toml` version and lockfile consistency;
+- connector contract, checkpoint and cursor format compatibility;
+- configuration additions, removals, defaults, and README;
+- security, rollback, and operator actions;
+- static image packaging (`Dockerfile`, `scripts/test-offline-image.sh`);
+- `CHANGELOG.md` is release-owned: draft its section from
+  `scripts/changelog-draft.sh` (merged changes since the last tag) and the
+  pull request bodies, upgrade actions first.
