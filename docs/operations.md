@@ -24,9 +24,18 @@ management interface; it has no authentication.
 | `hashi_source_lag_seconds` | gauge | Age of the source timestamp of the newest committed record |
 | `hashi_up` | gauge | `1` when the last pass succeeded |
 
-Counters restart at zero with the process. `hashi run` sinks write straight to
-their target, so there is no store-and-forward buffer to report yet; a buffered
-sink adds its fill level when it becomes configurable.
+An instance with a [store-and-forward buffer](run.md#store-and-forward-buffer)
+also reports:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `hashi_buffer_bytes` | gauge | Bytes waiting in the buffer |
+| `hashi_buffer_records` | gauge | Records waiting in the buffer |
+| `hashi_buffer_oldest_age_seconds` | gauge | Age of the oldest buffered record's ingest time; absent when empty |
+| `hashi_buffer_drained_total` | counter | Records this process delivered out of the buffer |
+| `hashi_buffer_dropped_total` | counter | Records `drop_oldest` dropped and logged in `gaps.log`; kept across restarts |
+
+Counters restart at zero with the process, except the buffer's dropped count.
 
 ## Diagnostics bundle
 

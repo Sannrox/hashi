@@ -29,6 +29,7 @@ struct InstanceMetrics {
     last_source_ts_ms: Option<i64>,
     healthy: bool,
     recorded_ms: Option<i64>,
+    buffer: Option<crate::buffer::BufferStats>,
 }
 
 impl Metrics {
@@ -54,6 +55,15 @@ impl Metrics {
         entry.last_source_ts_ms = progress.last_source_ts_ms.or(entry.last_source_ts_ms);
         entry.errors_total += u64::from(failed);
         entry.healthy = !failed;
+    }
+
+    /// Record an instance's buffer after a pass; `None` when it has no
+    /// buffer or the buffer could not be read.
+    pub fn record_buffer(&mut self, instance: &str, buffer: Option<crate::buffer::BufferStats>) {
+        self.instances
+            .entry(instance.to_string())
+            .or_default()
+            .buffer = buffer;
     }
 
     /// Healthy once every instance has passed and none failed its last pass.
@@ -118,6 +128,36 @@ impl Metrics {
             "gauge",
             "Age of the source timestamp of the newest committed record.",
             &|m| age(m.last_source_ts_ms),
+        );
+        family(
+            "hashi_buffer_bytes",
+            "gauge",
+            "Bytes waiting in the store-and-forward buffer.",
+            &|m| m.buffer.map(|b| b.bytes as f64),
+        );
+        family(
+            "hashi_buffer_records",
+            "gauge",
+            "Records waiting in the store-and-forward buffer.",
+            &|m| m.buffer.map(|b| b.records as f64),
+        );
+        family(
+            "hashi_buffer_oldest_age_seconds",
+            "gauge",
+            "Age of the oldest buffered record's ingest time; absent when the buffer is empty.",
+            &|m| age(m.buffer.and_then(|b| b.oldest_ingest_ts_ms)),
+        );
+        family(
+            "hashi_buffer_drained_total",
+            "counter",
+            "Records this process delivered out of the buffer.",
+            &|m| m.buffer.map(|b| b.drained as f64),
+        );
+        family(
+            "hashi_buffer_dropped_total",
+            "counter",
+            "Records a full drop_oldest buffer dropped and logged as a gap; kept across restarts.",
+            &|m| m.buffer.map(|b| b.dropped as f64),
         );
         family(
             "hashi_up",
@@ -205,6 +245,36 @@ mod tests {
             checkpoint,
             last_source_ts_ms: Some(1_000),
         }
+    }
+
+    /// Buffer series appear only for an instance with a buffer; the oldest
+    /// age only while something is buffered.
+    #[test]
+    fn buffer_metrics_report_fill_age_and_counters() {
+        let mut metrics = Metrics::default();
+        metrics.record("direct", &report(1, 1), false, 1_000);
+        metrics.record("line-1", &report(1, 1), false, 1_000);
+        metrics.record_buffer(
+            "line-1",
+            Some(crate::buffer::BufferStats {
+                bytes: 300,
+                records: 3,
+                oldest_ingest_ts_ms: Some(4_000),
+                drained: 5,
+                dropped: 2,
+            }),
+        );
+        let text = metrics.render(10_000);
+        for series in [
+            "hashi_buffer_bytes{instance=\"line-1\"} 300\n",
+            "hashi_buffer_records{instance=\"line-1\"} 3\n",
+            "hashi_buffer_oldest_age_seconds{instance=\"line-1\"} 6\n",
+            "hashi_buffer_drained_total{instance=\"line-1\"} 5\n",
+            "hashi_buffer_dropped_total{instance=\"line-1\"} 2\n",
+        ] {
+            assert!(text.contains(series), "{series} missing from {text}");
+        }
+        assert!(!text.contains("hashi_buffer_bytes{instance=\"direct\"}"));
     }
 
     #[test]

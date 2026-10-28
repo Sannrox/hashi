@@ -32,9 +32,42 @@ sink.jsonl = { dir = "out/line-1" }
   share one; a running instance also holds an exclusive lock in it
   (`.hashi-sink.lock`), so a second writer that reaches it by another path,
   in this process or another, is refused until the first stops.
+- `instance.buffer` (optional): a store-and-forward disk buffer between the
+  source and the sink, for sites whose uplink drops. See
+  [Store-and-forward buffer](#store-and-forward-buffer).
 
 Unknown fields are refused, and every error names its field, for example
 `invalid config: instance[0].source.fixture.records: must be at least 1`.
+
+## Store-and-forward buffer
+
+```toml
+buffer = { dir = "buffer/line-1", max_bytes = 1073741824, max_age_secs = 86400, when_full = "stop" }
+```
+
+A record is acknowledged, and the checkpoint advances, once it is durably
+written to the buffer. The buffer drains to the sink in order, with each
+record's original idempotency key, whenever the sink accepts again. It is
+local files under `dir`, with no lease or database, and a running instance
+holds `.hashi-buffer.lock` there. The directory may not be a sink's or
+another buffer's.
+
+- `max_bytes`: the most buffered data.
+- `max_age_secs` (optional): the oldest buffered record, by its ingest time,
+  may be at most this old.
+- `when_full`: `stop` (default) refuses the next record, so the source stops
+  advancing until the buffer drains. `drop_oldest` drops the oldest records
+  to make room. Each dropped record's idempotency key and ingest time go to
+  `gaps.log` in `dir` (no payload; rotated at 1 MiB into `gaps.1.log`), and
+  its total is kept in `dropped` and reported as
+  `hashi_buffer_dropped_total`. A schema control is never dropped; a full
+  buffer behind one stops.
+
+The sink opens, and takes its lock, on first delivery, so an instance whose
+sink cannot open yet still starts and buffers. A crash while draining
+redelivers from the last stored cursor with the same keys, so nothing is
+lost. Delivery is at least once: the JSON Lines sink appends every delivery,
+so consumers deduplicate by idempotency key.
 
 ## Credentials
 

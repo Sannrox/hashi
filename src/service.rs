@@ -10,17 +10,104 @@
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+use crate::buffer::{BufferStats, StoreAndForward};
 use crate::config::{Config, InstanceConfig, SinkConfig, SourceConfig};
+use crate::contract::{IdempotencyKey, Record};
 use crate::credential::FileCredential;
 use crate::fake::{FakeSource, record};
+use crate::sink::{DeliverError, Sink};
 use crate::{Error, FileCheckpoint, JsonLinesSink, RunReport, Runtime, RuntimeConfig, SystemClock};
 
-type FixtureRuntime = Runtime<FakeSource, JsonLinesSink, FileCheckpoint, SystemClock>;
+type FixtureRuntime = Runtime<FakeSource, InstanceSink, FileCheckpoint, SystemClock>;
 
-/// A running instance and the lock that fences its sink directory.
+/// An instance's sink, written directly or through its store-and-forward
+/// buffer.
+enum InstanceSink {
+    Direct(JsonLinesSink),
+    Buffered(StoreAndForward<LazySink>),
+}
+
+/// The sink behind a buffer, opened (and its directory locked) on first
+/// use. A sink that cannot open yet, such as an unmounted destination, is a
+/// transient error, so records keep buffering across a restart during an
+/// outage.
+struct LazySink {
+    dir: PathBuf,
+    open: Option<(JsonLinesSink, File)>,
+}
+
+impl LazySink {
+    fn sink(&mut self) -> Result<&mut JsonLinesSink, DeliverError> {
+        if self.open.is_none() {
+            let lock =
+                lock_sink_dir(&self.dir).map_err(|error| DeliverError::Transient(error.message))?;
+            let sink = JsonLinesSink::open(&self.dir)
+                .map_err(|error| DeliverError::Transient(error.message))?;
+            self.open = Some((sink, lock));
+        }
+        Ok(&mut self.open.as_mut().expect("opened above").0)
+    }
+}
+
+impl Sink for LazySink {
+    fn recover(&mut self) -> Result<(), DeliverError> {
+        self.sink()?.recover()
+    }
+
+    fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        self.sink()?.deliver(record, idk)
+    }
+}
+
+impl Sink for InstanceSink {
+    fn recover(&mut self) -> Result<(), DeliverError> {
+        match self {
+            Self::Direct(sink) => sink.recover(),
+            Self::Buffered(sink) => sink.recover(),
+        }
+    }
+
+    fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        match self {
+            Self::Direct(sink) => sink.deliver(record, idk),
+            Self::Buffered(sink) => sink.deliver(record, idk),
+        }
+    }
+}
+
+/// A running instance and the locks that fence its sink and buffer
+/// directories.
 struct Running {
     runtime: FixtureRuntime,
-    _sink_lock: File,
+    _locks: Vec<File>,
+}
+
+impl Running {
+    /// Run the instance. A pass that fails, for example because the source
+    /// is unavailable, still drains the buffer: those records were already
+    /// acknowledged and checkpointed, so their delivery must not wait on the
+    /// source.
+    fn run(&mut self) -> Result<RunReport, Error> {
+        let outcome = self.runtime.run();
+        if outcome.is_err()
+            && let InstanceSink::Buffered(buffer) = self.runtime.sink_mut()
+            && let Err(error @ (DeliverError::Blocked(_) | DeliverError::Poison(_))) =
+                buffer.recover()
+        {
+            eprintln!("buffer drain stopped: {error:?}");
+        }
+        outcome
+    }
+
+    fn buffer(&self) -> Option<BufferStats> {
+        match self.runtime.sink() {
+            InstanceSink::Direct(_) => None,
+            InstanceSink::Buffered(buffer) => buffer
+                .stats()
+                .inspect_err(|error| eprintln!("buffer stats unreadable: {error}"))
+                .ok(),
+        }
+    }
 }
 
 /// One instance's pass. `progress` counts what was committed even when `outcome` is an error.
@@ -28,6 +115,8 @@ pub struct Pass {
     pub instance: String,
     pub outcome: Result<RunReport, Error>,
     pub progress: RunReport,
+    /// The buffer's fill level and counters after the pass, when it has one.
+    pub buffer: Option<BufferStats>,
 }
 
 pub struct Service {
@@ -63,20 +152,29 @@ impl Service {
         self.instances
             .iter_mut()
             .map(|(instance, runtime)| {
-                let (outcome, progress) = match runtime {
-                    Some(running) => (running.runtime.run(), running.runtime.progress().clone()),
+                let (outcome, progress, buffer) = match runtime {
+                    Some(running) => (
+                        running.run(),
+                        running.runtime.progress().clone(),
+                        running.buffer(),
+                    ),
                     None => match open(checkpoint_dir, instance) {
                         Ok(opened) => {
                             let running = runtime.insert(opened);
-                            (running.runtime.run(), running.runtime.progress().clone())
+                            (
+                                running.run(),
+                                running.runtime.progress().clone(),
+                                running.buffer(),
+                            )
                         }
-                        Err(error) => (Err(error), RunReport::default()),
+                        Err(error) => (Err(error), RunReport::default(), None),
                     },
                 };
                 Pass {
                     instance: instance.name.clone(),
                     outcome,
                     progress,
+                    buffer,
                 }
             })
             .collect()
@@ -87,15 +185,19 @@ impl Service {
 /// instance or process reaches by a different path; this lock does, for as
 /// long as the instance runs.
 fn lock_sink_dir(dir: &Path) -> Result<File, Error> {
+    lock_dir(dir, ".hashi-sink.lock", "sink")
+}
+
+fn lock_dir(dir: &Path, file: &str, what: &str) -> Result<File, Error> {
     fs::create_dir_all(dir)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(dir.join(".hashi-sink.lock"))?;
+        .open(dir.join(file))?;
     lock.try_lock().map_err(|_| {
         Error::new(format!(
-            "sink directory {} is in use by another instance",
+            "{what} directory {} is in use by another instance",
             dir.display()
         ))
     })?;
@@ -127,15 +229,33 @@ fn open(checkpoint_dir: &Path, instance: &InstanceConfig) -> Result<Running, Err
         fixture.accept_sha256.clone(),
     );
     let SinkConfig::Jsonl(jsonl) = &instance.sink;
-    let sink_lock = lock_sink_dir(&jsonl.dir)?;
+    let mut locks = Vec::new();
+    let sink = match &instance.buffer {
+        None => {
+            locks.push(lock_sink_dir(&jsonl.dir)?);
+            InstanceSink::Direct(JsonLinesSink::open(&jsonl.dir)?)
+        }
+        Some(buffer) => {
+            // Two processes draining one buffer would deliver twice.
+            locks.push(lock_dir(&buffer.dir, ".hashi-buffer.lock", "buffer")?);
+            InstanceSink::Buffered(StoreAndForward::with_limits(
+                &buffer.dir,
+                buffer.limits(),
+                LazySink {
+                    dir: jsonl.dir.clone(),
+                    open: None,
+                },
+            )?)
+        }
+    };
     Ok(Running {
         runtime: Runtime::new(
             source,
-            JsonLinesSink::open(&jsonl.dir)?,
+            sink,
             FileCheckpoint::open(checkpoint_dir.join(&instance.name))?,
             SystemClock,
             RuntimeConfig::new(&instance.name),
         ),
-        _sink_lock: sink_lock,
+        _locks: locks,
     })
 }

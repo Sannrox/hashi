@@ -14,6 +14,8 @@
 //! name = "line-1"
 //! source.fixture = { records = 3, credential_file = "secrets/line-1", accept_sha256 = ["<hex>"] }
 //! sink.jsonl = { dir = "out/line-1" }
+//! # Optional store-and-forward buffer in front of the sink (#47).
+//! buffer = { dir = "buffer/line-1", max_bytes = 1073741824, max_age_secs = 86400, when_full = "stop" }
 //! ```
 
 use std::collections::BTreeSet;
@@ -37,6 +39,36 @@ pub struct InstanceConfig {
     pub name: String,
     pub source: SourceConfig,
     pub sink: SinkConfig,
+    /// A local disk buffer between the source and the sink. Absent: the
+    /// sink is written directly.
+    #[serde(default)]
+    pub buffer: Option<BufferConfig>,
+}
+
+/// `buffer = { dir, max_bytes, max_age_secs?, when_full? }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BufferConfig {
+    pub dir: PathBuf,
+    pub max_bytes: u64,
+    /// The oldest buffered record may be at most this old. Absent: no age cap.
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    /// `stop` (default) or `drop_oldest`.
+    #[serde(default)]
+    pub when_full: crate::buffer::WhenFull,
+}
+
+impl BufferConfig {
+    pub fn limits(&self) -> crate::buffer::BufferLimits {
+        crate::buffer::BufferLimits {
+            max_bytes: self.max_bytes,
+            max_age_ms: self
+                .max_age_secs
+                .map(|secs| i64::try_from(secs.saturating_mul(1000)).unwrap_or(i64::MAX)),
+            when_full: self.when_full,
+        }
+    }
 }
 
 /// One section per source family.
@@ -91,6 +123,9 @@ impl Config {
             }
             match &mut instance.sink {
                 SinkConfig::Jsonl(jsonl) => jsonl.dir = base.join(&jsonl.dir),
+            }
+            if let Some(buffer) = &mut instance.buffer {
+                buffer.dir = base.join(&buffer.dir);
             }
         }
         Ok(config)
@@ -166,6 +201,28 @@ impl Config {
                     }
                 }
             }
+            if let Some(buffer) = &instance.buffer {
+                if buffer.dir.as_os_str().is_empty() {
+                    return invalid(field("buffer.dir"), "must not be empty");
+                }
+                // One directory, one buffer: shared with a sink or another
+                // buffer, two writers would interleave its log.
+                if !sink_dirs.insert(
+                    buffer
+                        .dir
+                        .components()
+                        .filter(|part| !matches!(part, std::path::Component::CurDir))
+                        .collect::<PathBuf>(),
+                ) {
+                    return invalid(field("buffer.dir"), "is used by a sink or another buffer");
+                }
+                if buffer.max_bytes == 0 {
+                    return invalid(field("buffer.max_bytes"), "must be at least 1");
+                }
+                if buffer.max_age_secs == Some(0) {
+                    return invalid(field("buffer.max_age_secs"), "must be at least 1");
+                }
+            }
         }
         Ok(())
     }
@@ -193,6 +250,58 @@ mod tests {
         assert_eq!(parsed.checkpoint_dir, Path::new("/etc/hashi/state"));
         let SourceConfig::Fixture(fixture) = &parsed.instances[0].source;
         assert_eq!(fixture.credential_file, Path::new("/etc/hashi/secret"));
+    }
+
+    /// A buffer section resolves its directory like the sink's, defaults to
+    /// `stop`, and is refused when it shares a directory or has no room.
+    #[test]
+    fn a_buffer_section_is_parsed_and_validated() {
+        let buffered =
+            |buffer: &str| config(&format!("{}\nbuffer = {{ {buffer} }}", valid_instance()));
+        let parsed = Config::parse(
+            &buffered("dir = \"buf\", max_bytes = 1024, max_age_secs = 60"),
+            Path::new("/etc/hashi"),
+        )
+        .unwrap();
+        let buffer = parsed.instances[0].buffer.as_ref().unwrap();
+        assert_eq!(buffer.dir, Path::new("/etc/hashi/buf"));
+        assert_eq!(
+            buffer.limits(),
+            crate::buffer::BufferLimits {
+                max_bytes: 1024,
+                max_age_ms: Some(60_000),
+                when_full: crate::buffer::WhenFull::Stop,
+            }
+        );
+        let dropping = Config::parse(
+            &buffered("dir = \"buf\", max_bytes = 1, when_full = \"drop_oldest\""),
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(
+            dropping.instances[0].buffer.as_ref().unwrap().when_full,
+            crate::buffer::WhenFull::DropOldest
+        );
+        for (buffer, field) in [
+            ("dir = \"out\", max_bytes = 1", "instance[0].buffer.dir"),
+            (
+                "dir = \"buf\", max_bytes = 0",
+                "instance[0].buffer.max_bytes",
+            ),
+            (
+                "dir = \"buf\", max_bytes = 1, max_age_secs = 0",
+                "instance[0].buffer.max_age_secs",
+            ),
+            (
+                "dir = \"buf\", max_bytes = 1, when_full = \"block\"",
+                "drop_oldest",
+            ),
+        ] {
+            let error = Config::parse(&buffered(buffer), Path::new("."))
+                .unwrap_err()
+                .message;
+            assert!(error.contains(field), "{buffer}: {error}");
+        }
     }
 
     #[test]
