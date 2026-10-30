@@ -69,7 +69,10 @@ refers to them must reach the same instance.
   data may carry only the alias. Birth state is written atomically to
   `sparkplug_state_dir` on every birth and death and read back on connect, so a
   restarted connector resolves aliases of messages queued while it was away.
-  An exclusive lease on the directory fences a second instance.
+  An exclusive fencing lease on the directory fences a second instance.
+  Takeover resumes from the last checkpoint; missed messages depend on the
+  broker's persistent session and QoS. A paused holder is refused after the
+  token advances.
 - A data message from a node without a birth, one whose sequence number skips,
   or one with a metric missing from the certificates makes the connector
   publish an NCMD `Node Control/Rebirth` request (QoS 0, at most once per

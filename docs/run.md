@@ -15,6 +15,8 @@ TOML. Relative paths resolve against the config file's directory.
 
 ```toml
 checkpoint_dir = "state"
+# Optional. Default is a file slot under checkpoint_dir.
+# lease = { backend = "file", ttl_ms = 15000, members = 1 }
 
 [[instance]]
 name = "line-1"
@@ -24,14 +26,25 @@ sink.jsonl = { dir = "out/line-1" }
 
 - `checkpoint_dir`: each instance checkpoints under `checkpoint_dir/<name>`,
   so a restarted process resumes after the last committed position.
+- `lease` (optional): the lock store that decides who may write. Checkpoint
+  bytes stay in Hashi. `backend` is `file` (default, a JSON slot under
+  `lease.dir` or `checkpoint_dir`), `postgres` (URL in `credential_file`,
+  needs the `lease-postgres` feature), or `kubernetes` (`namespace`, `api`,
+  and a bearer token in `credential_file`, needs `lease-kubernetes`).
+  `ttl_ms` is the hold (default 15000). `members` is the site size; two nodes
+  need this exclusive lock or a witness, otherwise automatic promotion is
+  refused. A standby waits on the lease and resumes from the last checkpoint.
+  Hashi has no hard PostgreSQL dependency; a single-box site keeps the file
+  backend.
 - `instance.name`: `A-Z a-z 0-9 - _`, unique.
 - `instance.source.<family>`: one section per source family. This release
   ships `fixture`, the in-process source used to prove the runtime; protocol
   families add their own sections.
 - `instance.sink.jsonl.dir`: the JSON Lines sink directory. Instances may not
-  share one; a running instance also holds an exclusive lock in it
-  (`.hashi-sink.lock`), so a second writer that reaches it by another path,
-  in this process or another, is refused until the first stops.
+  share one; a running instance also holds a fencing lease in it, so a second
+  writer that reaches it by another path is refused until the first stops or
+  its TTL expires. Every sink write carries the instance fencing token, so a
+  paused holder is refused after takeover.
 - `instance.buffer` (optional): a store-and-forward disk buffer between the
   source and the sink, for sites whose uplink drops. See
   [Store-and-forward buffer](#store-and-forward-buffer).
@@ -48,9 +61,8 @@ buffer = { dir = "buffer/line-1", max_bytes = 1073741824, max_age_secs = 86400, 
 A record is acknowledged, and the checkpoint advances, once it is durably
 written to the buffer. The buffer drains to the sink in order, with each
 record's original idempotency key, whenever the sink accepts again. It is
-local files under `dir`, with no lease or database, and a running instance
-holds `.hashi-buffer.lock` there. The directory may not be a sink's or
-another buffer's.
+local files under `dir`, with no lock database, and a running instance holds
+a fencing lease there. The directory may not be a sink's or another buffer's.
 
 - `max_bytes`: the most buffered data.
 - `max_age_secs` (optional): the oldest buffered record, by its ingest time,

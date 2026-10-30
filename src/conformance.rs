@@ -4,7 +4,8 @@
 //! simulator or a disposable container). [`run`] drives the family's connector
 //! through the real [`Runtime`] with a durable checkpoint store and checks, in
 //! order: check, discover, snapshot, incremental, interruption and resume,
-//! duplicate keys, and schema drift. It returns the names of the passed checks,
+//! duplicate keys, kill-active takeover, paused-active fence, and schema drift.
+//! It returns the names of the passed checks,
 //! or the first contract violation as an error naming its check.
 //!
 //! Every check uses only the connector contract, so a family that passes here
@@ -23,15 +24,20 @@ use crate::sink::{DeliverError, Sink};
 use crate::{Error, RunReport};
 
 /// The checks [`run`] performs, in order.
-pub const CHECKS: [&str; 7] = [
+pub const CHECKS: [&str; 9] = [
     "check",
     "discover",
     "snapshot",
     "incremental",
     "interruption_and_resume",
     "duplicate_keys",
+    "kill_active",
+    "paused_active",
     "drift",
 ];
+/// Lease TTL for takeover checks. Short so the kit does not wait on the
+/// operator default.
+const TAKEOVER_TTL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Runtime instance name the kit checkpoints under.
 pub const INSTANCE: &str = "conformance";
@@ -138,7 +144,8 @@ pub fn run<F: Family>(family: &mut F, state_dir: &Path) -> Result<Vec<&'static s
             std::process::exit(101);
         }
     });
-    let outcome = run_checks(family, state_dir, &current);
+    let outcome =
+        crate::lease::with_ttl_override(TAKEOVER_TTL, || run_checks(family, state_dir, &current));
     *lock(&current) = None;
     outcome
 }
@@ -171,6 +178,8 @@ fn run_checks<F: Family>(
             "incremental" => kit.incremental(),
             "interruption_and_resume" => kit.interruption_and_resume(),
             "duplicate_keys" => kit.duplicate_keys(),
+            "kill_active" => kit.kill_active(),
+            "paused_active" => kit.paused_active(),
             _ => kit.drift(),
         };
         outcome.map_err(|error| Error::new(format!("{check}: {}", error.message)))?;
@@ -266,6 +275,9 @@ impl<F: Family> Kit<'_, F> {
         let mark = lock(&self.delivered).len();
         self.runtime_mut()?
             .run_while(|report: &RunReport| report.delivered == 0)?;
+        if let Some(runtime) = &mut self.runtime {
+            runtime.release_lease()?;
+        }
         self.runtime = None;
         self.checkpoint = self.committed()?;
         let killed_at = self.checkpoint;
@@ -333,6 +345,9 @@ impl<F: Family> Kit<'_, F> {
     /// or, for a family that fails closed, a refused start that changes nothing.
     fn drift(&mut self) -> Result<(), Error> {
         // Stop the connector first, as an operator does before changing a source schema.
+        if let Some(runtime) = &mut self.runtime {
+            runtime.release_lease()?;
+        }
         self.runtime = None;
         let before = self.committed()?;
         let kind = match self.family.drift()? {
@@ -365,9 +380,87 @@ impl<F: Family> Kit<'_, F> {
         Ok(())
     }
 
+    /// Drops the active runtime without releasing the lease (a kill), waits
+    /// for the TTL, and resumes from the durable checkpoint.
+    fn kill_active(&mut self) -> Result<(), Error> {
+        let expected = self.family.produce(&["ka1", "ka2"])?;
+        let mark = lock(&self.delivered).len();
+        self.runtime_mut()?
+            .run_while(|report: &RunReport| report.delivered == 0)?;
+        let acked: Vec<Record> = lock(&self.delivered)[mark..]
+            .iter()
+            .map(|(record, _)| record.clone())
+            .filter(|record| record.kind != CONTROL_KIND)
+            .collect();
+        if acked.is_empty() {
+            return Err(Error::new("nothing was delivered before the kill"));
+        }
+        let acked_keys: Vec<String> = acked
+            .iter()
+            .map(|record| record.idempotency_key(&self.id, INSTANCE).encode())
+            .collect();
+        if let Some(runtime) = &mut self.runtime {
+            runtime.abandon_lease();
+        }
+        self.runtime = None;
+        std::thread::sleep(TAKEOVER_TTL + std::time::Duration::from_millis(50));
+        let source = self.family.connect()?;
+        self.start(source)?;
+        let mut remaining = missing(&acked, &expected);
+        let after = self.family.produce(&["ka3"])?;
+        remaining.extend(after.iter().cloned());
+        let resumed = self.drain(&remaining, None)?;
+        require_keys(&resumed, &after)?;
+        let all: Vec<Record> = lock(&self.delivered)[mark..]
+            .iter()
+            .map(|(record, _)| record.clone())
+            .filter(|record| record.kind != CONTROL_KIND)
+            .collect();
+        require_keys(&all, &expected)?;
+        let mut seen = BTreeSet::new();
+        for (_, idk) in lock(&self.delivered)[mark..].iter() {
+            let encoded = idk.encode();
+            if !seen.insert(encoded.clone()) && !acked_keys.contains(&encoded) {
+                return Err(Error::new(
+                    "takeover delivered a duplicate with a new idempotency key",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the old runtime after takeover; its next write must be refused.
+    fn paused_active(&mut self) -> Result<(), Error> {
+        let expected = self.family.produce(&["pa1"])?;
+        self.drain(&expected, None)?;
+        let mut paused = self
+            .runtime
+            .take()
+            .ok_or_else(|| Error::new("no running connector"))?;
+        std::thread::sleep(TAKEOVER_TTL + std::time::Duration::from_millis(50));
+        let source = self.family.connect()?;
+        self.start(source)?;
+        let next = self.family.produce(&["pa2"])?;
+        self.drain(&next, None)?;
+        let err = paused
+            .run()
+            .err()
+            .ok_or_else(|| Error::new("paused writer was not refused after takeover"))?;
+        if !(err.message.contains("already running")
+            || err.message.contains("stale writer")
+            || err.message.contains("fence"))
+        {
+            return Err(Error::new(format!(
+                "paused writer failed for the wrong reason: {}",
+                err.message
+            )));
+        }
+        Ok(())
+    }
+
     fn start(&mut self, source: F::Source) -> Result<(), Error> {
         self.id = source.id().to_string();
-        let store = FileCheckpoint::open(self.state_dir)?;
+        let store = FileCheckpoint::open_with_ttl(self.state_dir, TAKEOVER_TTL)?;
         self.runtime = Some(Runtime::new(
             source,
             Recorder(self.delivered.clone()),

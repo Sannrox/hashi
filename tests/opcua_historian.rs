@@ -7,7 +7,6 @@ mod simulator;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +17,7 @@ use hashi::historian::{Historian, HistorianConfig, HistorianConnector};
 use hashi::opcua::historian::OpcUaHistorian;
 use hashi::opcua::{Authentication, Config, Policy};
 use hashi::runtime::Clock;
-use hashi::{Connector, Error, MemorySink, Runtime, RuntimeConfig};
+use hashi::{Connector, Error, InstanceLease, MemorySink, Runtime, RuntimeConfig};
 use opcua::types::{DataValue, DateTime, NodeId};
 
 const START_MS: i64 = 1_700_000_000_000;
@@ -85,15 +84,21 @@ impl Clock for FixtureClock {
 struct MemoryStore(Rc<RefCell<Option<Checkpoint>>>);
 
 impl CheckpointStore for MemoryStore {
-    fn acquire(&self, _connector: &str, _instance: &str) -> Result<File, Error> {
-        Ok(File::create(scratch("lease"))?)
+    fn acquire(&self, _connector: &str, _instance: &str) -> Result<InstanceLease, Error> {
+        Ok(InstanceLease::unfenced(1))
     }
 
     fn load_schemas(&self, _: &str, _: &str) -> Result<hashi::schema::SchemaState, Error> {
         Ok(Default::default())
     }
 
-    fn save_schemas(&self, _: &str, _: &str, _: &hashi::schema::SchemaState) -> Result<(), Error> {
+    fn save_schemas(
+        &self,
+        _: &str,
+        _: &str,
+        _: &hashi::schema::SchemaState,
+        _: u64,
+    ) -> Result<(), Error> {
         Ok(())
     }
 
@@ -106,7 +111,7 @@ impl CheckpointStore for MemoryStore {
         Ok(())
     }
 
-    fn quarantine(&self, _: &QuarantineRow) -> Result<(), Error> {
+    fn quarantine(&self, _: &QuarantineRow, _: u64) -> Result<(), Error> {
         Err(Error::new("no quarantine expected"))
     }
 

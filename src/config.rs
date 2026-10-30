@@ -9,6 +9,8 @@
 //!
 //! ```toml
 //! checkpoint_dir = "state"
+//! # Optional. Default is a local file slot under checkpoint_dir.
+//! # lease = { backend = "file", ttl_ms = 15000, members = 1 }
 //!
 //! [[instance]]
 //! name = "line-1"
@@ -29,8 +31,72 @@ use crate::Error;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub checkpoint_dir: PathBuf,
+    /// Lock store for instance leases. Absent: a file slot under `checkpoint_dir`.
+    #[serde(default)]
+    pub lease: LeaseConfig,
     #[serde(rename = "instance")]
     pub instances: Vec<InstanceConfig>,
+}
+
+/// `[lease]` section. The lock store is independent of checkpoint files.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseConfig {
+    #[serde(default)]
+    pub backend: LeaseBackend,
+    /// File-backend directory. Absent: `checkpoint_dir`.
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Hold time in milliseconds. Absent: 15000.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    /// Site size for automatic promotion. Absent: 1. Two nodes need this
+    /// exclusive lock (or a witness); the configured backend is that lock.
+    #[serde(default)]
+    pub members: Option<u32>,
+    /// PostgreSQL URL or Kubernetes bearer token. Never a value in the config.
+    #[serde(default)]
+    pub credential_file: Option<PathBuf>,
+    /// Kubernetes namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Kubernetes API base URL.
+    #[serde(default)]
+    pub api: Option<String>,
+}
+
+impl Default for LeaseConfig {
+    fn default() -> Self {
+        Self {
+            backend: LeaseBackend::File,
+            dir: None,
+            ttl_ms: None,
+            members: None,
+            credential_file: None,
+            namespace: None,
+            api: None,
+        }
+    }
+}
+
+impl LeaseConfig {
+    pub fn ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.ttl_ms.unwrap_or(15_000))
+    }
+
+    pub fn members(&self) -> u32 {
+        self.members.unwrap_or(1)
+    }
+}
+
+/// `lease.backend`: `file` (default), `postgres`, or `kubernetes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseBackend {
+    #[default]
+    File,
+    Postgres,
+    Kubernetes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -115,6 +181,15 @@ impl Config {
             .map_err(|error| Error::new(format!("invalid config: {}", error.message())))?;
         config.validate()?;
         config.checkpoint_dir = base.join(&config.checkpoint_dir);
+        if let Some(dir) = &mut config.lease.dir {
+            *dir = base.join(&*dir);
+        }
+        if let Some(path) = &mut config.lease.credential_file {
+            *path = base.join(&*path);
+        }
+        if config.lease.dir.is_none() {
+            config.lease.dir = Some(config.checkpoint_dir.clone());
+        }
         for instance in &mut config.instances {
             match &mut instance.source {
                 SourceConfig::Fixture(fixture) => {
@@ -137,6 +212,55 @@ impl Config {
         };
         if self.checkpoint_dir.as_os_str().is_empty() {
             return invalid("checkpoint_dir".into(), "must not be empty");
+        }
+        if self.lease.ttl_ms == Some(0) {
+            return invalid("lease.ttl_ms".into(), "must be at least 1");
+        }
+        if self.lease.members == Some(0) {
+            return invalid("lease.members".into(), "must be at least 1");
+        }
+        match self.lease.backend {
+            LeaseBackend::File => {}
+            LeaseBackend::Postgres => {
+                if self
+                    .lease
+                    .credential_file
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
+                {
+                    return invalid(
+                        "lease.credential_file".into(),
+                        "required for the postgres backend",
+                    );
+                }
+            }
+            LeaseBackend::Kubernetes => {
+                if self
+                    .lease
+                    .namespace
+                    .as_ref()
+                    .is_none_or(|value| value.is_empty())
+                {
+                    return invalid(
+                        "lease.namespace".into(),
+                        "required for the kubernetes backend",
+                    );
+                }
+                if self.lease.api.as_ref().is_none_or(|value| value.is_empty()) {
+                    return invalid("lease.api".into(), "required for the kubernetes backend");
+                }
+                if self
+                    .lease
+                    .credential_file
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
+                {
+                    return invalid(
+                        "lease.credential_file".into(),
+                        "required for the kubernetes backend",
+                    );
+                }
+            }
         }
         if self.instances.is_empty() {
             return invalid("instance".into(), "declare at least one instance");
@@ -248,6 +372,12 @@ mod tests {
     fn a_valid_config_resolves_paths_against_its_directory() {
         let parsed = Config::parse(&config(&valid_instance()), Path::new("/etc/hashi")).unwrap();
         assert_eq!(parsed.checkpoint_dir, Path::new("/etc/hashi/state"));
+        assert_eq!(parsed.lease.backend, LeaseBackend::File);
+        assert_eq!(
+            parsed.lease.dir.as_deref(),
+            Some(Path::new("/etc/hashi/state"))
+        );
+        assert_eq!(parsed.lease.ttl(), std::time::Duration::from_millis(15_000));
         let SourceConfig::Fixture(fixture) = &parsed.instances[0].source;
         assert_eq!(fixture.credential_file, Path::new("/etc/hashi/secret"));
     }
@@ -352,5 +482,32 @@ mod tests {
         );
         let error = Config::parse(&shared, Path::new(".")).unwrap_err().message;
         assert!(error.contains("instance[1].sink.jsonl.dir"), "{error}");
+    }
+
+    #[test]
+    fn a_lease_section_is_parsed_and_validated() {
+        let text = format!(
+            "checkpoint_dir = \"state\"\nlease = {{ backend = \"file\", dir = \"locks\", ttl_ms = 2000, members = 2 }}\n\n[[instance]]\n{}\n",
+            valid_instance()
+        );
+        let parsed = Config::parse(&text, Path::new("/etc/hashi")).unwrap();
+        assert_eq!(
+            parsed.lease.dir.as_deref(),
+            Some(Path::new("/etc/hashi/locks"))
+        );
+        assert_eq!(parsed.lease.ttl(), std::time::Duration::from_millis(2000));
+        assert_eq!(parsed.lease.members(), 2);
+        for (lease, field) in [
+            ("backend = \"file\", ttl_ms = 0", "lease.ttl_ms"),
+            ("backend = \"postgres\"", "lease.credential_file"),
+            ("backend = \"kubernetes\", namespace = \"ns\"", "lease.api"),
+        ] {
+            let text = format!(
+                "checkpoint_dir = \"state\"\nlease = {{ {lease} }}\n\n[[instance]]\n{}\n",
+                valid_instance()
+            );
+            let error = Config::parse(&text, Path::new(".")).unwrap_err().message;
+            assert!(error.contains(field), "{lease}: {error}");
+        }
     }
 }

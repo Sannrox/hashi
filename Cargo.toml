@@ -24,6 +24,7 @@ serialport = { version = "4.10.1", default-features = false, optional = true }
 toml = { version = "0.9.12", default-features = false, features = ["parse", "serde", "std"] }
 tokio = { version = "1.54.0", default-features = false, features = ["rt-multi-thread", "time"], optional = true }
 url = { version = "2.5.8", optional = true }
+fencing-lease = { git = "https://github.com/Sannrox/agent-kit", rev = "7adf5da3254b6a78f93c49837ab9f7cd6103b2d0", package = "fencing-lease", default-features = false }
 
 [features]
 default = ["parquet", "modbus"]
@@ -33,6 +34,8 @@ mysql = ["dep:chrono", "dep:mysql_async", "dep:mysql_common", "dep:futures-util"
 mqtt = ["dep:prost", "dep:rumqttc", "dep:rustls", "dep:tokio"]
 opcua = ["dep:async-opcua", "dep:tokio", "dep:url"]
 opcua-simulator = ["dep:async-trait", "opcua", "async-opcua/server", "tokio/net", "tokio/macros"]
+lease-postgres = ["fencing-lease/postgres"]
+lease-kubernetes = ["fencing-lease/kubernetes"]
 
 # Dependencies build without debug info in dev and test builds: backtraces
 # and debuggers keep full detail for workspace crates, and build directories

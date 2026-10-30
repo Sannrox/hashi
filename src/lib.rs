@@ -18,6 +18,7 @@ pub mod fake;
 pub mod historian;
 pub mod jsonl;
 pub mod kafka;
+pub mod lease;
 #[cfg(feature = "modbus")]
 pub mod modbus;
 #[cfg(feature = "mqtt")]
@@ -38,7 +39,9 @@ pub mod sink;
 pub mod soak;
 
 pub use buffer::StoreAndForward;
-pub use checkpoint::{Checkpoint, CheckpointStore, FileCheckpoint, QuarantineRow};
+pub use checkpoint::{
+    CHECKPOINT_VERSION, Checkpoint, CheckpointStore, FileCheckpoint, QuarantineRow,
+};
 pub use config::Config;
 pub use connector::Connector;
 pub use contract::{
@@ -49,6 +52,7 @@ pub use credential::{FileCredential, Secret};
 pub use fake::FakeSource;
 pub use jsonl::JsonLinesSink;
 pub use kafka::KafkaCompatibleSink;
+pub use lease::InstanceLease;
 #[cfg(feature = "parquet")]
 pub use parquet::ParquetSink;
 pub use platform::{CapturePeer, PLATFORM_SINK_PROTOCOL, PlatformPeer, PlatformSdkSink};

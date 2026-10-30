@@ -25,7 +25,6 @@
 //! sample at or before the watermark is refused. Samples written later than
 //! `settle_ms` behind real time are outside this contract.
 
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -150,7 +149,7 @@ pub struct HistorianConnector<H, T> {
     tag_set: String,
     page: Option<Page>,
     last_read_ms: Option<i64>,
-    _lease: File,
+    lease: crate::lease::DropRelease,
 }
 
 impl<H: Historian, T: Clock> HistorianConnector<H, T> {
@@ -164,14 +163,12 @@ impl<H: Historian, T: Clock> HistorianConnector<H, T> {
             return Err(Error::new("invalid historian configuration"));
         }
         std::fs::create_dir_all(&config.state_dir)?;
-        let lease = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(config.state_dir.join("historian.lease"))?;
-        lease
-            .try_lock()
-            .map_err(|_| Error::new("historian state directory is already owned"))?;
+        let lease = crate::lease::hold(
+            &config.state_dir,
+            "historian",
+            crate::lease::hold_ttl(),
+            "historian state directory is already owned",
+        )?;
         // Name order, so cursor indexes do not depend on discovery order.
         let mut tags = historian.tags()?;
         tags.sort_by(|left, right| left.name.cmp(&right.name));
@@ -198,7 +195,7 @@ impl<H: Historian, T: Clock> HistorianConnector<H, T> {
             tag_set,
             page: None,
             last_read_ms: None,
-            _lease: lease,
+            lease,
         })
     }
 
@@ -389,6 +386,7 @@ impl<H: Historian, T: Clock> Connector for HistorianConnector<H, T> {
     }
 
     fn check(&self) -> Result<CheckReport, Error> {
+        self.lease.renew()?;
         let mut message = if self.tags.is_empty() {
             "historian reports no tags".to_string()
         } else {
@@ -407,6 +405,7 @@ impl<H: Historian, T: Clock> Connector for HistorianConnector<H, T> {
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredKind>, Error> {
+        self.lease.renew()?;
         Ok(vec![DiscoveredKind {
             kind: SAMPLE_KIND.into(),
             schema: crate::schema::Schema::text(),
@@ -419,6 +418,7 @@ impl<H: Historian, T: Clock> Connector for HistorianConnector<H, T> {
         from: Option<Position>,
         source_cursor: Option<&str>,
     ) -> Result<Option<Record>, Error> {
+        self.lease.renew()?;
         // One horizon per read, so catching up always ends.
         let horizon = self.horizon();
         // Whether the current round opened in this call and has emitted

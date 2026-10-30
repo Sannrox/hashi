@@ -48,7 +48,7 @@ pub struct MySqlConnector {
     stream: Option<BinlogStream>,
     failed: bool,
     last_resume: Option<(Position, String)>,
-    _lease: std::fs::File,
+    lease: crate::lease::DropRelease,
 }
 impl MySqlConnector {
     /// Synchronous API; embed on a dedicated OS thread, outside a Tokio runtime.
@@ -148,15 +148,12 @@ impl MySqlConnector {
             ));
         }
         std::fs::create_dir_all(&config.state_dir)?;
-        let lease = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(config.state_dir.join("mysql.lease"))?;
-        lease
-            .try_lock()
-            .map_err(|_| Error::new("MySQL source spool is already owned"))?;
+        let lease = crate::lease::hold(
+            &config.state_dir,
+            "mysql",
+            crate::lease::hold_ttl(),
+            "MySQL source spool is already owned",
+        )?;
         let fingerprint = serde_json::json!([
             config.id,
             config.options.ip_or_hostname(),
@@ -217,7 +214,7 @@ impl MySqlConnector {
             stream: None,
             failed: false,
             last_resume: None,
-            _lease: lease,
+            lease,
         })
     }
 
@@ -696,6 +693,7 @@ impl Connector for MySqlConnector {
         &self.config.id
     }
     fn check(&self) -> Result<CheckReport, Error> {
+        self.lease.renew()?;
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(Error::new(
                 "call MySQL synchronous API outside an async runtime",
@@ -781,6 +779,7 @@ impl Connector for MySqlConnector {
         })
     }
     fn discover(&self) -> Result<Vec<DiscoveredKind>, Error> {
+        self.lease.renew()?;
         let mut kinds: Vec<_> = self.state.layouts.iter().map(Layout::discovered).collect();
         kinds.push(DiscoveredKind {
             kind: TRANSACTIONS.into(),
@@ -798,6 +797,7 @@ impl Connector for MySqlConnector {
         from: Option<Position>,
         cursor: Option<&str>,
     ) -> Result<Option<Record>, Error> {
+        self.lease.renew()?;
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(Error::new(
                 "call MySQL synchronous API outside an async runtime",

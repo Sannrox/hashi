@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use crate::Error;
-use crate::checkpoint::{atomic_write, repair_log_tail, sync_dir};
+use crate::checkpoint::{atomic_write, lock_and_admit, repair_log_tail, sync_dir};
 use crate::contract::{IdempotencyKey, Record};
 use crate::delivery;
 use crate::sink::{DeliverError, Sink};
@@ -82,6 +82,7 @@ pub struct StoreAndForward<S> {
     inner: S,
     drained: u64,
     dropped: u64,
+    token: u64,
     pub filled: bool,
 }
 
@@ -128,6 +129,7 @@ impl<S> StoreAndForward<S> {
             inner,
             drained: 0,
             dropped,
+            token: 0,
             filled: false,
         })
     }
@@ -401,11 +403,20 @@ impl<S: Sink> StoreAndForward<S> {
 }
 
 impl<S: Sink> Sink for StoreAndForward<S> {
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        let _lock = lock_and_admit(&self.dir.join(".hashi-fence"), token)
+            .map_err(crate::sink::from_fence)?;
+        self.token = token;
+        self.inner.admit(token)
+    }
+
     fn recover(&mut self) -> Result<(), DeliverError> {
         self.drain()
     }
 
     fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        let _lock = lock_and_admit(&self.dir.join(".hashi-fence"), self.token)
+            .map_err(crate::sink::from_fence)?;
         match self.drain() {
             Ok(()) | Err(DeliverError::Transient(_)) => {}
             Err(other) => return Err(other),

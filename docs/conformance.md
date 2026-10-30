@@ -12,6 +12,8 @@ durable checkpoint store, against a live fixture, and checks in order:
 | `incremental` | A later change is delivered after the committed checkpoint, never at or before it. |
 | `interruption_and_resume` | After a kill right after the first delivery, a fresh connector delivers every remaining change and resumes after the durable checkpoint. |
 | `duplicate_keys` | Two changes to one key are two records with distinct identities; neither is dropped. |
+| `kill_active` | After a kill of the active runtime, a standby takes the lease, no acknowledged record is lost, and duplicates reuse the same idempotency keys. |
+| `paused_active` | After takeover, the paused runtime's next write is refused. |
 | `drift` | A schema change produces a schema control record for the kind and the following change is delivered, or, for a family that fails closed, a refused start that delivers and commits nothing. |
 
 The first violation fails the run and names its check. A watchdog ends the

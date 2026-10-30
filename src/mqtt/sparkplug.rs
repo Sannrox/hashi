@@ -8,7 +8,6 @@
 //! cannot be resolved becomes an `UNRESOLVED_KIND` record, which the runtime
 //! quarantines: it is never guessed.
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use prost::Message as _;
@@ -83,7 +82,7 @@ pub struct Hosts {
     path: PathBuf,
     /// Minimum wait before asking the same node for a rebirth again.
     rebirth_interval_ms: i64,
-    _lease: File,
+    lease: crate::lease::DropRelease,
 }
 
 #[derive(Default)]
@@ -127,14 +126,12 @@ struct Topic<'a> {
 impl Hosts {
     pub fn open(state_dir: &Path, rebirth_interval_ms: i64) -> Result<Self, Error> {
         std::fs::create_dir_all(state_dir)?;
-        let lease = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(state_dir.join("sparkplug.lease"))?;
-        lease
-            .try_lock()
-            .map_err(|_| Error::new("Sparkplug state directory is already owned"))?;
+        let lease = crate::lease::hold(
+            state_dir,
+            "sparkplug",
+            crate::lease::hold_ttl(),
+            "Sparkplug state directory is already owned",
+        )?;
         let path = state_dir.join("sparkplug-births.v1.json");
         let files: Vec<NodeFile> = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -158,7 +155,7 @@ impl Hosts {
             nodes,
             path,
             rebirth_interval_ms,
-            _lease: lease,
+            lease,
         })
     }
 
@@ -170,6 +167,7 @@ impl Hosts {
         bytes: &[u8],
         now_ms: i64,
     ) -> Result<(Vec<Record>, Option<Rebirth>), Error> {
+        self.lease.renew()?;
         let Some(parsed) = parse_topic(topic) else {
             return Ok((
                 vec![unresolved(
@@ -335,6 +333,7 @@ impl Hosts {
     }
 
     fn persist(&self) -> Result<(), Error> {
+        self.lease.renew()?;
         let files: Vec<NodeFile> = self
             .nodes
             .iter()

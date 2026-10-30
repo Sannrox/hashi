@@ -56,8 +56,10 @@ and transaction application. Markers do not promise atomic application by a sink
 The runtime owns checkpoint commits after sink acknowledgement. The source manifest
 owns received batches, not runtime delivery. Preserve both stores. Missing,
 regressed, or mismatched checkpoint/cursor state fails closed. A per-directory
-exclusive lease fences concurrent local spool writers and releases on process death.
-This does not implement a cross-node ownership protocol.
+fencing lease fences concurrent spool writers. A standby resumes from the last
+committed GTID and position; delivery stays at-least-once with stable
+idempotency keys. Two-node automatic promotion needs this exclusive lock or a
+witness.
 
 ## Types and schema changes
 

@@ -149,6 +149,8 @@ fn drift_fixtures_survive_restart_and_isolate_breaking_kinds() {
             assert_eq!(rt.run().unwrap().quarantined, 1);
             rt.resolve_schema("row", &old).unwrap_err();
             rt.resolve_schema("row", &new).unwrap();
+            rt.release_lease().expect("release resolved runtime lease");
+            drop(rt);
             let mut rt = runtime(
                 &path,
                 new,
@@ -206,7 +208,7 @@ fn instance_lease_fails_immediately_and_releases_for_takeover() {
     let lease = store.acquire("fixture", "instance").unwrap();
     let mut rt = runtime(&path, baseline(), vec![], MemorySink::new());
     assert!(rt.run().unwrap_err().message.contains("already running"));
-    drop(lease);
+    lease.release().unwrap();
     rt.run().unwrap();
     std::fs::remove_dir_all(path).unwrap();
 }

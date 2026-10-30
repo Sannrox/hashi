@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::Error;
-use crate::checkpoint::{repair_log_tail, sync_dir};
+use crate::checkpoint::{lock_and_admit, repair_log_tail, sync_dir};
 use crate::contract::{IdempotencyKey, Record};
 use crate::delivery;
 use crate::sink::{DeliverError, Sink};
@@ -20,6 +20,7 @@ pub struct KafkaCompatibleSink {
     dir: PathBuf,
     topic: String,
     seen: HashSet<String>,
+    token: u64,
 }
 
 impl KafkaCompatibleSink {
@@ -32,6 +33,7 @@ impl KafkaCompatibleSink {
             dir,
             topic,
             seen: HashSet::new(),
+            token: 0,
         };
         sink.seen = sink.load_seen()?;
         Ok(sink)
@@ -63,7 +65,16 @@ impl KafkaCompatibleSink {
 }
 
 impl Sink for KafkaCompatibleSink {
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        let _lock = lock_and_admit(&self.dir.join(".hashi-fence"), token)
+            .map_err(crate::sink::from_fence)?;
+        self.token = token;
+        Ok(())
+    }
+
     fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        let _lock = lock_and_admit(&self.dir.join(".hashi-fence"), self.token)
+            .map_err(crate::sink::from_fence)?;
         let encoded = idk.encode();
         if self.seen.contains(&encoded) {
             self.sync_log().map_err(io_err)?;

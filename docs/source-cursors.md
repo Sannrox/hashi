@@ -32,7 +32,7 @@ application and any decision to replay quarantined records.
 | Parquet | Existing eight columns | Optional ninth `source_metadata` text column |
 | Platform frames | Protocol v1 and existing bytes | Protocol v2 and appended source-metadata JSON |
 | Quarantine | Readers accept v1 rows | Writers append v2 rows with metadata |
-| Checkpoints | Readers accept four-line v1 state | Writers store five-line v2 state including optional cursor |
+| Checkpoints | Readers accept four-line v1 and five-line v2 state | Writers store six-line v3 state including optional cursor and fencing token |
 
 The checkpoint and quarantine filenames retain their historical `.v1` slot
 names. This is deliberate: v2 must replace the authoritative checkpoint in the
@@ -44,17 +44,17 @@ The separate schema-decision file keeps its existing format.
 
 ## Upgrade and rollback
 
-Stop the older instance, retain its full state, and start v2 against that state.
-The existing per-instance exclusive lease prevents overlapping writers. A v1
-checkpoint loads with no cursor; the connector must support that position-only
-resume or explicitly refuse it. The first successful v2 checkpoint upgrades
-its contents in place. Buffered legacy records still load and drain.
+Stop the older instance, retain its full state, and start the new binary against
+that state. The per-instance fencing lease prevents overlapping writers. A v1
+checkpoint loads with no cursor and token 0; a v2 checkpoint loads with its
+cursor and token 0. The connector must support that position-only resume or
+explicitly refuse it. The first successful v3 checkpoint upgrades its contents
+in place, including the fencing token. Buffered legacy records still load and
+drain. Extra checkpoint fields still fail closed.
 
-V1 binaries cannot read v2 checkpoints or new source-metadata records. They
-fail closed on the upgraded checkpoint instead of resuming stale state.
-Rollback therefore requires an explicit compatible state/consumer recovery
-plan; copying an old checkpoint over acknowledged work is unsafe. Mixed v1/v2
-consumers remain compatible only for records without source metadata. Upgrade
-consumers before enabling source-aware records. No source cursor migration,
-re-snapshot generation fencing, database connector, or consumer transaction
-policy is implemented by this change.
+Older binaries cannot read a v3 checkpoint. They fail closed on the upgraded
+file instead of resuming stale state. Rollback therefore requires an explicit
+compatible state/consumer recovery plan; copying an old checkpoint over
+acknowledged work is unsafe. Mixed v1/v2 consumers remain compatible only for
+records without source metadata. Upgrade consumers before enabling
+source-aware records.

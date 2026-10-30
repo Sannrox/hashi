@@ -40,11 +40,12 @@ Malformed or unknown state fails closed. Pending events survive restart and
 replay with their original sequence. Instance state must travel together with
 its source checkpoint during backup, restore, or takeover.
 
-A run and explicit resolution hold an OS file lock per connector/instance.
-Another process using the same state directory fails immediately; process
-exit releases the lock. This is local durable-state ownership, not a cluster
-lease. Independent directories for the same source are not coordinated. Do
-not share an instance across nodes without storage that enforces the lock.
+A run and explicit resolution hold a fencing lease per connector/instance.
+Another process using the same state directory is contended while the hold is
+unexpired; a kill or pause leaves the TTL so a standby can take over. Writes
+carry the token, so a stale node is refused. Independent directories for the
+same source are not coordinated. Two-node automatic promotion needs this
+exclusive lock or a witness.
 
 The discovery Rust API changes from opaque text to typed schemas. Sink data,
 checkpoint, and quarantine compatibility is described in

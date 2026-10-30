@@ -59,7 +59,7 @@ pub(super) struct Reader {
     history: Option<history::History>,
     needs_history: bool,
     requires_full_history: bool,
-    _lease: std::fs::File,
+    lease: crate::lease::DropRelease,
 }
 impl Reader {
     pub async fn open(
@@ -71,15 +71,12 @@ impl Reader {
             .map(|history| history::History::new(history, config.nodes.len()))
             .transpose()?;
         std::fs::create_dir_all(&config.state_dir)?;
-        let lease = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(config.state_dir.join("opcua.lease"))?;
-        lease
-            .try_lock()
-            .map_err(|_| Error::new("OPC UA subscription spool is already owned"))?;
+        let lease = crate::lease::hold(
+            &config.state_dir,
+            "opcua",
+            crate::lease::hold_ttl(),
+            "OPC UA subscription spool is already owned",
+        )?;
         let kinds = inspect_kinds(&source.session, &config.nodes, source.schema_version).await?;
         let mut fingerprint = serde_json::json!([
             source.id,
@@ -125,7 +122,7 @@ impl Reader {
             needs_history: history.is_some(),
             requires_full_history: history.is_some() && high_water > 0,
             history,
-            _lease: lease,
+            lease,
         };
         reader.create(&source.session).await?;
         Ok(reader)
@@ -248,12 +245,17 @@ impl Reader {
         !self.failed
     }
 
+    pub fn renew_lease(&self) -> Result<(), Error> {
+        self.lease.renew()
+    }
+
     pub async fn read(
         &mut self,
         session: &Session,
         from: Option<Position>,
         timeout: Duration,
     ) -> Result<Option<Record>, Error> {
+        self.lease.renew()?;
         if self.failed {
             return Err(Error::new(
                 "OPC UA subscription failed; restart to recover durable pending records",
