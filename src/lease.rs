@@ -24,9 +24,10 @@ thread_local! {
     static TTL_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
 }
 
-/// Run `f` with a shorter hold, so the conformance kit can take over without
-/// waiting on [`DEFAULT_TTL`]. Nested calls restore the previous override.
-pub(crate) fn with_ttl_override<R>(ttl: Duration, f: impl FnOnce() -> R) -> R {
+/// Run `f` with a shorter hold, so the conformance kit and crash-recovery
+/// fixtures can take over without waiting on [`DEFAULT_TTL`]. Nested calls
+/// restore the previous override.
+pub fn with_ttl_override<R>(ttl: Duration, f: impl FnOnce() -> R) -> R {
     TTL_OVERRIDE.with(|slot| {
         let previous = slot.replace(Some(ttl));
         let result = f();

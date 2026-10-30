@@ -3,6 +3,13 @@ use hashi::mysql::{Config, MySqlConnector, Table};
 use hashi::{CheckpointStore, Connector, Operation, Record};
 use mysql_async::{Conn, Opts, OptsBuilder, prelude::Queryable};
 use std::time::Duration;
+
+/// Matches the conformance kit: long enough for FileStore, short enough to wait.
+const TAKEOVER_TTL: Duration = Duration::from_millis(500);
+
+fn wait_for_takeover() {
+    std::thread::sleep(TAKEOVER_TTL + Duration::from_millis(50));
+}
 fn config(options: Opts, database: &str, state_dir: std::path::PathBuf) -> Config {
     Config {
         id: "mysql-fixture".into(),
@@ -670,6 +677,7 @@ impl Worker {
         }
         self.0.kill().unwrap();
         self.0.wait().unwrap();
+        wait_for_takeover();
         let line = std::fs::read_to_string(path.join("worker.ready")).unwrap();
         hashi::delivery::decode(line.trim_end_matches('\n'))
             .unwrap()
@@ -704,7 +712,8 @@ fn mysql_snapshot_worker() {
     let path = std::path::PathBuf::from(path);
     let mut options = config(opts, &database, path.clone());
     options.chunk_rows = 4;
-    let mut source = MySqlConnector::connect(options).unwrap();
+    let mut source =
+        hashi::lease::with_ttl_override(TAKEOVER_TTL, || MySqlConnector::connect(options)).unwrap();
     let record = source.read(None, None).unwrap().unwrap();
     let store = hashi::FileCheckpoint::open(path.join("checkpoints")).unwrap();
     store

@@ -12,6 +12,13 @@ use std::time::Duration;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+/// Matches the conformance kit: long enough for FileStore, short enough to wait.
+const TAKEOVER_TTL: Duration = Duration::from_millis(500);
+
+fn wait_for_takeover() {
+    std::thread::sleep(TAKEOVER_TTL + Duration::from_millis(50));
+}
+
 /// Unique per process and call, so parallel agents and tests never share a topic or session.
 fn unique(label: &str) -> String {
     format!(
@@ -192,7 +199,7 @@ fn kill_child() {
             seen: 0,
             abort_at: 4,
         },
-        FileCheckpoint::open(dir.join("state")).unwrap(),
+        FileCheckpoint::open_with_ttl(dir.join("state"), TAKEOVER_TTL).unwrap(),
         SystemClock,
         RuntimeConfig::new("line-a"),
     );
@@ -226,12 +233,13 @@ fn kill_between_sink_ack_and_broker_ack_redelivers() {
     std::fs::write(dir.join("published"), b"").unwrap();
     let status = child.wait().unwrap();
     assert!(!status.success(), "the child must die inside the sink");
+    wait_for_takeover();
 
     let connector = MqttConnector::connect(config(Protocol::V311, &client_id, &prefix)).unwrap();
     let mut runtime = Runtime::new(
         connector,
         JsonLinesSink::open(dir.join("out")).unwrap(),
-        FileCheckpoint::open(dir.join("state")).unwrap(),
+        FileCheckpoint::open_with_ttl(dir.join("state"), TAKEOVER_TTL).unwrap(),
         SystemClock,
         RuntimeConfig::new("line-a"),
     );
