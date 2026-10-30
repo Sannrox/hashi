@@ -5,20 +5,25 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::Error;
-use crate::checkpoint::{path_token, repair_log_tail, sync_dir};
+use crate::checkpoint::{lock_and_admit, path_token, repair_log_tail, sync_dir};
 use crate::contract::{IdempotencyKey, Record};
 use crate::sink::{DeliverError, Sink};
 
 #[derive(Debug, Clone)]
 pub struct JsonLinesSink {
     dir: PathBuf,
+    token: u64,
 }
 
 impl JsonLinesSink {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, Error> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self { dir, token: 0 })
+    }
+
+    fn fence_path(&self) -> PathBuf {
+        self.dir.join(".hashi-fence")
     }
 
     fn part_path(&self, kind: &str) -> PathBuf {
@@ -49,7 +54,15 @@ impl JsonLinesSink {
 }
 
 impl Sink for JsonLinesSink {
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        let _lock = lock_and_admit(&self.fence_path(), token).map_err(crate::sink::from_fence)?;
+        self.token = token;
+        Ok(())
+    }
+
     fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        let _lock =
+            lock_and_admit(&self.fence_path(), self.token).map_err(crate::sink::from_fence)?;
         let path = self.part_path(&record.kind);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_err)?;

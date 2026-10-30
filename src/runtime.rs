@@ -3,9 +3,11 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::Error;
-use crate::checkpoint::{Checkpoint, CheckpointStore, QuarantineRow};
+use crate::checkpoint::{CHECKPOINT_VERSION, Checkpoint, CheckpointStore, QuarantineRow};
 use crate::connector::Connector;
-use crate::contract::{CONTRACT_VERSION, Position, Record};
+use crate::contract::Position;
+use crate::contract::Record;
+use crate::lease::{self, InstanceLease};
 use crate::sink::{DeliverError, Sink};
 
 pub trait Clock {
@@ -74,6 +76,8 @@ pub struct RunReport {
 }
 
 pub struct Runtime<C, S, K, T> {
+    /// Declared first so a drop releases the slot while `store` is still alive.
+    lease: LeaseHold,
     connector: C,
     sink: S,
     store: K,
@@ -91,6 +95,7 @@ where
 {
     pub fn new(connector: C, sink: S, store: K, clock: T, config: RuntimeConfig) -> Self {
         Self {
+            lease: LeaseHold::default(),
             connector,
             sink,
             store,
@@ -98,6 +103,21 @@ where
             config,
             progress: RunReport::default(),
         }
+    }
+
+    /// Fencing token of the held instance lease, if this runtime has acquired one.
+    pub fn fencing_token(&self) -> Option<u64> {
+        self.lease.get().map(InstanceLease::token)
+    }
+
+    /// Clean stop: free the slot so another process can acquire immediately.
+    pub fn release_lease(&mut self) -> Result<(), Error> {
+        self.lease.release()
+    }
+
+    /// Drop the hold without releasing the slot, as a kill would.
+    pub fn abandon_lease(&mut self) {
+        self.lease.abandon();
     }
 
     /// What the current or last run committed, also when it ended in an error.
@@ -132,13 +152,16 @@ where
         mut keep_going: impl FnMut(&RunReport) -> bool,
     ) -> Result<RunReport, Error> {
         self.progress = RunReport::default();
+        let connector_id = self.connector.id().to_string();
+        let mut token = self.hold_lease(&connector_id)?;
+        self.sink.admit(token).map_err(Error::from)?;
         let check = self.connector.check()?;
         if !check.ok {
             return Err(Error::new(format!("check failed: {}", check.message)));
         }
+        token = self.hold_lease(&connector_id)?;
+        self.sink.admit(token).map_err(Error::from)?;
         let discovered = self.connector.discover()?;
-        let connector_id = self.connector.id().to_string();
-        let _lease = self.store.acquire(&connector_id, &self.config.instance)?;
         let mut schemas = self
             .store
             .load_schemas(&connector_id, &self.config.instance)?;
@@ -172,8 +195,10 @@ where
             if !keep_going(&self.progress) {
                 break;
             }
+            token = self.hold_lease(&connector_id)?;
+            self.sink.admit(token).map_err(Error::from)?;
             let discovered = self.connector.discover()?;
-            self.refresh_schemas(&connector_id, &mut schemas, &discovered)?;
+            self.refresh_schemas(&connector_id, &mut schemas, &discovered, token)?;
             let Some(mut record) = self.connector.read(committed, source_cursor.as_deref())? else {
                 break;
             };
@@ -214,10 +239,10 @@ where
                 schema.and_then(|state| state.quarantine.as_deref())
             };
             let outcome = if let Some(reason) = reason {
-                self.quarantine(&connector_id, &record, reason)?;
+                self.quarantine(&connector_id, &record, reason, token)?;
                 Dispatch::Quarantined
             } else {
-                self.dispatch(&connector_id, &record)?
+                self.dispatch(&connector_id, &record, token)?
             };
             let next_cursor = record
                 .source
@@ -225,14 +250,14 @@ where
                 .and_then(|metadata| metadata.cursor.clone());
             match outcome {
                 Dispatch::Delivered => {
-                    self.commit(&connector_id, record.position, next_cursor.clone())?;
+                    self.commit(&connector_id, record.position, next_cursor.clone(), token)?;
                     committed = Some(record.position);
                     self.progress.delivered += 1;
                     self.progress.checkpoint = record.position;
                     self.progress.last_source_ts_ms = Some(record.source_ts_ms);
                 }
                 Dispatch::Quarantined => {
-                    self.commit(&connector_id, record.position, next_cursor.clone())?;
+                    self.commit(&connector_id, record.position, next_cursor.clone(), token)?;
                     committed = Some(record.position);
                     self.progress.quarantined += 1;
                     self.progress.checkpoint = record.position;
@@ -245,12 +270,17 @@ where
     }
 
     /// Accept only the exact quarantined schema, under the same instance lease as reads.
-    pub fn resolve_schema(&self, kind: &str, schema: &crate::schema::Schema) -> Result<(), Error> {
-        let id = self.connector.id();
-        let _lease = self.store.acquire(id, &self.config.instance)?;
-        let mut state = self.store.load_schemas(id, &self.config.instance)?;
+    pub fn resolve_schema(
+        &mut self,
+        kind: &str,
+        schema: &crate::schema::Schema,
+    ) -> Result<(), Error> {
+        let id = self.connector.id().to_string();
+        let token = self.hold_lease(&id)?;
+        let mut state = self.store.load_schemas(&id, &self.config.instance)?;
         state.resolve(kind, schema)?;
-        self.store.save_schemas(id, &self.config.instance, &state)
+        self.store
+            .save_schemas(&id, &self.config.instance, &state, token)
     }
 
     fn refresh_schemas(
@@ -258,8 +288,9 @@ where
         id: &str,
         state: &mut crate::schema::SchemaState,
         discovered: &[crate::contract::DiscoveredKind],
+        token: u64,
     ) -> Result<(), Error> {
-        self.flush_schema_controls(id, state)?;
+        self.flush_schema_controls(id, state, token)?;
         let mut changed = false;
         let mut seen = std::collections::BTreeSet::new();
         for kind in discovered {
@@ -270,15 +301,17 @@ where
         }
         // Persist decisions before delivery. A crash replays pending controls with the same key.
         if changed {
-            self.store.save_schemas(id, &self.config.instance, state)?;
+            self.store
+                .save_schemas(id, &self.config.instance, state, token)?;
         }
-        self.flush_schema_controls(id, state)
+        self.flush_schema_controls(id, state, token)
     }
 
     fn flush_schema_controls(
         &mut self,
         id: &str,
         state: &mut crate::schema::SchemaState,
+        token: u64,
     ) -> Result<(), Error> {
         let mut acknowledged = false;
         for (kind, entry) in &mut state.kinds {
@@ -321,14 +354,20 @@ where
             acknowledged = true;
         }
         if acknowledged {
-            self.store.save_schemas(id, &self.config.instance, state)?;
+            self.store
+                .save_schemas(id, &self.config.instance, state, token)?;
         }
         Ok(())
     }
 
-    fn dispatch(&mut self, connector_id: &str, record: &Record) -> Result<Dispatch, Error> {
+    fn dispatch(
+        &mut self,
+        connector_id: &str,
+        record: &Record,
+        token: u64,
+    ) -> Result<Dispatch, Error> {
         if record.key.trim().is_empty() || record.kind.trim().is_empty() {
-            self.quarantine(connector_id, record, "missing kind or key")?;
+            self.quarantine(connector_id, record, "missing kind or key", token)?;
             return Ok(Dispatch::Quarantined);
         }
         let before_bytes = record
@@ -338,7 +377,12 @@ where
             .and_then(|change| change.before_image.as_ref())
             .map_or(0, String::len);
         if record.payload.len().saturating_add(before_bytes) > self.config.max_record_bytes {
-            self.quarantine(connector_id, record, "payload exceeds max_record_bytes")?;
+            self.quarantine(
+                connector_id,
+                record,
+                "payload exceeds max_record_bytes",
+                token,
+            )?;
             return Ok(Dispatch::Quarantined);
         }
         let idk = record.idempotency_key(connector_id, &self.config.instance);
@@ -348,7 +392,7 @@ where
                 Err(DeliverError::Blocked(reason)) => return Err(Error::new(reason)),
                 Ok(()) => return Ok(Dispatch::Delivered),
                 Err(DeliverError::Poison(reason)) => {
-                    self.quarantine(connector_id, record, &reason)?;
+                    self.quarantine(connector_id, record, &reason, token)?;
                     return Ok(Dispatch::Quarantined);
                 }
                 Err(DeliverError::Transient(reason)) => {
@@ -363,41 +407,105 @@ where
         )))
     }
 
+    fn hold_lease(&mut self, connector_id: &str) -> Result<u64, Error> {
+        if let Some(lease) = self.lease.get_mut() {
+            match lease.renew() {
+                Ok(()) => return Ok(lease.token()),
+                Err(error) if lease::is_fence_lost(&error) => {
+                    // Slot empty and no successor: take it again. A standby
+                    // that already holds it is contended on the acquire below.
+                    self.lease.abandon();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let held = self.store.acquire(connector_id, &self.config.instance)?;
+        let token = held.token();
+        self.lease.set(held);
+        Ok(token)
+    }
+
     fn commit(
         &self,
         connector_id: &str,
         position: Position,
         source_cursor: Option<String>,
+        fencing_token: u64,
     ) -> Result<(), Error> {
         self.store.commit(&Checkpoint {
             source_cursor,
-            contract_version: CONTRACT_VERSION,
+            contract_version: CHECKPOINT_VERSION,
             connector: connector_id.to_string(),
             instance: self.config.instance.clone(),
             position,
+            fencing_token,
         })
     }
 
-    fn quarantine(&self, connector_id: &str, record: &Record, reason: &str) -> Result<(), Error> {
-        self.store.quarantine(&QuarantineRow {
-            source: record.source.clone(),
-            connector: connector_id.to_string(),
-            instance: self.config.instance.clone(),
-            kind: record.kind.clone(),
-            key: record.key.clone(),
-            position: record.position,
-            reason: reason.to_string(),
-            payload: record.payload.clone(),
-            source_ts_ms: record.source_ts_ms,
-            ingest_ts_ms: record.ingest_ts_ms,
-            quality: record.quality.clone(),
-        })
+    fn quarantine(
+        &self,
+        connector_id: &str,
+        record: &Record,
+        reason: &str,
+        token: u64,
+    ) -> Result<(), Error> {
+        self.store.quarantine(
+            &QuarantineRow {
+                source: record.source.clone(),
+                connector: connector_id.to_string(),
+                instance: self.config.instance.clone(),
+                kind: record.kind.clone(),
+                key: record.key.clone(),
+                position: record.position,
+                reason: reason.to_string(),
+                payload: record.payload.clone(),
+                source_ts_ms: record.source_ts_ms,
+                ingest_ts_ms: record.ingest_ts_ms,
+                quality: record.quality.clone(),
+            },
+            token,
+        )
     }
 }
 
 enum Dispatch {
     Delivered,
     Quarantined,
+}
+
+/// Releases the slot when dropped unless [`LeaseHold::abandon`] ran first.
+#[derive(Default)]
+struct LeaseHold(Option<InstanceLease>);
+
+impl LeaseHold {
+    fn get(&self) -> Option<&InstanceLease> {
+        self.0.as_ref()
+    }
+
+    fn get_mut(&mut self) -> Option<&mut InstanceLease> {
+        self.0.as_mut()
+    }
+
+    fn set(&mut self, lease: InstanceLease) {
+        self.0 = Some(lease);
+    }
+
+    fn abandon(&mut self) {
+        let _ = self.0.take();
+    }
+
+    fn release(&mut self) -> Result<(), Error> {
+        match self.0.take() {
+            Some(lease) => lease.release(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for LeaseHold {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
 }
 
 fn backoff_ms(attempt: u32, position: Position) -> u64 {
@@ -449,6 +557,21 @@ mod tests {
         )
     }
 
+    /// Rebinding `let mut rt = runtime(...)` constructs the new store before
+    /// the previous `LeaseHold` drops. Release first so the next acquire is free.
+    fn restart(
+        mut previous: Runtime<FakeSource, MemorySink, FileCheckpoint, NullClock>,
+        source: FakeSource,
+        sink: MemorySink,
+        dir: &std::path::Path,
+    ) -> Runtime<FakeSource, MemorySink, FileCheckpoint, NullClock> {
+        previous
+            .release_lease()
+            .expect("release previous runtime lease");
+        drop(previous);
+        runtime(source, sink, dir)
+    }
+
     #[test]
     fn a_record_at_position_zero_is_delivered() {
         let dir = dir();
@@ -480,7 +603,7 @@ mod tests {
         assert_eq!(first.delivered, 2);
         assert_eq!(first.checkpoint, 2);
         source.append(record("tag", "k3", 3, "3.0"));
-        let mut rt = runtime(source, MemorySink::new(), &dir);
+        let mut rt = restart(rt, source, MemorySink::new(), &dir);
         let second = rt.run().unwrap();
         assert_eq!(second.delivered, 1);
         assert_eq!(second.checkpoint, 3);
@@ -495,7 +618,7 @@ mod tests {
         let mut rt = runtime(source.clone(), MemorySink::new(), &dir);
         let stopped = rt.run_while(|report| report.delivered < 3).unwrap();
         assert_eq!(stopped.checkpoint, 3);
-        let mut rt = runtime(source, MemorySink::new(), &dir);
+        let mut rt = restart(rt, source, MemorySink::new(), &dir);
         let resumed = rt.run().unwrap();
         assert_eq!(resumed.delivered, 5);
         assert_eq!(resumed.checkpoint, 8);
@@ -537,6 +660,8 @@ mod tests {
             .map(|idk| idk.encode())
             .collect();
         assert_eq!(first_keys, vec!["3:opc/6:line-a/3:tag/2:k1/1"]);
+        rt.release_lease().expect("release crashed runtime lease");
+        drop(rt);
         let mut rt = runtime(source, MemorySink::new(), &dir);
         let report = rt.run().unwrap();
         assert_eq!(report.delivered, 3);
@@ -589,8 +714,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let sink = MemorySink::new();
-        let mut rt = runtime(FakeSource::new("opc", records(3)), sink, &dir);
+        let mut rt = restart(
+            rt,
+            FakeSource::new("opc", records(3)),
+            MemorySink::new(),
+            &dir,
+        );
         let report = rt.run().unwrap();
         assert_eq!(report.delivered, 3);
         assert_eq!(report.checkpoint, 3);
@@ -615,7 +744,7 @@ mod tests {
     }
 
     impl<K: CheckpointStore> CheckpointStore for CrashAfter<K> {
-        fn acquire(&self, connector: &str, instance: &str) -> Result<std::fs::File, Error> {
+        fn acquire(&self, connector: &str, instance: &str) -> Result<InstanceLease, Error> {
             self.inner.acquire(connector, instance)
         }
         fn load_schemas(
@@ -630,8 +759,9 @@ mod tests {
             connector: &str,
             instance: &str,
             state: &crate::schema::SchemaState,
+            token: u64,
         ) -> Result<(), Error> {
-            self.inner.save_schemas(connector, instance, state)
+            self.inner.save_schemas(connector, instance, state, token)
         }
 
         fn load(&self, connector: &str, instance: &str) -> Result<Option<Checkpoint>, Error> {
@@ -648,8 +778,8 @@ mod tests {
             self.inner.commit(checkpoint)
         }
 
-        fn quarantine(&self, row: &QuarantineRow) -> Result<(), Error> {
-            self.inner.quarantine(row)
+        fn quarantine(&self, row: &QuarantineRow, token: u64) -> Result<(), Error> {
+            self.inner.quarantine(row, token)
         }
 
         fn quarantined(
@@ -659,5 +789,118 @@ mod tests {
         ) -> Result<Vec<QuarantineRow>, Error> {
             self.inner.quarantined(connector, instance)
         }
+    }
+
+    /// Long enough for FileStore fsyncs in a short run; short enough for tests.
+    const TAKEOVER_TTL: std::time::Duration = std::time::Duration::from_millis(500);
+
+    fn short_store(dir: &std::path::Path) -> FileCheckpoint {
+        FileCheckpoint::open_with_ttl(dir, TAKEOVER_TTL).unwrap()
+    }
+
+    fn wait_for_takeover() {
+        std::thread::sleep(TAKEOVER_TTL + std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn kill_active_takeover_resumes_from_the_committed_checkpoint() {
+        let dir = dir();
+        let source = FakeSource::new("opc", records(4));
+        let mut active = Runtime::new(
+            source.clone(),
+            MemorySink::new(),
+            short_store(&dir),
+            NullClock { now_ms: 1 },
+            RuntimeConfig::new("line-a"),
+        );
+        assert_eq!(
+            active
+                .run_while(|report| report.delivered < 2)
+                .unwrap()
+                .delivered,
+            2
+        );
+        let token = active.fencing_token().unwrap();
+        active.abandon_lease();
+        drop(active);
+        wait_for_takeover();
+        let mut standby = Runtime::new(
+            source,
+            MemorySink::new(),
+            short_store(&dir),
+            NullClock { now_ms: 1 },
+            RuntimeConfig::new("line-a"),
+        );
+        let report = standby.run().unwrap();
+        assert_eq!(report.delivered, 2);
+        assert_eq!(report.checkpoint, 4);
+        assert!(standby.fencing_token().unwrap() > token);
+        let keys: Vec<u64> = standby
+            .into_parts()
+            .1
+            .delivered
+            .iter()
+            .map(|(record, _)| record.position)
+            .collect();
+        assert_eq!(keys, vec![3, 4]);
+    }
+
+    #[test]
+    fn paused_active_writes_are_refused_after_takeover() {
+        let dir = dir();
+        let source = FakeSource::new("opc", records(4));
+        let mut paused = Runtime::new(
+            source.clone(),
+            MemorySink::new(),
+            short_store(&dir),
+            NullClock { now_ms: 1 },
+            RuntimeConfig::new("line-a"),
+        );
+        assert_eq!(
+            paused
+                .run_while(|report| report.delivered < 1)
+                .unwrap()
+                .delivered,
+            1
+        );
+        wait_for_takeover();
+        let mut standby = Runtime::new(
+            source,
+            MemorySink::new(),
+            short_store(&dir),
+            NullClock { now_ms: 1 },
+            RuntimeConfig::new("line-a"),
+        );
+        assert_eq!(standby.run().unwrap().checkpoint, 4);
+        let err = paused.run().unwrap_err();
+        assert!(
+            err.message.contains("already running") || err.message.contains("stale writer"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn an_expired_lease_with_no_successor_is_reacquired() {
+        let dir = dir();
+        let mut rt = Runtime::new(
+            FakeSource::new("opc", records(3)),
+            MemorySink::new(),
+            short_store(&dir),
+            NullClock { now_ms: 1 },
+            RuntimeConfig::new("line-a"),
+        );
+        assert_eq!(
+            rt.run_while(|report| report.delivered < 1)
+                .unwrap()
+                .delivered,
+            1
+        );
+        let first = rt.fencing_token().unwrap();
+        wait_for_takeover();
+        let report = rt.run().unwrap();
+        assert_eq!(report.delivered, 2);
+        assert_eq!(report.checkpoint, 3);
+        assert!(rt.fencing_token().unwrap() > first);
     }
 }

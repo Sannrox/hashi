@@ -7,14 +7,16 @@
 //! retried. Checkpoints live under `checkpoint_dir/<instance>`, so a
 //! restarted process resumes where the last one committed.
 
-use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::buffer::{BufferStats, StoreAndForward};
 use crate::config::{Config, InstanceConfig, SinkConfig, SourceConfig};
 use crate::contract::{IdempotencyKey, Record};
 use crate::credential::FileCredential;
 use crate::fake::{FakeSource, record};
+use crate::lease::{self, DropRelease, SharedLeaseStore};
+use crate::runtime::Clock;
 use crate::sink::{DeliverError, Sink};
 use crate::{Error, FileCheckpoint, JsonLinesSink, RunReport, Runtime, RuntimeConfig, SystemClock};
 
@@ -22,9 +24,42 @@ type FixtureRuntime = Runtime<FakeSource, InstanceSink, FileCheckpoint, SystemCl
 
 /// An instance's sink, written directly or through its store-and-forward
 /// buffer.
+struct Locked<S> {
+    sink: S,
+    lock: DropRelease,
+}
+
+impl<S: Sink> Sink for Locked<S> {
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        self.lock.renew().map_err(dir_lock_err)?;
+        self.sink.admit(token)
+    }
+
+    fn recover(&mut self) -> Result<(), DeliverError> {
+        self.lock.renew().map_err(dir_lock_err)?;
+        self.sink.recover()
+    }
+
+    fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        self.lock.renew().map_err(dir_lock_err)?;
+        self.sink.deliver(record, idk)
+    }
+}
+
+fn dir_lock_err(error: Error) -> DeliverError {
+    if lease::is_fence_lost(&error)
+        || error.message.contains("already running")
+        || error.message.contains("in use by another instance")
+    {
+        DeliverError::Blocked(error.message)
+    } else {
+        DeliverError::Transient(error.message)
+    }
+}
+
 enum InstanceSink {
-    Direct(JsonLinesSink),
-    Buffered(StoreAndForward<LazySink>),
+    Direct(Locked<JsonLinesSink>),
+    Buffered(Box<Locked<StoreAndForward<LazySink>>>),
 }
 
 /// The sink behind a buffer, opened (and its directory locked) on first
@@ -33,23 +68,38 @@ enum InstanceSink {
 /// outage.
 struct LazySink {
     dir: PathBuf,
-    open: Option<(JsonLinesSink, File)>,
+    ttl: Duration,
+    token: u64,
+    open: Option<(JsonLinesSink, DropRelease)>,
 }
 
 impl LazySink {
     fn sink(&mut self) -> Result<&mut JsonLinesSink, DeliverError> {
         if self.open.is_none() {
-            let lock =
-                lock_sink_dir(&self.dir).map_err(|error| DeliverError::Transient(error.message))?;
-            let sink = JsonLinesSink::open(&self.dir)
+            let lock = lock_sink_dir(&self.dir, self.ttl)
                 .map_err(|error| DeliverError::Transient(error.message))?;
+            let mut sink = JsonLinesSink::open(&self.dir)
+                .map_err(|error| DeliverError::Transient(error.message))?;
+            if self.token > 0 {
+                sink.admit(self.token)?;
+            }
             self.open = Some((sink, lock));
         }
-        Ok(&mut self.open.as_mut().expect("opened above").0)
+        let open = self.open.as_mut().expect("opened above");
+        open.1.renew().map_err(dir_lock_err)?;
+        Ok(&mut open.0)
     }
 }
 
 impl Sink for LazySink {
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        self.token = token;
+        if self.open.is_some() {
+            self.sink()?.admit(token)?;
+        }
+        Ok(())
+    }
+
     fn recover(&mut self) -> Result<(), DeliverError> {
         self.sink()?.recover()
     }
@@ -60,6 +110,13 @@ impl Sink for LazySink {
 }
 
 impl Sink for InstanceSink {
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        match self {
+            Self::Direct(sink) => sink.admit(token),
+            Self::Buffered(sink) => sink.admit(token),
+        }
+    }
+
     fn recover(&mut self) -> Result<(), DeliverError> {
         match self {
             Self::Direct(sink) => sink.recover(),
@@ -76,10 +133,11 @@ impl Sink for InstanceSink {
 }
 
 /// A running instance and the locks that fence its sink and buffer
-/// directories.
+/// directories. Those locks release on drop so a clean stop frees the path.
 struct Running {
     runtime: FixtureRuntime,
-    _locks: Vec<File>,
+    takeovers: u64,
+    acquired_ms: i64,
 }
 
 impl Running {
@@ -102,7 +160,8 @@ impl Running {
     fn buffer(&self) -> Option<BufferStats> {
         match self.runtime.sink() {
             InstanceSink::Direct(_) => None,
-            InstanceSink::Buffered(buffer) => buffer
+            InstanceSink::Buffered(locked) => locked
+                .sink
                 .stats()
                 .inspect_err(|error| eprintln!("buffer stats unreadable: {error}"))
                 .ok(),
@@ -117,10 +176,17 @@ pub struct Pass {
     pub progress: RunReport,
     /// The buffer's fill level and counters after the pass, when it has one.
     pub buffer: Option<BufferStats>,
+    /// 0 while waiting for the lease, 1 while this process holds it.
+    pub role: u8,
+    pub fencing_token: u64,
+    pub takeovers: u64,
+    pub lease_acquired_ms: Option<i64>,
 }
 
 pub struct Service {
     checkpoint_dir: PathBuf,
+    leases: SharedLeaseStore,
+    ttl: Duration,
     instances: Vec<(InstanceConfig, Option<Running>)>,
 }
 
@@ -130,6 +196,8 @@ impl Service {
     pub fn from_config(config: &Config) -> Result<Self, Error> {
         Ok(Self {
             checkpoint_dir: config.checkpoint_dir.clone(),
+            leases: lease::open_store(&config.lease)?,
+            ttl: config.lease.ttl(),
             instances: config
                 .instances
                 .iter()
@@ -149,59 +217,69 @@ impl Service {
     /// Like [`Service::pass`], plus what each instance committed before an error.
     pub fn pass_with_progress(&mut self) -> Vec<Pass> {
         let checkpoint_dir = &self.checkpoint_dir;
+        let leases = &self.leases;
+        let ttl = self.ttl;
         self.instances
             .iter_mut()
-            .map(|(instance, runtime)| {
-                let (outcome, progress, buffer) = match runtime {
-                    Some(running) => (
-                        running.run(),
-                        running.runtime.progress().clone(),
-                        running.buffer(),
-                    ),
-                    None => match open(checkpoint_dir, instance) {
-                        Ok(opened) => {
-                            let running = runtime.insert(opened);
-                            (
-                                running.run(),
-                                running.runtime.progress().clone(),
-                                running.buffer(),
-                            )
-                        }
-                        Err(error) => (Err(error), RunReport::default(), None),
-                    },
-                };
-                Pass {
-                    instance: instance.name.clone(),
-                    outcome,
-                    progress,
-                    buffer,
+            .map(|(instance, runtime)| match runtime {
+                Some(running) => {
+                    let outcome = running.run();
+                    finish_pass(&instance.name, running, outcome)
                 }
+                None => match open(checkpoint_dir, leases.clone(), ttl, instance) {
+                    Ok(opened) => {
+                        let running = runtime.insert(opened);
+                        let outcome = running.run();
+                        finish_pass(&instance.name, running, outcome)
+                    }
+                    Err(error) => {
+                        let standby = is_standby(&error);
+                        Pass {
+                            instance: instance.name.clone(),
+                            outcome: Err(error),
+                            progress: RunReport::default(),
+                            buffer: None,
+                            role: u8::from(!standby),
+                            fencing_token: 0,
+                            takeovers: 0,
+                            lease_acquired_ms: None,
+                        }
+                    }
+                },
             })
             .collect()
     }
 }
 
-/// Checkpoint leases fence one instance, not a sink directory that another
-/// instance or process reaches by a different path; this lock does, for as
-/// long as the instance runs.
-fn lock_sink_dir(dir: &Path) -> Result<File, Error> {
-    lock_dir(dir, ".hashi-sink.lock", "sink")
+fn is_standby(error: &Error) -> bool {
+    error.message.contains("already running")
+        || error.message.contains("stale writer")
+        || error.message.contains("in use by another instance")
 }
 
-fn lock_dir(dir: &Path, file: &str, what: &str) -> Result<File, Error> {
-    fs::create_dir_all(dir)?;
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(file))?;
-    lock.try_lock().map_err(|_| {
-        Error::new(format!(
-            "{what} directory {} is in use by another instance",
-            dir.display()
-        ))
-    })?;
-    Ok(lock)
+fn finish_pass(name: &str, running: &mut Running, outcome: Result<RunReport, Error>) -> Pass {
+    let token = running.runtime.fencing_token().unwrap_or(0);
+    let standby = outcome.as_ref().is_err_and(is_standby);
+    if !standby && token > 1 && running.takeovers == 0 {
+        running.takeovers = 1;
+    }
+    Pass {
+        instance: name.to_string(),
+        outcome,
+        progress: running.runtime.progress().clone(),
+        buffer: running.buffer(),
+        role: u8::from(!standby),
+        fencing_token: token,
+        takeovers: running.takeovers,
+        lease_acquired_ms: Some(running.acquired_ms),
+    }
+}
+
+/// Checkpoint leases fence one instance, not a sink directory that another
+/// instance or process reaches by a different path; this lock does, and
+/// releases on a clean stop.
+fn lock_sink_dir(dir: &Path, ttl: Duration) -> Result<DropRelease, Error> {
+    lease::lock_dir(dir, "sink", "sink", ttl)
 }
 
 /// The connector id an instance checkpoints under.
@@ -210,7 +288,12 @@ pub(crate) fn connector_id(instance: &InstanceConfig) -> String {
     format!("fixture-{}", instance.name)
 }
 
-fn open(checkpoint_dir: &Path, instance: &InstanceConfig) -> Result<Running, Error> {
+fn open(
+    checkpoint_dir: &Path,
+    leases: SharedLeaseStore,
+    ttl: Duration,
+    instance: &InstanceConfig,
+) -> Result<Running, Error> {
     let SourceConfig::Fixture(fixture) = &instance.source;
     let records = (1..=fixture.records)
         .map(|position| {
@@ -229,33 +312,37 @@ fn open(checkpoint_dir: &Path, instance: &InstanceConfig) -> Result<Running, Err
         fixture.accept_sha256.clone(),
     );
     let SinkConfig::Jsonl(jsonl) = &instance.sink;
-    let mut locks = Vec::new();
     let sink = match &instance.buffer {
-        None => {
-            locks.push(lock_sink_dir(&jsonl.dir)?);
-            InstanceSink::Direct(JsonLinesSink::open(&jsonl.dir)?)
-        }
+        None => InstanceSink::Direct(Locked {
+            sink: JsonLinesSink::open(&jsonl.dir)?,
+            lock: lock_sink_dir(&jsonl.dir, ttl)?,
+        }),
         Some(buffer) => {
             // Two processes draining one buffer would deliver twice.
-            locks.push(lock_dir(&buffer.dir, ".hashi-buffer.lock", "buffer")?);
-            InstanceSink::Buffered(StoreAndForward::with_limits(
-                &buffer.dir,
-                buffer.limits(),
-                LazySink {
-                    dir: jsonl.dir.clone(),
-                    open: None,
-                },
-            )?)
+            InstanceSink::Buffered(Box::new(Locked {
+                sink: StoreAndForward::with_limits(
+                    &buffer.dir,
+                    buffer.limits(),
+                    LazySink {
+                        dir: jsonl.dir.clone(),
+                        ttl,
+                        token: 0,
+                        open: None,
+                    },
+                )?,
+                lock: lease::lock_dir(&buffer.dir, "buffer", "buffer", ttl)?,
+            }))
         }
     };
     Ok(Running {
         runtime: Runtime::new(
             source,
             sink,
-            FileCheckpoint::open(checkpoint_dir.join(&instance.name))?,
+            FileCheckpoint::with_store(checkpoint_dir.join(&instance.name), leases, ttl)?,
             SystemClock,
             RuntimeConfig::new(&instance.name),
         ),
-        _locks: locks,
+        takeovers: 0,
+        acquired_ms: SystemClock.now_ms(),
     })
 }

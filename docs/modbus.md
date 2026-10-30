@@ -12,6 +12,8 @@
   use the existing sinks and replay safely after interruption. Explicit schema
   resolution resumes the kind; other kinds continue while it is quarantined.
   An exclusive instance lease prevents concurrent local checkpoint writers (#10).
+  A standby takes over from the last checkpoint after the hold expires; polling
+  cannot recover samples missed during the gap and reports it (#46).
 
 - Pluggable sinks: JSON Lines, partitioned Apache Parquet, a file-backed
   Kafka-compatible idempotent topic log, and a versioned out-of-process

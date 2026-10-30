@@ -25,8 +25,9 @@ renamed into place) before any of its records is delivered. A restart reuses
 the saved round, so a record re-emitted after a crash has the same content
 and position. A round that turns out empty is widened in place to the next
 horizon instead of being followed by a new one, so the saved round always
-starts where the last checkpointed round ended. The state directory is leased: a second connector on it is
-refused.
+starts where the last checkpointed round ended. The state directory is leased: a second connector on it is contended while
+the hold is unexpired. A standby resumes from the last checkpointed round;
+historian reads replay from their watermarks.
 
 ## Checkpoints
 

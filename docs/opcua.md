@@ -170,7 +170,9 @@ A failed reader reports unhealthy and must restart to recover durable state.
 Reads wait through keepalives until a sample arrives. The embedding runtime
 must keep calling read to keep the subscription serviced; server queue and
 lifetime limits apply while downstream delivery blocks. This is a single
-leased spool on shared durable storage, not a cross-node ownership protocol.
+leased spool on shared durable storage. A standby takes the fencing lease and
+resumes from the last checkpoint; values changed while the subscription was
+down are recovered only through historical gap fill.
 
 ### 10,000-item fixture measurements
 

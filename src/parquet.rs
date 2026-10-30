@@ -12,7 +12,7 @@ use parquet::record::RowAccessor;
 use parquet::schema::parser::parse_message_type;
 
 use crate::Error;
-use crate::checkpoint::{path_token, sync_dir};
+use crate::checkpoint::{lock_and_admit, path_token, sync_dir};
 use crate::contract::{IdempotencyKey, Record};
 use crate::sink::{DeliverError, Sink};
 
@@ -32,13 +32,14 @@ const SCHEMA: &str = "
 #[derive(Debug, Clone)]
 pub struct ParquetSink {
     dir: PathBuf,
+    token: u64,
 }
 
 impl ParquetSink {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, Error> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self { dir, token: 0 })
     }
 
     fn part_path(&self, kind: &str, idk: &IdempotencyKey) -> PathBuf {
@@ -74,7 +75,16 @@ impl ParquetSink {
 }
 
 impl Sink for ParquetSink {
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        let _lock = lock_and_admit(&self.dir.join(".hashi-fence"), token)
+            .map_err(crate::sink::from_fence)?;
+        self.token = token;
+        Ok(())
+    }
+
     fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        let _lock = lock_and_admit(&self.dir.join(".hashi-fence"), self.token)
+            .map_err(crate::sink::from_fence)?;
         let path = self.part_path(&record.kind, idk);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_err)?;

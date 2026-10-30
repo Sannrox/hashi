@@ -30,6 +30,10 @@ struct InstanceMetrics {
     healthy: bool,
     recorded_ms: Option<i64>,
     buffer: Option<crate::buffer::BufferStats>,
+    role: u8,
+    fencing_token: u64,
+    takeovers: u64,
+    lease_acquired_ms: Option<i64>,
 }
 
 impl Metrics {
@@ -55,6 +59,28 @@ impl Metrics {
         entry.last_source_ts_ms = progress.last_source_ts_ms.or(entry.last_source_ts_ms);
         entry.errors_total += u64::from(failed);
         entry.healthy = !failed;
+    }
+
+    /// Role (0 standby, 1 active), fencing token, takeover count, and when
+    /// this process acquired the lease.
+    pub fn record_lease(
+        &mut self,
+        instance: &str,
+        role: u8,
+        fencing_token: u64,
+        takeovers: u64,
+        acquired_ms: Option<i64>,
+    ) {
+        let entry = self.instances.entry(instance.to_string()).or_default();
+        entry.role = role;
+        entry.fencing_token = fencing_token;
+        entry.takeovers = takeovers;
+        if acquired_ms.is_some() {
+            entry.lease_acquired_ms = acquired_ms;
+        }
+        if role == 0 {
+            entry.healthy = true;
+        }
     }
 
     /// Record an instance's buffer after a pass; `None` when it has no
@@ -164,6 +190,30 @@ impl Metrics {
             "gauge",
             "1 when the last pass succeeded.",
             &|m| Some(if m.healthy { 1.0 } else { 0.0 }),
+        );
+        family(
+            "hashi_role",
+            "gauge",
+            "1 when this process holds the instance lease, 0 while it waits as a standby.",
+            &|m| Some(m.role as f64),
+        );
+        family(
+            "hashi_fencing_token",
+            "gauge",
+            "Fencing token of the held instance lease.",
+            &|m| Some(m.fencing_token as f64),
+        );
+        family(
+            "hashi_takeover_total",
+            "counter",
+            "Times this process took over the instance lease from another holder.",
+            &|m| Some(m.takeovers as f64),
+        );
+        family(
+            "hashi_lease_age_seconds",
+            "gauge",
+            "Seconds since this process acquired the instance lease.",
+            &|m| age(m.lease_acquired_ms),
         );
         out
     }
@@ -303,6 +353,30 @@ mod tests {
             metrics
                 .render(9_000)
                 .contains("hashi_checkpoint_position{instance=\"line-1\"} 6\n")
+        );
+    }
+
+    #[test]
+    fn lease_metrics_report_role_token_age_and_takeovers() {
+        let mut metrics = Metrics::default();
+        metrics.record("line-1", &report(1, 1), false, 1_000);
+        metrics.record_lease("line-1", 1, 4, 2, Some(1_000));
+        let text = metrics.render(4_000);
+        assert!(
+            text.contains("hashi_role{instance=\"line-1\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hashi_fencing_token{instance=\"line-1\"} 4\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hashi_takeover_total{instance=\"line-1\"} 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hashi_lease_age_seconds{instance=\"line-1\"} 3\n"),
+            "{text}"
         );
     }
 

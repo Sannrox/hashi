@@ -1,10 +1,9 @@
 use hashi::contract::{CheckReport, DiscoveredKind, Position};
 use hashi::{
     Change, Checkpoint, CheckpointStore, Connector, DeliverError, Error, FileCheckpoint,
-    IdempotencyKey, MemorySink, NullClock, Operation, QuarantineRow, Record, Runtime,
-    RuntimeConfig, Sink, SourceMetadata,
+    IdempotencyKey, InstanceLease, MemorySink, NullClock, Operation, QuarantineRow, Record,
+    Runtime, RuntimeConfig, Sink, SourceMetadata,
 };
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -94,14 +93,20 @@ fn runtime(path: &Path, source: Source) -> Runtime<Source, MemorySink, FileCheck
 }
 struct FailCommit(FileCheckpoint);
 impl CheckpointStore for FailCommit {
-    fn acquire(&self, c: &str, i: &str) -> Result<File, Error> {
+    fn acquire(&self, c: &str, i: &str) -> Result<InstanceLease, Error> {
         self.0.acquire(c, i)
     }
     fn load_schemas(&self, c: &str, i: &str) -> Result<hashi::schema::SchemaState, Error> {
         self.0.load_schemas(c, i)
     }
-    fn save_schemas(&self, c: &str, i: &str, s: &hashi::schema::SchemaState) -> Result<(), Error> {
-        self.0.save_schemas(c, i, s)
+    fn save_schemas(
+        &self,
+        c: &str,
+        i: &str,
+        s: &hashi::schema::SchemaState,
+        token: u64,
+    ) -> Result<(), Error> {
+        self.0.save_schemas(c, i, s, token)
     }
     fn load(&self, c: &str, i: &str) -> Result<Option<Checkpoint>, Error> {
         self.0.load(c, i)
@@ -109,8 +114,8 @@ impl CheckpointStore for FailCommit {
     fn commit(&self, _: &Checkpoint) -> Result<(), Error> {
         Err(Error::new("injected crash before checkpoint replacement"))
     }
-    fn quarantine(&self, r: &QuarantineRow) -> Result<(), Error> {
-        self.0.quarantine(r)
+    fn quarantine(&self, r: &QuarantineRow, token: u64) -> Result<(), Error> {
+        self.0.quarantine(r, token)
     }
     fn quarantined(&self, c: &str, i: &str) -> Result<Vec<QuarantineRow>, Error> {
         self.0.quarantined(c, i)
@@ -192,7 +197,7 @@ fn version_one_checkpoint_and_quarantine_upgrade_in_the_same_durable_slots() {
     source.0[1].key = String::new();
     assert_eq!(runtime(&path, source.clone()).run().unwrap().quarantined, 1);
     let checkpoint = store.load("cdc", "instance").unwrap().unwrap();
-    assert_eq!(checkpoint.contract_version, 2);
+    assert_eq!(checkpoint.contract_version, hashi::CHECKPOINT_VERSION);
     assert_eq!(checkpoint.position, 3);
     let rows = store.quarantined("cdc", "instance").unwrap();
     assert_eq!(rows.len(), 2);
@@ -201,7 +206,7 @@ fn version_one_checkpoint_and_quarantine_upgrade_in_the_same_durable_slots() {
     assert!(
         std::fs::read_to_string(path.join("checkpoint-636463.696E7374616E6365.v1"))
             .unwrap()
-            .starts_with("2\n")
+            .starts_with("3\n")
     );
     std::fs::remove_dir_all(path).unwrap();
 }

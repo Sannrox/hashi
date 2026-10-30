@@ -709,7 +709,7 @@ fn mysql_snapshot_worker() {
     let store = hashi::FileCheckpoint::open(path.join("checkpoints")).unwrap();
     store
         .commit(&hashi::Checkpoint {
-            contract_version: hashi::CONTRACT_VERSION,
+            contract_version: hashi::CHECKPOINT_VERSION,
             connector: "mysql-fixture".into(),
             instance: "fixture".into(),
             position: record.position,
@@ -717,6 +717,7 @@ fn mysql_snapshot_worker() {
                 .source
                 .as_ref()
                 .and_then(|source| source.cursor.clone()),
+            fencing_token: 1,
         })
         .unwrap();
     let line =

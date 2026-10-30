@@ -23,6 +23,10 @@ management interface; it has no authentication.
 | `hashi_checkpoint_age_seconds` | gauge | Seconds since this process last advanced the checkpoint; absent until it does |
 | `hashi_source_lag_seconds` | gauge | Age of the source timestamp of the newest committed record |
 | `hashi_up` | gauge | `1` when the last pass succeeded |
+| `hashi_role` | gauge | `1` while this process holds the instance lease, `0` while it waits as a standby |
+| `hashi_fencing_token` | gauge | Fencing token of the held instance lease |
+| `hashi_takeover_total` | counter | Times this process took over the instance lease from another holder |
+| `hashi_lease_age_seconds` | gauge | Seconds since this process acquired the instance lease |
 
 An instance with a [store-and-forward buffer](run.md#store-and-forward-buffer)
 also reports:

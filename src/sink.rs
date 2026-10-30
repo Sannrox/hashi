@@ -21,6 +21,14 @@ impl From<DeliverError> for Error {
     }
 }
 
+pub(crate) fn from_fence(error: Error) -> DeliverError {
+    if crate::lease::is_fence_lost(&error) {
+        DeliverError::Blocked(error.message)
+    } else {
+        DeliverError::Transient(error.message)
+    }
+}
+
 pub trait Sink {
     fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError>;
 
@@ -28,6 +36,12 @@ pub trait Sink {
     /// uses this on runtime start so a recovered uplink can empty the queue
     /// after the source has already been checkpointed.
     fn recover(&mut self) -> Result<(), DeliverError> {
+        Ok(())
+    }
+
+    /// Admit this fencing token before a write. Default: no on-disk fence.
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        let _ = token;
         Ok(())
     }
 }

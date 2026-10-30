@@ -124,12 +124,26 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
                     "{name}: delivered {} quarantined {} checkpoint {}",
                     report.delivered, report.quarantined, report.checkpoint
                 ),
+                Err(_error) if pass.role == 0 => {
+                    if once {
+                        failed = true;
+                    }
+                    eprintln!("{name}: standby, waiting for lease");
+                }
                 Err(error) => {
                     failed = true;
                     eprintln!("{name}: {}", error.message);
                 }
             }
-            metrics.record(name, &pass.progress, pass.outcome.is_err(), now_ms());
+            let pass_failed = pass.outcome.is_err() && pass.role != 0;
+            metrics.record(name, &pass.progress, pass_failed, now_ms());
+            metrics.record_lease(
+                name,
+                pass.role,
+                pass.fencing_token,
+                pass.takeovers,
+                pass.lease_acquired_ms,
+            );
             metrics.record_buffer(name, pass.buffer);
         }
         drop(metrics);

@@ -75,7 +75,7 @@ pub struct OpcUaConnector {
     timeout: Duration,
     schema_version: u64,
     subscription: Option<subscription::Reader>,
-    _pki_lease: std::fs::File,
+    pki_lease: crate::lease::DropRelease,
 }
 impl OpcUaConnector {
     /// Synchronous embedding API. Use a dedicated OS thread when called by an async host.
@@ -146,15 +146,12 @@ impl OpcUaConnector {
                 "OPC UA application certificate and private key are required",
             ));
         }
-        let lease = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(config.pki_dir.join("hashi.lease"))?;
-        lease
-            .try_lock()
-            .map_err(|_| Error::new("OPC UA PKI store is already owned"))?;
+        let lease = crate::lease::hold(
+            &config.pki_dir,
+            "hashi",
+            crate::lease::hold_ttl(),
+            "OPC UA PKI store is already owned",
+        )?;
         let token = match config.authentication {
             Authentication::UserName { user, password } => {
                 IdentityToken::UserName(user, password.into())
@@ -233,7 +230,7 @@ impl OpcUaConnector {
             max_nodes: config.max_nodes,
             timeout: config.timeout,
             schema_version: config.schema_version,
-            _pki_lease: lease,
+            pki_lease: lease,
         })
     }
 
@@ -525,6 +522,10 @@ impl Connector for OpcUaConnector {
         &self.id
     }
     fn check(&self) -> Result<CheckReport, Error> {
+        self.pki_lease.renew()?;
+        if let Some(reader) = &self.subscription {
+            reader.renew_lease()?;
+        }
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(Error::new(
                 "call OPC UA synchronous API outside an async runtime",
@@ -557,6 +558,10 @@ impl Connector for OpcUaConnector {
         })
     }
     fn discover(&self) -> Result<Vec<DiscoveredKind>, Error> {
+        self.pki_lease.renew()?;
+        if let Some(reader) = &self.subscription {
+            reader.renew_lease()?;
+        }
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(Error::new(
                 "call OPC UA synchronous API outside an async runtime",
@@ -585,6 +590,7 @@ impl Connector for OpcUaConnector {
         })
     }
     fn read(&mut self, from: Option<Position>, _: Option<&str>) -> Result<Option<Record>, Error> {
+        self.pki_lease.renew()?;
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(Error::new(
                 "call OPC UA synchronous API outside an async runtime",

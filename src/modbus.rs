@@ -319,7 +319,7 @@ pub struct ModbusConnector<T, C> {
     pending: VecDeque<Record>,
     state_dir: std::path::PathBuf,
     spool_header: String,
-    _lease: std::fs::File,
+    lease: crate::lease::DropRelease,
     transport: T,
     clock: C,
 }
@@ -378,15 +378,12 @@ impl<T: Transport, C: Clock> ModbusConnector<T, C> {
         }
         let state_dir = state_dir.into();
         std::fs::create_dir_all(&state_dir)?;
-        let lease = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(state_dir.join("modbus.lease"))?;
-        lease
-            .try_lock()
-            .map_err(|e| Error::new(format!("Modbus spool already owned: {e}")))?;
+        let lease = crate::lease::hold(
+            &state_dir,
+            "modbus",
+            crate::lease::hold_ttl(),
+            "Modbus spool already owned",
+        )?;
         let spool_header =
             serde_json::to_string(&(1, &id, &devices)).map_err(|e| Error::new(e.to_string()))?;
         let mut recovered_state = None;
@@ -462,7 +459,7 @@ impl<T: Transport, C: Clock> ModbusConnector<T, C> {
             pending,
             state_dir,
             spool_header,
-            _lease: lease,
+            lease,
             transport,
             clock,
         })
@@ -612,12 +609,14 @@ impl<T: Transport, C: Clock> Connector for ModbusConnector<T, C> {
     }
     /// Reachability is reflected per record; construction validates the map.
     fn check(&self) -> Result<CheckReport, Error> {
+        self.lease.renew()?;
         Ok(CheckReport {
             ok: true,
             message: "register maps validated; device failures appear as quality".into(),
         })
     }
     fn discover(&self) -> Result<Vec<DiscoveredKind>, Error> {
+        self.lease.renew()?;
         Ok(self
             .devices
             .iter()
@@ -655,6 +654,7 @@ impl<T: Transport, C: Clock> Connector for ModbusConnector<T, C> {
         from: Option<Position>,
         _source_cursor: Option<&str>,
     ) -> Result<Option<Record>, Error> {
+        self.lease.renew()?;
         // Keep observations until their source checkpoint acknowledges them.
         // Atomic spool replacement makes a failed delivery replay the same sample after restart.
         if let Some(position) = from {
