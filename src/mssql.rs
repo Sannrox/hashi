@@ -235,17 +235,20 @@ impl MssqlConnector {
 
     async fn snapshot(config: &Config, fingerprint: String) -> Result<State, Error> {
         let mut client = Self::connection(config).await?;
+        let mode = detect_mode(&mut client, config).await?;
+        let mut layouts = layouts(&mut client, &config.tables, config.schema_version).await?;
+        attach_instances(&mut client, &mut layouts).await?;
+        if mode == Mode::Cdc {
+            wait_covering_lsn(&mut client, &layouts).await?;
+        }
         execute(&mut client, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
             .await
             .map_err(|_| {
                 Error::new("SQL Server snapshot requires ALLOW_SNAPSHOT_ISOLATION on the database")
             })?;
         execute(&mut client, "BEGIN TRANSACTION").await?;
-        let mode = detect_mode(&mut client, config).await?;
-        let mut layouts = layouts(&mut client, &config.tables, config.schema_version).await?;
-        attach_instances(&mut client, &mut layouts).await?;
         let cursor = match mode {
-            Mode::Cdc => current_lsn(&mut client).await?,
+            Mode::Cdc => snapshot_lsn(&mut client, &layouts).await?,
             Mode::ChangeTracking => current_version(&mut client).await?,
         };
         let mut records = VecDeque::new();
@@ -443,7 +446,9 @@ impl MssqlConnector {
 
     async fn poll_cdc(&mut self, client: &mut SqlClient) -> Result<(), Error> {
         let from = parse_lsn(&self.state.cursor)?;
-        let to = parse_lsn(&current_lsn(client).await?)?;
+        let Some(to) = read_max_lsn(client).await? else {
+            return Ok(());
+        };
         if to <= from {
             return Ok(());
         }
@@ -1125,7 +1130,7 @@ async fn capture_instances(
         .collect()
 }
 
-async fn current_lsn(client: &mut SqlClient) -> Result<String, Error> {
+async fn read_max_lsn(client: &mut SqlClient) -> Result<Option<[u8; 10]>, Error> {
     let row = client
         .simple_query("SELECT sys.fn_cdc_get_max_lsn()")
         .await
@@ -1135,9 +1140,48 @@ async fn current_lsn(client: &mut SqlClient) -> Result<String, Error> {
         .map_err(sql_error)?
         .ok_or_else(|| Error::new("SQL Server CDC max LSN is missing"))?;
     match row.try_get::<&[u8], _>(0).map_err(sql_error)? {
-        Some(bytes) => format_lsn(bytes),
-        None => Ok("00000000000000000000".into()),
+        Some(bytes) if bytes.len() != 10 => Err(Error::new("SQL Server LSN must be 10 bytes")),
+        Some(bytes) if bytes.iter().any(|b| *b != 0) => {
+            let mut out = [0u8; 10];
+            out.copy_from_slice(bytes);
+            Ok(Some(out))
+        }
+        Some(_) | None => Ok(None),
     }
+}
+
+async fn covering_lsn(
+    client: &mut SqlClient,
+    layouts: &[Layout],
+) -> Result<Option<[u8; 10]>, Error> {
+    let Some(max) = read_max_lsn(client).await? else {
+        return Ok(None);
+    };
+    for layout in layouts {
+        let instances = capture_instances(client, layout).await?;
+        if select_instance(&instances, &max).is_err() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(max))
+}
+
+/// The capture job must scan past each instance start LSN before a snapshot cursor is valid.
+async fn wait_covering_lsn(client: &mut SqlClient, layouts: &[Layout]) -> Result<(), Error> {
+    for _ in 0..40 {
+        if covering_lsn(client, layouts).await?.is_some() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(Error::new("SQL Server CDC max LSN is missing"))
+}
+
+async fn snapshot_lsn(client: &mut SqlClient, layouts: &[Layout]) -> Result<String, Error> {
+    covering_lsn(client, layouts)
+        .await?
+        .ok_or_else(|| Error::new("SQL Server CDC max LSN is missing"))
+        .and_then(|lsn| format_lsn(&lsn))
 }
 async fn instance_min_lsn(client: &mut SqlClient, instance: &str) -> Result<[u8; 10], Error> {
     capture_function(instance)?;
@@ -1220,6 +1264,19 @@ async fn scalar_flag(client: &mut SqlClient, sql: &str) -> Result<bool, Error> {
     Err(Error::new("SQL Server flag query returned nothing"))
 }
 
+fn count_i32(row: &tiberius::Row) -> Result<i32, Error> {
+    if let Ok(Some(v)) = row.try_get::<i32, _>(0) {
+        return Ok(v);
+    }
+    if let Ok(Some(v)) = row.try_get::<i64, _>(0) {
+        return i32::try_from(v).map_err(|_| Error::new("SQL Server count is out of range"));
+    }
+    if let Ok(Some(v)) = row.try_get::<i16, _>(0) {
+        return Ok(i32::from(v));
+    }
+    Err(Error::new("SQL Server count is missing"))
+}
+
 async fn scalar_i32(client: &mut SqlClient, sql: &str) -> Result<i32, Error> {
     let row = client
         .simple_query(sql)
@@ -1266,20 +1323,16 @@ async fn check_cdc(
     {
         missing.push("change data capture on the database");
     }
-    let agent = client
-        .simple_query(
-            "SELECT TOP 1 status_desc FROM sys.dm_server_services WHERE servicename LIKE N'SQL Server Agent%'",
-        )
-        .await
-        .map_err(sql_error)?
-        .into_row()
-        .await
-        .map_err(sql_error)?;
-    let agent_ok = agent
-        .as_ref()
-        .and_then(|row| row.try_get::<&str, _>(0).ok().flatten())
-        .is_some_and(|status| status.eq_ignore_ascii_case("Running"));
-    if !agent_ok {
+    if !scalar_flag(
+        client,
+        "SELECT CONVERT(bit, CASE WHEN EXISTS (
+            SELECT 1 FROM sys.dm_server_services
+            WHERE servicename LIKE N'SQL Server Agent%'
+              AND (status = 4 OR LTRIM(RTRIM(status_desc)) = N'Running')
+        ) THEN 1 ELSE 0 END)",
+    )
+    .await?
+    {
         missing.push("SQL Server Agent running");
     }
     let retention_minutes = scalar_i64(
@@ -1296,11 +1349,12 @@ async fn check_cdc(
         );
         query.bind(table.schema.as_str());
         query.bind(table.table.as_str());
-        let count: i32 = rows(client, query)
+        let count = rows(client, query)
             .await?
             .into_iter()
             .next()
-            .and_then(|row| row.try_get::<i32, _>(0).ok().flatten())
+            .map(|row| count_i32(&row))
+            .transpose()?
             .unwrap_or(0);
         if count == 0 {
             missing.push("capture instance on each selected table");

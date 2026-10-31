@@ -111,6 +111,25 @@ async fn wait_agent(client: &mut Client<tokio_util::compat::Compat<TcpStream>>) 
     }
 }
 
+fn count_i32(row: &tiberius::Row) -> i32 {
+    row.try_get::<i32, _>(0)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            row.try_get::<i64, _>(0)
+                .ok()
+                .flatten()
+                .and_then(|v| i32::try_from(v).ok())
+        })
+        .unwrap_or(0)
+}
+
+async fn try_exec(client: &mut Client<tokio_util::compat::Compat<TcpStream>>, sql: &str) {
+    if let Ok(stream) = client.simple_query(sql).await {
+        let _ = stream.into_first_result().await;
+    }
+}
+
 async fn wait_capture_instance(
     client: &mut Client<tokio_util::compat::Compat<TcpStream>>,
     min: i32,
@@ -124,16 +143,38 @@ async fn wait_capture_instance(
             .into_first_result()
             .await
             .unwrap();
-        let count = rows
-            .first()
-            .and_then(|row| row.try_get::<i32, _>(0).ok().flatten())
-            .unwrap_or(0);
+        let count = rows.first().map(count_i32).unwrap_or(0);
         if count >= min {
             return;
         }
         assert!(
             std::time::Instant::now() < deadline,
             "capture instance was not created"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_max_lsn(client: &mut Client<tokio_util::compat::Compat<TcpStream>>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        try_exec(client, "EXEC sys.sp_cdc_scan").await;
+        let rows = match client.simple_query("SELECT sys.fn_cdc_get_max_lsn()").await {
+            Ok(stream) => stream.into_first_result().await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let ready = rows.first().is_some_and(|row| {
+            row.try_get::<&[u8], _>(0)
+                .ok()
+                .flatten()
+                .is_some_and(|bytes| bytes.len() == 10 && bytes.iter().any(|b| *b != 0))
+        });
+        if ready {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CDC max LSN was not available"
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -190,10 +231,12 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
         )
         .await;
         wait_capture_instance(&mut client, 1).await;
+        wait_max_lsn(&mut client).await;
     });
     let mut source =
         MssqlConnector::connect(config("127.0.0.1", port, &database, path.clone())).unwrap();
-    assert!(source.check().unwrap().ok);
+    let report = source.check().unwrap();
+    assert!(report.ok, "{}", report.message);
     let first = source.read(None, None).unwrap().unwrap();
     assert_eq!(first.key, "[1]");
     let second = next(&mut source, &first).unwrap();
@@ -218,6 +261,7 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
         )
         .await;
         exec(&mut client, "COMMIT").await;
+        try_exec(&mut client, "EXEC sys.sp_cdc_scan").await;
     });
     let begin = next(&mut source, &third).unwrap();
     assert_eq!(
@@ -279,7 +323,9 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
         )
         .await;
         wait_capture_instance(&mut client, 2).await;
+        wait_max_lsn(&mut client).await;
         exec(&mut client, "INSERT INTO dbo.items (id, value, extra) VALUES (5, N'five', 9)").await;
+        try_exec(&mut client, "EXEC sys.sp_cdc_scan").await;
     });
     let mut last = end;
     let mut found_five = false;

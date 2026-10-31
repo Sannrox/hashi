@@ -29,9 +29,10 @@ retained minimum fails closed and requires an explicit new snapshot.
 
 ## Snapshot and handoff
 
-A snapshot-isolation transaction stages complete selected tables in primary-key
-pages, then publishes an atomically replaced, fsynced batch and the LSN (or
-change-tracking version) captured with that snapshot. Stream reads start after
+A snapshot waits until change data capture has a max LSN that covers each
+selected capture instance. A snapshot-isolation transaction then stages complete
+selected tables in primary-key pages, then publishes an atomically replaced,
+fsynced batch and the LSN (or change-tracking version) captured with that snapshot. Stream reads start after
 that cursor. A crash before the manifest restarts the snapshot. A crash after
 publication replays remaining records with the same order positions and
 idempotency identities.
