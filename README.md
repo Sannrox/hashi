@@ -12,7 +12,7 @@ Default Cargo features are `parquet` and `modbus`. `mqtt`, `mysql`, `mssql`, `op
 
 Hashi doesn't make governance decisions. It authenticates to sources, reads, normalizes and delivers. Mapping records to objects, markings and Actions belongs to the consumer. It runs as a single binary or as one process per connector, with no runtime network calls besides the configured sources and sinks.
 
-Status: v0.1 MVP families are in tree. SQL Server CDC is in tree; Oracle CDC stays on the v0.2 roadmap. See [VISION.md](VISION.md).
+Status: v0.1 MVP families are in tree. SQL Server CDC and SQL Server historian mapping are in tree; Oracle CDC stays on the v0.2 roadmap. See [VISION.md](VISION.md).
 
 License: Apache-2.0. The default build admits only permissive dependency
 licenses; `cargo deny check licenses` enforces it (`deny.toml`).
@@ -21,6 +21,7 @@ licenses; `cargo deny check licenses` enforces it (`deny.toml`).
 
 - [Running from a config file](docs/run.md)
 - [Health, metrics, diagnostics and offline packaging](docs/operations.md)
+- [Releases](RELEASING.md)
 - [Source cursors and change records](docs/source-cursors.md)
 - [Schema drift and quarantine](docs/schema-drift.md)
 - [Modbus polling](docs/modbus.md)

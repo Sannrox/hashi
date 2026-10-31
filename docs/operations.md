@@ -64,11 +64,14 @@ reported as such, without the parser's message.
 
 `Dockerfile` builds one statically linked binary (musl) in a digest-pinned
 build image and copies it onto an empty base, running as an unprivileged user.
-The build needs crate downloads; the image needs nothing at run time:
+The build needs crate downloads; the image needs nothing at run time.
+Release images are tagged with the version only; there is no `latest` tag.
+Deploy by digest. Signed `v*` tags and GitHub Releases are described in
+[RELEASING.md](../RELEASING.md).
 
 ```sh
-docker build -t hashi .
-docker run --network none -v "$PWD/site:/work" hashi run --config /work/hashi.toml
+docker build -t hashi:local .
+docker run --network none -v "$PWD/site:/work" hashi:local run --config /work/hashi.toml
 ```
 
 The binary opens no connections besides configured sources and sinks and the
