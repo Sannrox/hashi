@@ -73,7 +73,70 @@ async fn connect(
 }
 
 async fn exec(client: &mut Client<tokio_util::compat::Compat<TcpStream>>, sql: &str) {
-    client.simple_query(sql).await.unwrap();
+    client
+        .simple_query(sql)
+        .await
+        .unwrap()
+        .into_first_result()
+        .await
+        .unwrap();
+}
+
+async fn wait_agent(client: &mut Client<tokio_util::compat::Compat<TcpStream>>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let rows = match client
+            .simple_query(
+                "SELECT TOP 1 status_desc FROM sys.dm_server_services WHERE servicename LIKE N'SQL Server Agent%'",
+            )
+            .await
+        {
+            Ok(stream) => stream.into_first_result().await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let running = rows.first().is_some_and(|row| {
+            row.try_get::<&str, _>(0)
+                .ok()
+                .flatten()
+                .is_some_and(|status| status.eq_ignore_ascii_case("Running"))
+        });
+        if running {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SQL Server Agent was not running"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_capture_instance(
+    client: &mut Client<tokio_util::compat::Compat<TcpStream>>,
+    min: i32,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let rows = client
+            .simple_query("SELECT COUNT(*) FROM cdc.change_tables")
+            .await
+            .unwrap()
+            .into_first_result()
+            .await
+            .unwrap();
+        let count = rows
+            .first()
+            .and_then(|row| row.try_get::<i32, _>(0).ok().flatten())
+            .unwrap_or(0);
+        if count >= min {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capture instance was not created"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 #[test]
@@ -119,14 +182,15 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
             "INSERT INTO dbo.items (id, value) VALUES (1, N'one'), (2, N'two'), (3, N'three')",
         )
         .await;
+        wait_agent(&mut client).await;
         exec(&mut client, "EXEC sys.sp_cdc_enable_db").await;
         exec(
             &mut client,
             "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'items', @role_name=NULL, @supports_net_changes=0",
         )
         .await;
+        wait_capture_instance(&mut client, 1).await;
     });
-    std::thread::sleep(Duration::from_secs(3));
     let mut source =
         MssqlConnector::connect(config("127.0.0.1", port, &database, path.clone())).unwrap();
     assert!(source.check().unwrap().ok);
@@ -214,9 +278,9 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
             "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'items', @role_name=NULL, @capture_instance=N'dbo_items_v2', @supports_net_changes=0",
         )
         .await;
+        wait_capture_instance(&mut client, 2).await;
         exec(&mut client, "INSERT INTO dbo.items (id, value, extra) VALUES (5, N'five', 9)").await;
     });
-    std::thread::sleep(Duration::from_secs(3));
     let mut last = end;
     let mut found_five = false;
     for _ in 0..16 {

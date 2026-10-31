@@ -87,6 +87,9 @@ pub(super) async fn layouts(
                 qualified(&table.schema, &table.table)
             ))
             .await
+            .map_err(sql_error)?
+            .into_first_result()
+            .await
             .map_err(sql_error)?;
         layouts.push(Layout {
             schema: table.schema.clone(),

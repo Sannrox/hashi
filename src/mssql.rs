@@ -235,16 +235,12 @@ impl MssqlConnector {
 
     async fn snapshot(config: &Config, fingerprint: String) -> Result<State, Error> {
         let mut client = Self::connection(config).await?;
-        client
-            .simple_query("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
+        execute(&mut client, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
             .await
             .map_err(|_| {
                 Error::new("SQL Server snapshot requires ALLOW_SNAPSHOT_ISOLATION on the database")
             })?;
-        client
-            .simple_query("BEGIN TRANSACTION")
-            .await
-            .map_err(sql_error)?;
+        execute(&mut client, "BEGIN TRANSACTION").await?;
         let mode = detect_mode(&mut client, config).await?;
         let mut layouts = layouts(&mut client, &config.tables, config.schema_version).await?;
         attach_instances(&mut client, &mut layouts).await?;
@@ -323,7 +319,7 @@ impl MssqlConnector {
                 }
             }
         }
-        client.simple_query("COMMIT;").await.map_err(sql_error)?;
+        execute(&mut client, "COMMIT").await?;
         if records.is_empty() {
             position = 1;
             append(
@@ -1016,12 +1012,12 @@ fn sql_error(_error: tiberius::error::Error) -> Error {
 }
 
 async fn detect_mode(client: &mut SqlClient, config: &Config) -> Result<Mode, Error> {
-    let cdc: i32 = scalar_i32(
+    if scalar_flag(
         client,
         "SELECT is_cdc_enabled FROM sys.databases WHERE name=DB_NAME()",
     )
-    .await?;
-    if cdc == 1 {
+    .await?
+    {
         return Ok(Mode::Cdc);
     }
     let tracking: i32 = scalar_i32(
@@ -1192,6 +1188,38 @@ async fn current_version(client: &mut SqlClient) -> Result<String, Error> {
             .to_string(),
     )
 }
+async fn execute(client: &mut SqlClient, sql: &str) -> Result<(), Error> {
+    client
+        .simple_query(sql)
+        .await
+        .map_err(sql_error)?
+        .into_first_result()
+        .await
+        .map_err(sql_error)?;
+    Ok(())
+}
+
+async fn scalar_flag(client: &mut SqlClient, sql: &str) -> Result<bool, Error> {
+    let row = client
+        .simple_query(sql)
+        .await
+        .map_err(sql_error)?
+        .into_row()
+        .await
+        .map_err(sql_error)?
+        .ok_or_else(|| Error::new("SQL Server scalar query returned nothing"))?;
+    if let Ok(Some(v)) = row.try_get::<bool, _>(0) {
+        return Ok(v);
+    }
+    if let Ok(Some(v)) = row.try_get::<i32, _>(0) {
+        return Ok(v != 0);
+    }
+    if let Ok(Some(v)) = row.try_get::<u8, _>(0) {
+        return Ok(v != 0);
+    }
+    Err(Error::new("SQL Server flag query returned nothing"))
+}
+
 async fn scalar_i32(client: &mut SqlClient, sql: &str) -> Result<i32, Error> {
     let row = client
         .simple_query(sql)
@@ -1230,12 +1258,11 @@ async fn check_cdc(
     state: &State,
 ) -> Result<CheckReport, Error> {
     let mut missing = Vec::new();
-    if scalar_i32(
+    if !scalar_flag(
         client,
         "SELECT is_cdc_enabled FROM sys.databases WHERE name=DB_NAME()",
     )
     .await?
-        != 1
     {
         missing.push("change data capture on the database");
     }
