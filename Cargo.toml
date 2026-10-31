@@ -25,12 +25,15 @@ toml = { version = "0.9.12", default-features = false, features = ["parse", "ser
 tokio = { version = "1.54.0", default-features = false, features = ["rt-multi-thread", "time"], optional = true }
 url = { version = "2.5.8", optional = true }
 fencing-lease = { git = "https://github.com/Sannrox/agent-kit", rev = "7adf5da3254b6a78f93c49837ab9f7cd6103b2d0", package = "fencing-lease", default-features = false }
+tiberius = { version = "0.13.0", default-features = false, features = ["chrono", "rustls", "tds73"], optional = true }
+tokio-util = { version = "0.7.20", default-features = false, features = ["compat"], optional = true }
 
 [features]
 default = ["parquet", "modbus"]
 parquet = ["dep:parquet"]
 modbus = ["dep:serialport"]
 mysql = ["dep:chrono", "dep:mysql_async", "dep:mysql_common", "dep:futures-util", "dep:tokio"]
+mssql = ["dep:chrono", "dep:tiberius", "dep:tokio-util", "dep:tokio", "dep:rustls", "tokio/net"]
 mqtt = ["dep:prost", "dep:rumqttc", "dep:rustls", "dep:tokio"]
 opcua = ["dep:async-opcua", "dep:tokio", "dep:url"]
 opcua-simulator = ["dep:async-trait", "opcua", "async-opcua/server", "tokio/net", "tokio/macros"]

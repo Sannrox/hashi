@@ -23,6 +23,8 @@ pub mod lease;
 pub mod modbus;
 #[cfg(feature = "mqtt")]
 pub mod mqtt;
+#[cfg(feature = "mssql")]
+pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 pub mod observe;
