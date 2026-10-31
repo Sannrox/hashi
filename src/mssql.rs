@@ -1,4 +1,5 @@
 //! Snapshot plus LSN-ordered change capture, with change tracking as fallback.
+pub mod historian;
 mod schema;
 mod state;
 use crate::schema::{FieldType, Schema};
@@ -945,7 +946,7 @@ impl Drop for MssqlConnector {
     }
 }
 
-fn install_crypto() {
+pub(super) fn install_crypto() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();

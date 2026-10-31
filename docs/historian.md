@@ -72,7 +72,28 @@ disposable plaintext fixture.
 
 Raw reads are `SELECT`s over `(after_ms, until_ms]`, ordered by the time
 column, so a restart with the same window is replayable. Interpolated reads
-are not offered. SQL Server mapping is a later adapter.
+are not offered.
+
+## SQL mapping (SQL Server)
+
+Enable the `mssql` Cargo feature and construct
+`mssql::historian::SqlHistorian` with host, port, user, password, database,
+and a mapping: the tag table (identity and name columns), the value table
+(tag, time, value, and quality columns), and the schema that holds them
+(`mapping.database`). `connect` checks that mapping against the catalog and
+refuses a missing table, a missing column, a time/value/name column of the
+wrong type, a nullable identity, time, value, or name column, a tag identity
+or name that is not unique, or identity columns that do not share a type and
+collation, before any sample is read. Raw reads select by the tag identity
+column so a case-insensitive name collation cannot mix two tags. Time bounds
+are millisecond watermarks even when the time column stores fractional
+seconds. Call the synchronous API from a dedicated OS thread outside a Tokio
+runtime. Verified TLS is required unless `allow_insecure_lab` explicitly
+permits a disposable fixture with a server-selected certificate.
+
+Raw reads are `SELECT`s over `(after_ms, until_ms]`, ordered by the time
+column, so a restart with the same window is replayable. Interpolated reads
+are not offered.
 
 ## OPC UA Historical Access
 
@@ -87,13 +108,14 @@ runs over the rest. Session, trust, and PKI setup are the same as
 
 The parent historian scope in #6 is delivered by #22 (one trait, chunked
 backfill, per-tag checkpoints, tail handover), #23 (OPC UA Historical Access),
-and #24 (MySQL mapping). The REST historian adapter and SQL Server mapping
-stay later.
+#24 (MySQL mapping), and #68 (SQL Server mapping). The REST historian adapter
+stays later.
 
 ```sh
 CARGO_TARGET_DIR="$PWD/target" cargo test --locked --test historian_backfill
 CARGO_TARGET_DIR="$PWD/target" cargo test --locked --features opcua-simulator --test opcua_historian
 bash scripts/test-mysql-container.sh
+bash scripts/test-mssql-container.sh
 ```
 
 | Capability | Evidence |
@@ -104,6 +126,8 @@ bash scripts/test-mysql-container.sh
 | Variables without history reported by `check`; connector still runs | [OPC UA historian fixture](../tests/opcua_historian.rs) |
 | Generic SQL historian adapter configured by mapping (tag table, value table, time column, quality column) on MySQL | [MySQL historian fixture](../tests/mysql_historian.rs) |
 | Wrong mapping refused at connect; interpolated SQL reads not offered | [MySQL historian fixture](../tests/mysql_historian.rs) |
+| Generic SQL historian adapter configured by mapping (tag table, value table, time column, quality column) on SQL Server | [SQL Server historian fixture](../tests/mssql_historian.rs) |
+| Wrong SQL Server mapping refused at connect; interpolated SQL reads not offered | [SQL Server historian fixture](../tests/mssql_historian.rs) |
 
 These checks establish fixture and simulator conformance. They do not certify
 arbitrary plant historians. Vendor client libraries stay out of the default
