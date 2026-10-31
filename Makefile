@@ -10,3 +10,4 @@ update:
 validate:
 	cargo fmt --check
 	cargo clippy --all-targets --all-features --locked -- -D warnings
+	bash scripts/validate-release.sh

@@ -21,10 +21,13 @@ CLI, metrics, diagnostics, and the static image).
 - `make validate`, `make test` and `make test-integration` are the local gates.
   They match the build, test, fmt and clippy jobs in `.github/workflows/ci.yml`:
   `cargo build --all-targets --all-features --locked`,
-  `cargo test --all-features --locked`, `cargo fmt --check`, and
-  `cargo clippy --all-targets --all-features --locked -- -D warnings`. CI also
-  runs `cargo deny check licenses`, OPC UA/MySQL/MQTT container fixtures, and
-  the offline image.
+  `cargo test --all-features --locked`, `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
+  `bash scripts/validate-release.sh`. CI also runs `cargo deny check licenses`,
+  OPC UA/MySQL/MQTT container fixtures, and the offline image.
+- `scripts/validate-release.sh` checks the tag-triggered release path: signed
+  annotated tags, CHANGELOG notes, SBOM, and the family release manifest.
+  Pull requests and dry runs must not publish or attest.
 
 GitHub Issues are the planning source of truth. Workflow Skills are shared;
 see `## Shared agent skills`. Never commit hostnames, home paths, secrets or
@@ -302,6 +305,7 @@ the local gates (`make update`, `make validate`, `make test`,
 | protocol fixture | the matching `scripts/test-*-container.sh` |
 | configuration | parsing/default tests, `docs/run.md`, README |
 | static image | `scripts/test-offline-image.sh` |
+| release workflow | `bash scripts/validate-release.sh` |
 | docs / Skills | links and commands; `bash scripts/validate-workflow-skills.sh` |
 
 ### Release audit
@@ -310,7 +314,6 @@ the local gates (`make update`, `make validate`, `make test`,
 - connector contract, checkpoint and cursor format compatibility;
 - configuration additions, removals, defaults, and README;
 - security, rollback, and operator actions;
-- static image packaging (`Dockerfile`, `scripts/test-offline-image.sh`);
-- `CHANGELOG.md` is release-owned: draft its section from
-  `scripts/changelog-draft.sh` (merged changes since the last tag) and the
-  pull request bodies, upgrade actions first.
+- static image packaging (`Dockerfile`, `scripts/test-offline-image.sh`; deploy by digest, never a `latest` tag);
+- release notes drafted from the pull request bodies since the last tag with
+  `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the release.
