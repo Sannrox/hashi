@@ -330,7 +330,8 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
     let mut last = end;
     let mut found_five = false;
     for _ in 0..16 {
-        last = next(&mut source, &last).unwrap();
+        last = next(&mut source, &last)
+            .unwrap_or_else(|error| panic!("cdc after capture-instance switch: {}", error.message));
         if last.key == "[5]" {
             found_five = true;
             break;

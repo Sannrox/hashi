@@ -53,7 +53,8 @@ per-directory fencing lease fences concurrent spool writers.
 
 After DDL, enable a new capture instance for the table. The connector follows the
 newest instance whose start LSN covers the checkpoint. Earlier instances remain
-readable until that LSN. Dropped retention below the checkpoint, or a cursor the
+readable until that LSN. A newer instance is queried from its own min LSN, not
+from a checkpoint that predates it. Dropped retention below the checkpoint, or a cursor the
 cleanup job has purged, fails visibly. Operator recovery is a new snapshot.
 
 ## Restart

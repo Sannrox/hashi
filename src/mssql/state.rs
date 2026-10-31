@@ -198,6 +198,13 @@ pub(super) fn select_instance<'a>(
     Ok(chosen)
 }
 
+/// Exclusive CDC `from_lsn` for one capture instance. Newer instances start at
+/// their own min LSN; a range that is empty after that clamp is skipped.
+pub(super) fn cdc_query_from(from: [u8; 10], min: [u8; 10], to: [u8; 10]) -> Option<[u8; 10]> {
+    let start = if from < min { min } else { from };
+    (start < to).then_some(start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +245,27 @@ mod tests {
             "dbo_items_v2"
         );
         assert!(select_instance(&instances, &parse_lsn("00000000000000000000").unwrap()).is_err());
+    }
+
+    #[test]
+    fn cdc_query_from_clamps_to_instance_min_and_skips_empty_ranges() {
+        let min = parse_lsn("00000000000000000010").unwrap();
+        let to = parse_lsn("00000000000000000020").unwrap();
+        assert_eq!(
+            cdc_query_from(parse_lsn("00000000000000000001").unwrap(), min, to),
+            Some(min)
+        );
+        assert_eq!(
+            cdc_query_from(parse_lsn("00000000000000000015").unwrap(), min, to),
+            Some(parse_lsn("00000000000000000015").unwrap())
+        );
+        assert_eq!(
+            cdc_query_from(parse_lsn("00000000000000000020").unwrap(), min, to),
+            None
+        );
+        assert_eq!(
+            cdc_query_from(parse_lsn("00000000000000000001").unwrap(), to, to),
+            None
+        );
     }
 }

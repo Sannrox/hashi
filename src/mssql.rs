@@ -10,8 +10,8 @@ use schema::{
     Cell, capture_function, captured_columns, cells, ident, key, layouts, object, qualified, rows,
 };
 use state::{
-    Batch, CaptureInstance, Layout, Mode, State, format_lsn, parse_lsn, parse_version,
-    select_instance,
+    Batch, CaptureInstance, Layout, Mode, State, cdc_query_from, format_lsn, parse_lsn,
+    parse_version, select_instance,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -456,7 +456,11 @@ impl MssqlConnector {
         for index in 0..self.state.layouts.len() {
             let instances = capture_instances(client, &self.state.layouts[index]).await?;
             let covering = select_instance(&instances, &from)?;
-            let min = instance_min_lsn(client, &covering.name).await?;
+            let Some(min) = instance_min_lsn(client, &covering.name).await? else {
+                return Err(Error::new(
+                    "SQL Server CDC retention expired; an explicit new snapshot and consumer recovery are required",
+                ));
+            };
             if from < min {
                 return Err(Error::new(
                     "SQL Server CDC retention expired; an explicit new snapshot and consumer recovery are required",
@@ -475,6 +479,12 @@ impl MssqlConnector {
                 if next_start.is_some_and(|start| start <= from) || instance.start_lsn > to {
                     continue;
                 }
+                let Some(min) = instance_min_lsn(client, &instance.name).await? else {
+                    continue;
+                };
+                let Some(query_from) = cdc_query_from(from, min, to) else {
+                    continue;
+                };
                 follow_instance(client, &mut self.state.layouts[index], instance).await?;
                 let layout = self.state.layouts[index].clone();
                 let function = capture_function(&instance.name)?;
@@ -488,7 +498,7 @@ impl MssqlConnector {
                         .join(", "),
                     function
                 ));
-                query.bind(from.as_slice());
+                query.bind(query_from.as_slice());
                 query.bind(to.as_slice());
                 for row in rows(client, query).await? {
                     let lsn = schema::binary10(&row, 0)?;
@@ -1183,7 +1193,10 @@ async fn snapshot_lsn(client: &mut SqlClient, layouts: &[Layout]) -> Result<Stri
         .ok_or_else(|| Error::new("SQL Server CDC max LSN is missing"))
         .and_then(|lsn| format_lsn(&lsn))
 }
-async fn instance_min_lsn(client: &mut SqlClient, instance: &str) -> Result<[u8; 10], Error> {
+async fn instance_min_lsn(
+    client: &mut SqlClient,
+    instance: &str,
+) -> Result<Option<[u8; 10]>, Error> {
     capture_function(instance)?;
     let mut query = tiberius::Query::new("SELECT sys.fn_cdc_get_min_lsn(@P1)");
     query.bind(instance);
@@ -1193,15 +1206,13 @@ async fn instance_min_lsn(client: &mut SqlClient, instance: &str) -> Result<[u8;
         .next()
         .ok_or_else(|| Error::new("SQL Server CDC min LSN is missing"))?;
     match row.try_get::<&[u8], _>(0).map_err(sql_error)? {
-        Some(bytes) => {
+        Some(bytes) if bytes.len() != 10 => Err(Error::new("SQL Server LSN must be 10 bytes")),
+        Some(bytes) if bytes.iter().any(|b| *b != 0) => {
             let mut out = [0u8; 10];
-            if bytes.len() != 10 {
-                return Err(Error::new("SQL Server LSN must be 10 bytes"));
-            }
             out.copy_from_slice(bytes);
-            Ok(out)
+            Ok(Some(out))
         }
-        None => Err(Error::new("SQL Server CDC min LSN is missing")),
+        Some(_) | None => Ok(None),
     }
 }
 
@@ -1367,7 +1378,7 @@ async fn check_cdc(
             match select_instance(&instances, &from) {
                 Ok(instance) => {
                     let min = instance_min_lsn(client, &instance.name).await?;
-                    if from < min {
+                    if min.is_none_or(|min| from < min) {
                         missing.push("retained LSNs covering the checkpoint");
                         break;
                     }
