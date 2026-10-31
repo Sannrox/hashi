@@ -64,3 +64,6 @@ checkpoint. Connection credentials may rotate without changing source identity.
 A read failure marks the reader unhealthy; restart retries from durable state.
 `resume` opens at a committed LSN or change-tracking version in an empty state
 directory for one-shot outbox hosts.
+
+A mapped SQL historian (`mssql::historian::SqlHistorian`) uses the same driver
+and disposable fixture; see [historian.md](historian.md).

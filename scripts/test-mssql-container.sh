@@ -25,3 +25,4 @@ port="$(docker port "$container" 1433/tcp | sed 's/.*://' | head -n 1)"
 export HASHI_MSSQL_DISPOSABLE=1 HASHI_MSSQL_TEST_PORT="$port" HASHI_MSSQL_CONTAINER="$container" \
   HASHI_MSSQL_SA_PASSWORD=Hashi_fixture1 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
 cargo test --locked --features mssql --test mssql_cdc -- --ignored --nocapture --test-threads=1
+cargo test --locked --features mssql --test mssql_historian -- --ignored --nocapture --test-threads=1
