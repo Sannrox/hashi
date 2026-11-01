@@ -6,6 +6,21 @@ Family versioning, tagging, and release policy:
 This page is hashi-local: how a maintainer prepares and tags **this**
 repository.
 
+## Compatibility of config, CLI and JSON output
+
+- **Config.** A config file may declare `version = 1` at the top; omitted
+  means the current version. A file declaring any other version is refused
+  at load, so settings written for a newer schema never run ignored. A change
+  older files cannot express bumps the version in the same release as its
+  migration notes. Releases before this rule reject a `version` key, so omit
+  it if you may roll back to one.
+- **CLI.** A command (`run`, `diagnostics`, `outbox`) or flag is removed only
+  after one minor release that still accepts it and prints a deprecation
+  warning naming its replacement.
+- **JSON output.** The `diagnostics` bundle is an API: fields are only added
+  in a minor; removing or renaming one is a breaking change listed under
+  Breaking in `CHANGELOG.md`.
+
 ## Who cuts a tag
 
 Agents never push `v*` tags. After the version-bump pull request merges, the

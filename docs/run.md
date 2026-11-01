@@ -14,6 +14,8 @@ Add `--listen <addr>` for health and metrics, and use `hashi diagnostics
 TOML. Relative paths resolve against the config file's directory.
 
 ```toml
+# Optional. Config schema; omitted means current, other values are refused.
+# version = 1
 checkpoint_dir = "state"
 # Optional. Default is a file slot under checkpoint_dir.
 # lease = { backend = "file", ttl_ms = 15000, members = 1 }
@@ -24,6 +26,8 @@ source.fixture = { records = 3, credential_file = "secrets/line-1", accept_sha25
 sink.jsonl = { dir = "out/line-1" }
 ```
 
+- `version` (optional): config schema version, `1`. Any other value is
+  refused; see [RELEASING.md](../RELEASING.md) for the compatibility rules.
 - `checkpoint_dir`: each instance checkpoints under `checkpoint_dir/<name>`,
   so a restarted process resumes after the last committed position.
 - `lease` (optional): the lock store that decides who may write. Checkpoint

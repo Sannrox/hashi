@@ -27,9 +27,32 @@ use serde::Deserialize;
 
 use crate::Error;
 
+/// The config schema version this release reads.
+pub const CONFIG_VERSION: u32 = 1;
+
+/// A config file's declared schema version. Omitted means
+/// [`CONFIG_VERSION`]; any other value is refused, so a file written for a
+/// newer schema never runs with its new settings ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigVersion;
+
+impl<'de> Deserialize<'de> for ConfigVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match u32::deserialize(deserializer)? {
+            CONFIG_VERSION => Ok(Self),
+            other => Err(serde::de::Error::custom(format!(
+                "config version {other} is not supported; this release reads version {CONFIG_VERSION}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Schema version (`version = 1`). Omitted means the current version.
+    #[serde(default)]
+    version: Option<ConfigVersion>,
     pub checkpoint_dir: PathBuf,
     /// Lock store for instance leases. Absent: a file slot under `checkpoint_dir`.
     #[serde(default)]
@@ -508,6 +531,22 @@ mod tests {
             );
             let error = Config::parse(&text, Path::new(".")).unwrap_err().message;
             assert!(error.contains(field), "{lease}: {error}");
+        }
+    }
+
+    #[test]
+    fn config_version_defaults_to_current_and_unknown_versions_are_refused() {
+        for accepted in ["", "version = 1\n"] {
+            let text = format!("{accepted}{}", config(&valid_instance()));
+            Config::parse(&text, Path::new("/etc/hashi"))
+                .unwrap_or_else(|error| panic!("{accepted:?}: {error}"));
+        }
+        for refused in ["version = 2\n", "version = 0\n"] {
+            let text = format!("{refused}{}", config(&valid_instance()));
+            let error = Config::parse(&text, Path::new("/etc/hashi"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("is not supported"), "{refused:?}: {error}");
         }
     }
 }
