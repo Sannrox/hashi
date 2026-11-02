@@ -62,6 +62,7 @@ pub(super) struct State {
     pub version: u32,
     pub fingerprint: String,
     pub high_water: Position,
+    /// Scanned source boundary; retained batches preserve consumer checkpoints.
     pub cursor: String,
     pub mode: Mode,
     pub layouts: Vec<Layout>,

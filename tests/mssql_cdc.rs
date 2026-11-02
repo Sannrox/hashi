@@ -314,6 +314,39 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
         "CDC update must carry the before image"
     );
     let end = last;
+    // An unrelated captured table advances the database LSN without producing
+    // any records for this connector. Its consumer checkpoint must survive it.
+    runtime.block_on(async {
+        let mut client = connect(port, Some(&database)).await;
+        exec(&mut client, "CREATE TABLE dbo.unrelated (id INT NOT NULL PRIMARY KEY)").await;
+        exec(&mut client, "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'unrelated', @role_name=NULL, @supports_net_changes=0").await;
+        exec(&mut client, "INSERT INTO dbo.unrelated (id) VALUES (1)").await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            try_exec(&mut client, "EXEC sys.sp_cdc_scan").await;
+            let rows = client.simple_query("SELECT COUNT(*) FROM cdc.dbo_unrelated_CT").await.unwrap().into_first_result().await.unwrap();
+            if rows.first().is_some_and(|row| count_i32(row) > 0) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "unrelated change was not captured");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+    assert!(
+        source
+            .read(resume(&end).0, resume(&end).1)
+            .unwrap()
+            .is_none()
+    );
+    drop(source);
+    let mut source =
+        MssqlConnector::connect(config("127.0.0.1", port, &database, path.clone())).unwrap();
+    assert!(
+        source
+            .read(resume(&end).0, resume(&end).1)
+            .unwrap()
+            .is_none()
+    );
     runtime.block_on(async {
         let mut client = connect(port, Some(&database)).await;
         exec(&mut client, "ALTER TABLE dbo.items ADD extra INT NOT NULL CONSTRAINT df_items_extra DEFAULT 0").await;
@@ -322,7 +355,7 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
             "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'items', @role_name=NULL, @capture_instance=N'dbo_items_v2', @supports_net_changes=0",
         )
         .await;
-        wait_capture_instance(&mut client, 2).await;
+        wait_capture_instance(&mut client, 3).await;
         wait_max_lsn(&mut client).await;
         exec(&mut client, "INSERT INTO dbo.items (id, value, extra) VALUES (5, N'five', 9)").await;
         try_exec(&mut client, "EXEC sys.sp_cdc_scan").await;
