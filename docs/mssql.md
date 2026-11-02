@@ -49,6 +49,10 @@ manifest owns received batches, not runtime delivery. Preserve both stores.
 Missing, regressed, or mismatched checkpoint/cursor state fails closed. A
 per-directory fencing lease fences concurrent spool writers.
 
+Empty polls advance scan progress in both CDC and change tracking while retaining
+the last emitted batch as consumer checkpoint evidence. Unrelated database
+activity therefore cannot invalidate the checkpoint, including after restart.
+
 ## Capture instances and schema changes
 
 After DDL, enable a new capture instance for the table. The connector follows the

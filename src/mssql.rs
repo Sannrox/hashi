@@ -414,10 +414,8 @@ impl MssqlConnector {
         if let Some(record) = self.pending.front() {
             return Ok(Some(record.clone()));
         }
-        if let Some(batch) = self.state.batch.take() {
-            state::save(&self.config.state_dir, &self.state)?;
-            std::fs::remove_file(state::batch_path(&self.config.state_dir, &batch))?;
-        }
+        // Keep the last emitted batch as checkpoint evidence while empty
+        // polls advance scan progress without emitting a consumer cursor.
         let runtime = self
             .runtime
             .take()
@@ -971,6 +969,8 @@ fn append(
     Ok(())
 }
 fn write_batch(config: &Config, state: &State, records: &VecDeque<Record>) -> Result<(), Error> {
+    let previous =
+        state::load(&config.state_dir, &state.fingerprint)?.and_then(|previous| previous.batch);
     let batch = state
         .batch
         .as_ref()
@@ -983,7 +983,11 @@ fn write_batch(config: &Config, state: &State, records: &VecDeque<Record>) -> Re
         ));
     }
     crate::checkpoint::atomic_write(&state::batch_path(&config.state_dir, batch), &text)?;
-    state::save(&config.state_dir, state)
+    state::save(&config.state_dir, state)?;
+    if let Some(previous) = previous.filter(|previous| previous.first != batch.first) {
+        std::fs::remove_file(state::batch_path(&config.state_dir, &previous))?;
+    }
+    Ok(())
 }
 fn marker(
     position: Position,
