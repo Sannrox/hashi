@@ -40,10 +40,14 @@ ROOT_PATH="$ROOT_PATH" bash scripts/release-package.sh --out "${tmp}/dist" --ski
 python3 -c "import json,sys; m=json.loads(open(sys.argv[1]).read()); assert m['schema']=='tenkai.family-release-manifest.v1'; assert m['component']=='hashi'; assert m['images']==[]; assert 'latest' not in json.dumps(m)" "${tmp}/dist/hashi-release.json"
 [[ ! -f "${tmp}/dist/published" ]] || fail "dry-run must not publish"
 
+version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+[[ -n "$version" ]] || fail "crate version not found in Cargo.toml"
 notes_out="${tmp}/notes"
 mkdir -p "$notes_out"
-bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --skip-github --tag v0.0.0 --git-sha "$(git rev-parse HEAD)"
+bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --skip-github --tag "v${version}" --git-sha "$(git rev-parse HEAD)"
 [[ -s "${notes_out}/RELEASE_NOTES.md" ]] || fail "tag dry-run did not write CHANGELOG notes"
-grep -F "Development crate version" "${notes_out}/RELEASE_NOTES.md" >/dev/null || fail "CHANGELOG notes missing expected 0.0.0 body"
+expected="$(python3 scripts/changelog-notes.py "$version" | head -n 1)"
+[[ -n "$expected" ]] || fail "CHANGELOG.md has no section for ${version}"
+grep -F -- "$expected" "${notes_out}/RELEASE_NOTES.md" >/dev/null || fail "CHANGELOG notes missing the ${version} section"
 
 printf 'validate-release passed\n'

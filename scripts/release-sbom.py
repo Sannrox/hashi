@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -38,13 +39,15 @@ def bom_from_metadata(meta: dict) -> dict:
             "purl": purl,
         }
         if pkg.get("license"):
-            component["licenses"] = [{"license": {"id": pkg["license"]}}]
+            component["licenses"] = [
+                {"expression": " OR ".join(part.strip() for part in pkg["license"].split("/"))}
+            ]
         if pid not in workspace:
             components.append(component)
     if root_pkg is None:
         raise SystemExit("cargo metadata did not include package hashi")
     root_purl = f"pkg:cargo/hashi@{root_pkg['version']}"
-    return {
+    bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "version": 1,
@@ -59,6 +62,11 @@ def bom_from_metadata(meta: dict) -> dict:
         },
         "components": sorted(components, key=lambda item: item["bom-ref"]),
     }
+
+    # Stable contents produce the same document identity on a rebuild.
+    document = json.dumps(bom, sort_keys=True, separators=(",", ":"))
+    bom["serialNumber"] = uuid.uuid5(uuid.NAMESPACE_URL, document).urn
+    return bom
 
 
 def self_test() -> None:
@@ -81,6 +89,9 @@ def self_test() -> None:
     }
     bom = bom_from_metadata(meta)
     assert bom["bomFormat"] == "CycloneDX"
+    assert bom["serialNumber"].startswith("urn:uuid:")
+    uuid.UUID(bom["serialNumber"].removeprefix("urn:uuid:"))
+    assert bom["components"][0]["licenses"] == [{"expression": "MIT OR Apache-2.0"}]
     assert bom["metadata"]["component"]["version"] == "0.0.0"
     assert bom["metadata"]["component"]["type"] == "application"
     assert bom["components"][0]["name"] == "libc"
