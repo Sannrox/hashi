@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-02
+
+First tagged release, prepared for signature and immutable release verification.
+The release includes a binary, an image archive, an SBOM and provenance.
+Verify the published release with `git verify-tag v0.1.0` and
+`gh release verify v0.1.0` before using it.
+
+### Fixed
+
+- Release SBOMs carry a valid document identity and license expressions.
+
+### Added
+
 - A soak harness (`hashi::soak`) loops produce and drain over a family's
   conformance driver for a configured duration, injects network drops, source
   restarts and credential rotations through per-family hooks, and writes a JSON
