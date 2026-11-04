@@ -102,6 +102,16 @@ fi
 grep -F 'git rev-list "$range"' scripts/release-package.sh >/dev/null \
   && grep -F 'range="${prev}..${GIT_SHA}"' scripts/release-package.sh >/dev/null \
   || fail "scripts/release-package.sh must take gate flags only from pull requests in the release commit's history"
+# The gate-flag lookup discards its errors, so a token that cannot read pull
+# requests would silently drop every gate flag.
+python3 - "$workflow" <<'PY_PR_READ' || fail "${workflow} must grant pull-requests: read to the job that runs release-package.sh"
+import re, sys
+body = open(sys.argv[1]).read().split("\njobs:\n", 1)[1]
+jobs = [b for b in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body) if "bash scripts/release-package.sh" in b]
+perms = [re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", b) for b in jobs]
+if not jobs or not all(p and re.search(r"(?m)^      pull-requests: read$", p.group(1)) for p in perms):
+    sys.exit(1)
+PY_PR_READ
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/hashi-release-package.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
