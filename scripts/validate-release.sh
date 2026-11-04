@@ -98,6 +98,11 @@ if grep -E '(:latest|tag: latest|tags: latest)' "$workflow" >/dev/null; then
   fail "${workflow} must not produce a latest image tag"
 fi
 
+# Gate flags come only from pull requests merged into the release commit.
+grep -F 'git rev-list "$range"' scripts/release-package.sh >/dev/null \
+  && grep -F 'range="${prev}..${GIT_SHA}"' scripts/release-package.sh >/dev/null \
+  || fail "scripts/release-package.sh must take gate flags only from pull requests in the release commit's history"
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/hashi-release-package.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "${tmp}/dist"
