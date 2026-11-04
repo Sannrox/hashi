@@ -8,7 +8,9 @@ ROOT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${ROOT_PATH}"
 
 git fetch --quiet --tags origin main
-since="${1:-$(git describe --tags --abbrev=0 origin/main 2>/dev/null || git rev-list --max-parents=0 origin/main)}"
+# Since the last final tag: an rc tag never starts the range, so the final
+# release's notes include what its release candidates shipped.
+since="${1:-$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' origin/main 2>/dev/null || git rev-list --max-parents=0 origin/main)}"
 echo "## [Unreleased] (since ${since})"
 echo
 git log --first-parent --format='- %s' "${since}..origin/main"

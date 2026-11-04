@@ -25,9 +25,10 @@ CLI, metrics, diagnostics, and the static image).
   `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
   `bash scripts/validate-release.sh`. CI also runs `cargo deny check licenses`,
   OPC UA/MySQL/MQTT container fixtures, and the offline image.
-- `scripts/validate-release.sh` checks the tag-triggered release path: signed
-  annotated tags, CHANGELOG notes, SBOM, and the family release manifest.
-  Pull requests and dry runs must not publish or attest.
+- `scripts/validate-release.sh` checks the release path (a `v*` tag push
+  dispatches `release.yml` from main for that tag): signed annotated tags,
+  CHANGELOG notes, SBOM, and the family release manifest. Pull requests and
+  dry runs must not publish or attest.
 
 GitHub Issues are the planning source of truth. Workflow Skills are shared;
 see `## Shared agent skills`. Never commit hostnames, home paths, secrets or
