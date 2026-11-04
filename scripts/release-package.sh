@@ -104,8 +104,11 @@ for path in sorted(p for p in out.iterdir() if p.is_file() and p.name != "SHA256
 
 LABEL_ARGS=()
 if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; then
-  prev="$(git tag --list 'v*' --sort=-version:refname)"
-  prev="$(awk -v cur="$TAG" '$0 != cur { print; exit }' <<<"$prev")"
+  # Gate flags cover every pull request since the nearest earlier final tag in
+  # the release commit's history. An rc tag never starts the range, or a final
+  # release would drop the pull requests merged before its rc.
+  prev="$(git tag --merged "$GIT_SHA" --list 'v*' --sort=-version:refname)"
+  prev="$(awk -v cur="$TAG" '$0 != cur && $0 !~ /-/ { print; exit }' <<<"$prev")"
   search=()
   if [[ -n "$prev" ]]; then
     since="$(git log -1 --format=%cs "$prev" 2>/dev/null || true)"
