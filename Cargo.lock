@@ -1075,6 +1075,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "url",
+ "x509-cert",
 ]
 
 [[package]]

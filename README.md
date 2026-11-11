@@ -94,7 +94,8 @@ Protocol sources are configured the same way, one `[[instance]]` per connector
 ([docs/run.md](docs/run.md)). Without `--once`, `hashi run` keeps passing until
 stopped; add `--listen <addr>` for `/healthz` and Prometheus `/metrics`, and
 `hashi diagnostics --config <file>` prints a support bundle without secrets,
-keys or payloads ([docs/operations.md](docs/operations.md)).
+keys or payloads. `hashi discover` and `hashi trust` review a source and OPC UA
+server certificates before capture ([docs/operations.md](docs/operations.md)).
 
 ## How it works
 

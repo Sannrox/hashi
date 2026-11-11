@@ -35,6 +35,11 @@ password; obtain both from the embedding application's credential custody.
 Plaintext requires `allow_insecure_lab`. Diagnostics never carry credentials or
 raw protocol errors.
 
+`hashi trust` does not apply: MQTT keeps CA-plus-hostname verification and has
+no rejected/trusted certificate store. `hashi discover` reports the configured
+topic filters and any kinds already seen, not a broker-wide browse, when
+`source.mqtt` is in the run file (#97).
+
 ## Routes and decoders
 
 Every route is subscribed at QoS 1; a broker that grants a lower QoS fails the

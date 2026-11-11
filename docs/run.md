@@ -7,7 +7,8 @@ hashi run --config hashi.toml --interval-ms 5000
 ```
 
 Add `--listen <addr>` for health and metrics, and use `hashi diagnostics
---config hashi.toml` for a support bundle; see [operations](operations.md).
+--config hashi.toml` for a support bundle. `hashi discover` and `hashi trust`
+review a source before capture; see [operations](operations.md).
 
 ## Config
 

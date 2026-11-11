@@ -284,8 +284,7 @@ fn lock_sink_dir(dir: &Path, ttl: Duration) -> Result<DropRelease, Error> {
 
 /// The connector id an instance checkpoints under.
 pub(crate) fn connector_id(instance: &InstanceConfig) -> String {
-    let SourceConfig::Fixture(_) = &instance.source;
-    format!("fixture-{}", instance.name)
+    format!("{}-{}", instance.source.family(), instance.name)
 }
 
 fn open(
@@ -294,7 +293,12 @@ fn open(
     ttl: Duration,
     instance: &InstanceConfig,
 ) -> Result<Running, Error> {
-    let SourceConfig::Fixture(fixture) = &instance.source;
+    let SourceConfig::Fixture(fixture) = &instance.source else {
+        return Err(Error::new(format!(
+            "hashi run does not start source kind {} yet",
+            instance.source.family()
+        )));
+    };
     let records = (1..=fixture.records)
         .map(|position| {
             record(

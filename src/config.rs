@@ -167,6 +167,19 @@ pub enum SourceConfig {
     /// The in-process fixture source: `records` programmed records, readable
     /// only while the credential file holds a value whose SHA-256 is listed.
     Fixture(FixtureSourceConfig),
+    /// OPC UA session used by `hashi discover` and `hashi trust`. `hashi run`
+    /// does not start this family yet.
+    #[serde(rename = "opcua")]
+    OpcUa(OpcUaSourceConfig),
+}
+
+impl SourceConfig {
+    pub fn family(&self) -> &'static str {
+        match self {
+            Self::Fixture(_) => "fixture",
+            Self::OpcUa(_) => "opcua",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -175,6 +188,31 @@ pub struct FixtureSourceConfig {
     pub records: u64,
     pub credential_file: PathBuf,
     pub accept_sha256: Vec<String>,
+}
+
+/// `source.opcua = { endpoint, application_uri, pki_dir, policy, ... }`.
+///
+/// Username authentication reads `credential_file` as user then password,
+/// one per line. X.509 authentication names certificate and key files.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpcUaSourceConfig {
+    pub endpoint: String,
+    pub application_uri: String,
+    pub pki_dir: PathBuf,
+    pub policy: String,
+    #[serde(default)]
+    pub allow_insecure_lab: bool,
+    #[serde(default)]
+    pub credential_file: Option<PathBuf>,
+    #[serde(default)]
+    pub user_certificate: Option<PathBuf>,
+    #[serde(default)]
+    pub user_private_key: Option<PathBuf>,
+    pub roots: Vec<String>,
+    pub max_nodes: u64,
+    pub timeout_ms: u64,
+    pub schema_version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -217,6 +255,18 @@ impl Config {
             match &mut instance.source {
                 SourceConfig::Fixture(fixture) => {
                     fixture.credential_file = base.join(&fixture.credential_file);
+                }
+                SourceConfig::OpcUa(opcua) => {
+                    opcua.pki_dir = base.join(&opcua.pki_dir);
+                    if let Some(path) = &mut opcua.credential_file {
+                        *path = base.join(&*path);
+                    }
+                    if let Some(path) = &mut opcua.user_certificate {
+                        *path = base.join(&*path);
+                    }
+                    if let Some(path) = &mut opcua.user_private_key {
+                        *path = base.join(&*path);
+                    }
                 }
             }
             match &mut instance.sink {
@@ -331,6 +381,70 @@ impl Config {
                         );
                     }
                 }
+                SourceConfig::OpcUa(opcua) => {
+                    if !opcua.endpoint.starts_with("opc.tcp://") {
+                        return invalid(
+                            field("source.opcua.endpoint"),
+                            "must start with opc.tcp://",
+                        );
+                    }
+                    if opcua.application_uri.trim().is_empty() {
+                        return invalid(field("source.opcua.application_uri"), "must not be empty");
+                    }
+                    if opcua.pki_dir.as_os_str().is_empty() {
+                        return invalid(field("source.opcua.pki_dir"), "must not be empty");
+                    }
+                    if !matches!(
+                        opcua.policy.as_str(),
+                        "basic256sha256" | "aes128sha256rsaoaep" | "aes256sha256rsapss" | "none"
+                    ) {
+                        return invalid(
+                            field("source.opcua.policy"),
+                            "use basic256sha256, aes128sha256rsaoaep, aes256sha256rsapss, or none",
+                        );
+                    }
+                    if opcua.policy == "none" && !opcua.allow_insecure_lab {
+                        return invalid(
+                            field("source.opcua.allow_insecure_lab"),
+                            "required for policy none",
+                        );
+                    }
+                    let user = opcua
+                        .credential_file
+                        .as_ref()
+                        .is_some_and(|path| !path.as_os_str().is_empty());
+                    let x509 = opcua
+                        .user_certificate
+                        .as_ref()
+                        .is_some_and(|path| !path.as_os_str().is_empty())
+                        && opcua
+                            .user_private_key
+                            .as_ref()
+                            .is_some_and(|path| !path.as_os_str().is_empty());
+                    if user == x509 {
+                        return invalid(
+                            field("source.opcua.credential_file"),
+                            "set credential_file or both user_certificate and user_private_key",
+                        );
+                    }
+                    if opcua.roots.is_empty()
+                        || opcua.roots.iter().any(|root| root.trim().is_empty())
+                    {
+                        return invalid(field("source.opcua.roots"), "list at least one node id");
+                    }
+                    if opcua.max_nodes == 0 || opcua.max_nodes > 10_000 {
+                        return invalid(
+                            field("source.opcua.max_nodes"),
+                            "must be between 1 and 10000",
+                        );
+                    }
+                    if opcua.timeout_ms == 0 {
+                        return invalid(field("source.opcua.timeout_ms"), "must be at least 1");
+                    }
+                    if opcua.schema_version == 0 {
+                        return invalid(field("source.opcua.schema_version"), "must be at least 1");
+                    }
+                }
             }
             match &instance.sink {
                 SinkConfig::Jsonl(jsonl) => {
@@ -401,8 +515,33 @@ mod tests {
             Some(Path::new("/etc/hashi/state"))
         );
         assert_eq!(parsed.lease.ttl(), std::time::Duration::from_millis(15_000));
-        let SourceConfig::Fixture(fixture) = &parsed.instances[0].source;
+        let SourceConfig::Fixture(fixture) = &parsed.instances[0].source else {
+            panic!("expected fixture");
+        };
         assert_eq!(fixture.credential_file, Path::new("/etc/hashi/secret"));
+    }
+
+    #[test]
+    fn an_opcua_source_resolves_pki_and_credential_paths() {
+        let instance = "name = \"line-1\"\n\
+             source.opcua = { endpoint = \"opc.tcp://127.0.0.1:4840/\", application_uri = \"urn:hashi:line-1\", \
+             pki_dir = \"pki\", policy = \"basic256sha256\", credential_file = \"secrets/opcua\", \
+             roots = [\"nsu=urn:hashi:fixture;s=Equipment\"], max_nodes = 100, timeout_ms = 3000, schema_version = 1 }\n\
+             sink.jsonl = { dir = \"out\" }";
+        let parsed = Config::parse(&config(instance), Path::new("/etc/hashi")).unwrap();
+        let SourceConfig::OpcUa(opcua) = &parsed.instances[0].source else {
+            panic!("expected opcua");
+        };
+        assert_eq!(opcua.pki_dir, Path::new("/etc/hashi/pki"));
+        assert_eq!(
+            opcua.credential_file.as_deref(),
+            Some(Path::new("/etc/hashi/secrets/opcua"))
+        );
+        let missing = instance.replace("credential_file = \"secrets/opcua\", ", "");
+        let error = Config::parse(&config(&missing), Path::new("."))
+            .unwrap_err()
+            .message;
+        assert!(error.contains("source.opcua.credential_file"), "{error}");
     }
 
     /// A buffer section resolves its directory like the sink's, defaults to
@@ -477,8 +616,8 @@ mod tests {
                 "mode",
             ),
             (
-                valid_instance().replace("source.fixture", "source.opcua"),
-                "opcua",
+                valid_instance().replace("source.fixture", "source.modbus"),
+                "modbus",
             ),
             (valid_instance().replace("name = \"line-1\"\n", ""), "name"),
         ];
