@@ -66,6 +66,32 @@ certificate even if another copy is trusted. Reconnect after approval.
 Hostname, application URI, validity, and key checks remain enabled. Connector
 diagnostics omit credentials and raw protocol errors.
 
+## Operator discover and trust
+
+```sh
+hashi discover --config hashi.toml [--instance line-1]
+hashi trust list --config hashi.toml [--instance line-1]
+hashi trust approve --config hashi.toml [--instance line-1] <sha256>
+hashi trust revoke --config hashi.toml [--instance line-1] <sha256>
+```
+
+`discover` connects with the configured identity and prints versioned JSON of
+the discovered kinds. It never trusts a certificate. An untrusted server fails
+with `error` `untrusted_certificate` and a summary of each cert in `rejected/`
+(subject, SHA-256, validity, issuer). No PEM or private key is printed.
+
+`trust list` prints the same summaries for `rejected/` and `trusted/`. `trust
+approve <sha256>` moves exactly that certificate from `rejected/` to `trusted/`
+under the computed file name, holding the PKI directory's exclusive lock. It
+refuses an unknown or ambiguous fingerprint, and refuses when a duplicate would
+stay in `rejected/`. `trust revoke` does the reverse. Both are idempotent. A
+crash between file operations leaves no certificate in both stores.
+
+The instance uses `source.opcua` in the run config file. `hashi run` does not
+start this family yet. Username credentials are two lines in `credential_file`
+(user, then password). X.509 user authentication names `user_certificate` and
+`user_private_key` instead.
+
 ## Discovery bounds
 
 Roots must be Object containers; variable roots fail explicitly. Expanded

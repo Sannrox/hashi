@@ -36,6 +36,78 @@ impl Policy {
             Self::None => SecurityPolicy::None,
         }
     }
+
+    pub(crate) fn from_config(name: &str) -> Result<Self, Error> {
+        match name {
+            "basic256sha256" => Ok(Self::Basic256Sha256),
+            "aes128sha256rsaoaep" => Ok(Self::Aes128Sha256RsaOaep),
+            "aes256sha256rsapss" => Ok(Self::Aes256Sha256RsaPss),
+            "none" => Ok(Self::None),
+            _ => Err(Error::new("invalid OPC UA policy")),
+        }
+    }
+}
+
+/// Parse a browse root: `i=85`, `ns=1;s=Equipment`, or `nsu=urn:hashi:fixture;s=Equipment`.
+/// The identifier is the first `s=` or `i=` after the namespace prefix; its
+/// value keeps embedded semicolons (`ns=1;s=Area;Temperature`).
+pub(crate) fn parse_root(raw: &str) -> Result<ExpandedNodeId, Error> {
+    let invalid = || Error::new(format!("invalid OPC UA root {raw}"));
+    let s_at = raw.find(";s=").map(|i| i + 1);
+    let i_at = raw.find(";i=").map(|i| i + 1);
+    let id_at = if raw.starts_with("s=") || raw.starts_with("i=") {
+        0
+    } else {
+        match (s_at, i_at) {
+            (Some(s), Some(i)) => s.min(i),
+            (Some(s), None) => s,
+            (None, Some(i)) => i,
+            (None, None) => return Err(invalid()),
+        }
+    };
+    let ns_part = if id_at == 0 { "" } else { &raw[..id_at - 1] };
+    let id_part = &raw[id_at..];
+    let mut namespace_uri = String::new();
+    let mut ns: u16 = 0;
+    if !ns_part.is_empty() {
+        if let Some(rest) = ns_part.strip_prefix("nsu=") {
+            if let Some((uri, index)) = rest.rsplit_once(";ns=") {
+                namespace_uri = uri.to_string();
+                ns = index.parse().map_err(|_| invalid())?;
+            } else {
+                namespace_uri = rest.to_string();
+            }
+        } else if let Some(rest) = ns_part.strip_prefix("ns=") {
+            if let Some((index, uri)) = rest.split_once(";nsu=") {
+                ns = index.parse().map_err(|_| invalid())?;
+                namespace_uri = uri.to_string();
+            } else {
+                ns = rest.parse().map_err(|_| invalid())?;
+            }
+        } else {
+            return Err(invalid());
+        }
+    }
+    let node_id = if let Some(value) = id_part.strip_prefix("s=") {
+        if value.is_empty() {
+            return Err(invalid());
+        }
+        NodeId::new(ns, value)
+    } else if let Some(value) = id_part.strip_prefix("i=") {
+        let numeric: u32 = value.parse().map_err(|_| invalid())?;
+        NodeId::new(ns, numeric)
+    } else {
+        return Err(invalid());
+    };
+    Ok(ExpandedNodeId {
+        node_id,
+        namespace_uri: if namespace_uri.is_empty() {
+            Default::default()
+        } else {
+            namespace_uri.into()
+        },
+        server_index: 0,
+    })
 }
 /// Never format credential contents into diagnostics.
 #[derive(Clone)]
@@ -152,6 +224,7 @@ impl OpcUaConnector {
             crate::lease::hold_ttl(),
             "OPC UA PKI store is already owned",
         )?;
+        crate::operator::prepare_opcua_pki(&config.pki_dir)?;
         let token = match config.authentication {
             Authentication::UserName { user, password } => {
                 IdentityToken::UserName(user, password.into())
@@ -626,7 +699,27 @@ impl Drop for OpcUaConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_url;
+    use super::{endpoint_url, parse_root};
+    use ::opcua::types::Identifier;
+    #[test]
+    fn parse_root_keeps_semicolons_inside_a_string_identifier() {
+        let root = parse_root("ns=1;s=Area;Temperature").unwrap();
+        assert_eq!(root.node_id.namespace, 1);
+        assert_eq!(
+            root.node_id.identifier,
+            Identifier::String("Area;Temperature".into())
+        );
+        let nsu = parse_root("nsu=urn:hashi:fixture;s=Equipment").unwrap();
+        assert_eq!(nsu.namespace_uri.as_ref(), "urn:hashi:fixture");
+        assert_eq!(
+            nsu.node_id.identifier,
+            Identifier::String("Equipment".into())
+        );
+        let numeric = parse_root("i=85").unwrap();
+        assert_eq!(numeric.node_id.identifier, Identifier::Numeric(85));
+        assert!(parse_root("ns=1;s=").is_err());
+        assert!(parse_root("not-a-node").is_err());
+    }
     #[test]
     fn endpoint_scope_keeps_explicit_ports_and_rejects_embedded_credentials() {
         let configured = endpoint_url("opc.tcp://127.0.0.1:4841/").unwrap();

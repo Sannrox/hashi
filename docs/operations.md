@@ -77,3 +77,18 @@ docker run --network none -v "$PWD/site:/work" hashi:local run --config /work/ha
 The binary opens no connections besides configured sources and sinks and the
 optional `--listen` socket. `scripts/test-offline-image.sh` proves this by
 running a fixture config in the image with `--network none`.
+
+## Discover and trust
+
+```sh
+hashi discover --config hashi.toml [--instance line-1]
+hashi trust list --config hashi.toml [--instance line-1]
+hashi trust approve --config hashi.toml [--instance line-1] <sha256>
+hashi trust revoke --config hashi.toml [--instance line-1] <sha256>
+```
+
+`discover` prints versioned JSON of the kinds the instance's source offers.
+It never trusts a certificate. `--instance` is required when the file declares
+more than one instance. OPC UA trust review is documented in
+[opcua.md](opcua.md). MQTT has no trust store; discover of configured topic
+filters follows `source.mqtt` in the run file ([mqtt.md](mqtt.md), #97).

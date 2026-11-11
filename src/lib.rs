@@ -30,6 +30,7 @@ pub mod mysql;
 pub mod observe;
 #[cfg(feature = "opcua")]
 pub mod opcua;
+pub mod operator;
 pub mod outbox;
 #[cfg(feature = "parquet")]
 pub mod parquet;
@@ -55,6 +56,10 @@ pub use fake::FakeSource;
 pub use jsonl::JsonLinesSink;
 pub use kafka::KafkaCompatibleSink;
 pub use lease::InstanceLease;
+pub use operator::{
+    DiscoverDocument, DiscoverOutcome, TrustDocument, UntrustedDocument, discover, trust_approve,
+    trust_list, trust_revoke,
+};
 #[cfg(feature = "parquet")]
 pub use parquet::ParquetSink;
 pub use platform::{CapturePeer, PLATFORM_SINK_PROTOCOL, PlatformPeer, PlatformSdkSink};
