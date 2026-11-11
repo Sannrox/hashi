@@ -109,6 +109,18 @@ pub(crate) fn parse_root(raw: &str) -> Result<ExpandedNodeId, Error> {
         server_index: 0,
     })
 }
+
+/// Subscription monitors `NodeId`s. `nsu=` is resolved against the live
+/// namespace array at discover; run config must name a numeric index.
+pub(crate) fn subscription_node(raw: &str) -> Result<NodeId, Error> {
+    let expanded = parse_root(raw)?;
+    if !expanded.namespace_uri.is_null() {
+        return Err(Error::new(
+            "OPC UA subscription node needs a numeric namespace (ns=); nsu= is resolved at discover",
+        ));
+    }
+    Ok(expanded.node_id)
+}
 /// Never format credential contents into diagnostics.
 #[derive(Clone)]
 pub enum Authentication {
@@ -699,7 +711,7 @@ impl Drop for OpcUaConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_url, parse_root};
+    use super::{endpoint_url, parse_root, subscription_node};
     use ::opcua::types::Identifier;
     #[test]
     fn parse_root_keeps_semicolons_inside_a_string_identifier() {
@@ -719,6 +731,19 @@ mod tests {
         assert_eq!(numeric.node_id.identifier, Identifier::Numeric(85));
         assert!(parse_root("ns=1;s=").is_err());
         assert!(parse_root("not-a-node").is_err());
+        assert_eq!(
+            subscription_node("ns=1;s=Area;Temperature")
+                .unwrap()
+                .namespace,
+            1
+        );
+        assert!(subscription_node("i=85").is_ok());
+        assert!(
+            subscription_node("nsu=urn:hashi:fixture;s=Equipment")
+                .unwrap_err()
+                .message
+                .contains("numeric namespace")
+        );
     }
     #[test]
     fn endpoint_scope_keeps_explicit_ports_and_rejects_embedded_credentials() {

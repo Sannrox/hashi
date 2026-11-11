@@ -19,3 +19,25 @@ pub trait Connector {
         source_cursor: Option<&str>,
     ) -> Result<Option<Record>, Error>;
 }
+
+impl<T: Connector + ?Sized> Connector for Box<T> {
+    fn id(&self) -> &str {
+        (**self).id()
+    }
+
+    fn check(&self) -> Result<CheckReport, Error> {
+        (**self).check()
+    }
+
+    fn discover(&self) -> Result<Vec<DiscoveredKind>, Error> {
+        (**self).discover()
+    }
+
+    fn read(
+        &mut self,
+        from: Option<Position>,
+        source_cursor: Option<&str>,
+    ) -> Result<Option<Record>, Error> {
+        (**self).read(from, source_cursor)
+    }
+}

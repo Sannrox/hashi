@@ -286,29 +286,22 @@ impl Reader {
         if let Some(record) = self.pending.front() {
             return Ok(Some(record.clone()));
         }
-        loop {
-            let collected = if self.history.is_some() {
-                tokio::time::timeout(
-                    timeout.max(self.publish_timeout),
-                    self.collect(session, timeout),
-                )
-                .await
-                .map_err(|_| Error::new("OPC UA history recovery timed out"))
-                .and_then(|result| result)
-            } else {
-                self.collect(session, timeout).await
-            };
-            if let Err(error) = collected {
-                self.failed = true;
-                return Err(error);
-            }
-            if let Some(record) = self.pending.front() {
-                return Ok(Some(record.clone()));
-            }
-            if self.history.is_some() {
-                return Ok(None);
-            }
+        let collected = if self.history.is_some() {
+            tokio::time::timeout(
+                timeout.max(self.publish_timeout),
+                self.collect(session, timeout),
+            )
+            .await
+            .map_err(|_| Error::new("OPC UA history recovery timed out"))
+            .and_then(|result| result)
+        } else {
+            self.collect(session, timeout).await
+        };
+        if let Err(error) = collected {
+            self.failed = true;
+            return Err(error);
         }
+        Ok(self.pending.front().cloned())
     }
 
     async fn fill_history(&mut self, session: &Session) -> Result<(), Error> {

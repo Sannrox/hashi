@@ -95,3 +95,29 @@ fn discover_requires_instance_when_the_config_has_several() {
     assert!(stdout.contains("\"instance\": \"line-2\""), "{stdout}");
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[cfg(feature = "mysql")]
+#[test]
+fn discover_lists_mysql_tables_from_config_without_connecting() {
+    let dir = work_dir();
+    fs::write(dir.join("secrets/mysql"), "password").unwrap();
+    let path = dir.join("hashi.toml");
+    fs::write(
+        &path,
+        "checkpoint_dir = \"state\"\n\n[[instance]]\nname = \"line-1\"\n\
+         source.mysql = { url = \"mysql://user@127.0.0.1:1\", credential_file = \"secrets/mysql\", \
+         tables = [{ database = \"plant\", table = \"items\" }], state_dir = \"mysql\", \
+         chunk_rows = 100, max_batch_bytes = 1048576, server_id = 1024, schema_version = 1, timeout_ms = 20 }\n\
+         sink.jsonl = { dir = \"out\" }\n",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = hashi(&["discover", "--config", path.to_str().unwrap()]);
+    assert!(ok, "{stderr}{stdout}");
+    assert!(stdout.contains("\"source\": \"mysql\""), "{stdout}");
+    assert!(stdout.contains("\"kind\": \"plant.items\""), "{stdout}");
+    assert!(
+        stdout.contains("\"kind\": \"__mysql_transaction\""),
+        "{stdout}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

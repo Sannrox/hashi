@@ -170,7 +170,9 @@ fn two_instances_cannot_write_one_sink_directory_through_an_alias() {
     let mut alias = config.clone();
     alias.checkpoint_dir = dir.join("state-2");
     alias.instances[0].name = "line-2".into();
-    let hashi::config::SinkConfig::Jsonl(jsonl) = &mut alias.instances[0].sink;
+    let hashi::config::SinkConfig::Jsonl(jsonl) = &mut alias.instances[0].sink else {
+        panic!("expected jsonl");
+    };
     jsonl.dir = dir.join("secrets").join("..").join("out");
     let mut second = Service::from_config(&alias).unwrap();
     let refused = second.pass()[0].1.clone().unwrap_err().message;
@@ -232,4 +234,124 @@ fn buffered_records_drain_while_the_source_credential_is_missing() {
     assert_eq!(passes[0].buffer.unwrap().records, 0);
     drop(service);
     assert_eq!(delivered(&dir), ["r1", "r2"]);
+}
+
+#[test]
+fn parquet_and_kafka_sinks_are_started_from_the_run_config() {
+    let dir = work_dir();
+    fs::write(dir.join("secrets/line-1"), NEW).unwrap();
+    #[cfg(feature = "parquet")]
+    {
+        let parquet = dir.join("hashi-parquet.toml");
+        fs::write(
+            &parquet,
+            format!(
+                "checkpoint_dir = \"state-parquet\"\n\n[[instance]]\nname = \"line-1\"\n\
+                 source.fixture = {{ records = 2, credential_file = \"secrets/line-1\", accept_sha256 = [\"{}\"] }}\n\
+                 sink.parquet = {{ dir = \"parquet\" }}\n",
+                digest(NEW)
+            ),
+        )
+        .unwrap();
+        let (ok, logs) = hashi_run(&parquet);
+        assert!(ok, "{logs}");
+        let rows = hashi::ParquetSink::open(dir.join("parquet"))
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(record, _)| record.key.as_str())
+                .collect::<Vec<_>>(),
+            ["r1", "r2"]
+        );
+    }
+
+    let kafka = dir.join("hashi-kafka.toml");
+    fs::write(
+        &kafka,
+        format!(
+            "checkpoint_dir = \"state-kafka\"\n\n[[instance]]\nname = \"line-1\"\n\
+             source.fixture = {{ records = 2, credential_file = \"secrets/line-1\", accept_sha256 = [\"{}\"] }}\n\
+             sink.kafka = {{ dir = \"kafka\", topic = \"line-1\" }}\n",
+            digest(NEW)
+        ),
+    )
+    .unwrap();
+    let (ok, logs) = hashi_run(&kafka);
+    assert!(ok, "{logs}");
+    let rows = hashi::KafkaCompatibleSink::open(dir.join("kafka"), "line-1")
+        .unwrap()
+        .replay()
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|(record, _)| record.key.as_str())
+            .collect::<Vec<_>>(),
+        ["r1", "r2"]
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(not(feature = "mqtt"))]
+#[test]
+fn a_compiled_out_source_kind_is_refused_by_name() {
+    let dir = work_dir();
+    let path = dir.join("hashi.toml");
+    fs::write(
+        &path,
+        "checkpoint_dir = \"state\"\n\n[[instance]]\nname = \"line-1\"\n\
+         source.mqtt = { host = \"broker\", port = 1883, protocol = \"v5\", client_id = \"line-1\", \
+         allow_insecure_lab = true, timeout_ms = 1000, max_packet_bytes = 1024, schema_version = 1, \
+         routes = [{ filter = \"plant/#\", kind = \"reading\", decoder = \"json\" }] }\n\
+         sink.jsonl = { dir = \"out\" }\n",
+    )
+    .unwrap();
+    let (ok, logs) = hashi_run(&path);
+    assert!(!ok);
+    assert!(logs.contains("mqtt"), "{logs}");
+    assert!(logs.contains("feature"), "{logs}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(not(feature = "parquet"))]
+#[test]
+fn a_compiled_out_buffered_sink_is_refused_by_name() {
+    let dir = work_dir();
+    fs::write(dir.join("secrets/line-1"), NEW).unwrap();
+    let path = dir.join("hashi.toml");
+    fs::write(
+        &path,
+        format!(
+            "checkpoint_dir = \"state\"\n\n[[instance]]\nname = \"line-1\"\n\
+             source.fixture = {{ records = 1, credential_file = \"secrets/line-1\", accept_sha256 = [\"{}\"] }}\n\
+             sink.parquet = {{ dir = \"out\" }}\n\
+             buffer = {{ dir = \"buffer\", max_bytes = 65536 }}\n",
+            digest(NEW)
+        ),
+    )
+    .unwrap();
+    let (ok, logs) = hashi_run(&path);
+    assert!(!ok);
+    assert!(logs.contains("parquet"), "{logs}");
+    assert!(logs.contains("feature"), "{logs}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn diagnostics_reports_the_configured_source_and_sink_kinds() {
+    let dir = work_dir();
+    fs::write(dir.join("secrets/line-1"), NEW).unwrap();
+    let config = write_config(&dir, 1, NEW);
+    assert!(hashi_run(&config).0);
+    let output = Command::new(env!("CARGO_BIN_EXE_hashi"))
+        .args(["diagnostics", "--config", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let bundle = String::from_utf8(output.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&bundle).unwrap();
+    assert_eq!(json["instances"][0]["source"], "fixture");
+    assert_eq!(json["instances"][0]["sink"], "jsonl");
+    fs::remove_dir_all(&dir).unwrap();
 }

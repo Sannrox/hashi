@@ -25,6 +25,8 @@ checkpoint_dir = "state"
 name = "line-1"
 source.fixture = { records = 3, credential_file = "secrets/line-1", accept_sha256 = ["<hex>"] }
 sink.jsonl = { dir = "out/line-1" }
+# sink.parquet = { dir = "out/line-1" }
+# sink.kafka = { dir = "out/line-1", topic = "line-1" }
 ```
 
 - `version` (optional): config schema version, `1`. Any other value is
@@ -42,14 +44,20 @@ sink.jsonl = { dir = "out/line-1" }
   Hashi has no hard PostgreSQL dependency; a single-box site keeps the file
   backend.
 - `instance.name`: `A-Z a-z 0-9 - _`, unique.
-- `instance.source.<family>`: one section per source family. This release
-  ships `fixture`, the in-process source used to prove the runtime; protocol
-  families add their own sections.
-- `instance.sink.jsonl.dir`: the JSON Lines sink directory. Instances may not
-  share one; a running instance also holds a fencing lease in it, so a second
-  writer that reaches it by another path is refused until the first stops or
-  its TTL expires. Every sink write carries the instance fencing token, so a
-  paused holder is refused after takeover.
+- `instance.source.<family>`: one section per source family. Implemented
+  families: `fixture`, `opcua`, `mqtt`, `modbus`, `mysql`, `mssql`, and
+  `historian` (nested `adapter.opcua`, `adapter.mysql`, or `adapter.mssql`).
+  A family compiled out of the binary is refused by name. Credentials stay
+  file paths; `credential_file` is user then password on two lines for OPC UA
+  and MQTT, the password only for MySQL and SQL Server. OPC UA `hashi run`
+  also needs `nodes` and `state_dir` to subscribe; `nodes` use a numeric
+  namespace (`ns=` or `i=`), and `nsu=` is resolved at `hashi discover`.
+- `instance.sink.<family>`: `jsonl`, `parquet`, or `kafka` (file-backed topic
+  log with `dir` and `topic`). Instances may not share a sink directory; a
+  running instance also holds a fencing lease in it, so a second writer that
+  reaches it by another path is refused until the first stops or its TTL
+  expires. Every sink write carries the instance fencing token, so a paused
+  holder is refused after takeover.
 - `instance.buffer` (optional): a store-and-forward disk buffer between the
   source and the sink, for sites whose uplink drops. See
   [Store-and-forward buffer](#store-and-forward-buffer).

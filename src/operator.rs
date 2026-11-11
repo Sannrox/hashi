@@ -9,10 +9,26 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::config::{Config, InstanceConfig, SourceConfig};
+#[cfg(feature = "modbus")]
+use crate::config::ModbusSourceConfig;
+#[cfg(feature = "mqtt")]
+use crate::config::MqttSourceConfig;
+#[cfg(feature = "mssql")]
+use crate::config::MssqlSourceConfig;
+#[cfg(feature = "mysql")]
+use crate::config::MysqlSourceConfig;
+use crate::config::{Config, HistorianAdapterConfig, InstanceConfig, SourceConfig};
 use crate::contract::DiscoveredKind;
 use crate::credential::FileCredential;
 use crate::fake::{FakeSource, record};
+#[cfg(any(
+    feature = "mqtt",
+    feature = "modbus",
+    feature = "mysql",
+    feature = "mssql"
+))]
+use crate::schema::FieldType;
+use crate::schema::Schema;
 use crate::{Connector, Error};
 
 /// JSON schema for discover and trust documents.
@@ -119,7 +135,192 @@ pub fn discover(config: &Config, instance: Option<&str>) -> Result<DiscoverOutco
                 Err(Error::new("hashi discover needs the opcua feature"))
             }
         }
+        SourceConfig::Mqtt(mqtt) => {
+            #[cfg(feature = "mqtt")]
+            {
+                document(instance, "mqtt", mqtt_discovered(mqtt))
+            }
+            #[cfg(not(feature = "mqtt"))]
+            {
+                let _ = mqtt;
+                Err(Error::new("hashi discover needs the mqtt feature"))
+            }
+        }
+        SourceConfig::Modbus(modbus) => {
+            #[cfg(feature = "modbus")]
+            {
+                document(instance, "modbus", modbus_discovered(modbus))
+            }
+            #[cfg(not(feature = "modbus"))]
+            {
+                let _ = modbus;
+                Err(Error::new("hashi discover needs the modbus feature"))
+            }
+        }
+        SourceConfig::Mysql(mysql) => {
+            #[cfg(feature = "mysql")]
+            {
+                document(instance, "mysql", mysql_discovered(mysql))
+            }
+            #[cfg(not(feature = "mysql"))]
+            {
+                let _ = mysql;
+                Err(Error::new("hashi discover needs the mysql feature"))
+            }
+        }
+        SourceConfig::Mssql(mssql) => {
+            #[cfg(feature = "mssql")]
+            {
+                document(instance, "mssql", mssql_discovered(mssql))
+            }
+            #[cfg(not(feature = "mssql"))]
+            {
+                let _ = mssql;
+                Err(Error::new("hashi discover needs the mssql feature"))
+            }
+        }
+        SourceConfig::Historian(_) => document(instance, "historian", historian_discovered()),
     }
+}
+
+#[cfg(feature = "mqtt")]
+fn mqtt_discovered(mqtt: &MqttSourceConfig) -> Vec<DiscoveredKind> {
+    let mut kinds: std::collections::BTreeMap<&str, (&str, Vec<&str>)> =
+        std::collections::BTreeMap::new();
+    for route in &mqtt.routes {
+        let entry = kinds
+            .entry(route.kind.as_str())
+            .or_insert((route.decoder.as_str(), Vec::new()));
+        entry.1.push(route.filter.as_str());
+    }
+    kinds
+        .into_iter()
+        .map(|(kind, (decoder, filters))| DiscoveredKind {
+            kind: kind.to_string(),
+            schema: Schema {
+                version: mqtt.schema_version,
+                key_fields: vec![],
+                fields: std::collections::BTreeMap::from([(
+                    "payload".into(),
+                    match decoder {
+                        "raw" => FieldType::Bytes,
+                        _ => FieldType::Text,
+                    },
+                )]),
+            },
+            metadata: std::collections::BTreeMap::from([(
+                "topic_filters".into(),
+                filters.join(" "),
+            )]),
+        })
+        .collect()
+}
+
+#[cfg(feature = "modbus")]
+fn modbus_discovered(modbus: &ModbusSourceConfig) -> Vec<DiscoveredKind> {
+    modbus
+        .devices
+        .iter()
+        .flat_map(|device| &device.groups)
+        .map(|group| DiscoveredKind {
+            kind: group.kind.clone(),
+            schema: Schema {
+                version: group.schema_version,
+                key_fields: vec![],
+                fields: group
+                    .registers
+                    .iter()
+                    .flat_map(|register| {
+                        let mut fields = vec![(
+                            register.name.clone(),
+                            if register.value_type == "bool" {
+                                FieldType::Bool
+                            } else {
+                                FieldType::F64
+                            },
+                        )];
+                        if register.unit.is_some() {
+                            fields.push((format!("{}_unit", register.name), FieldType::Text));
+                        }
+                        fields
+                    })
+                    .collect(),
+            },
+            metadata: Default::default(),
+        })
+        .collect()
+}
+
+#[cfg(feature = "mysql")]
+fn mysql_discovered(mysql: &MysqlSourceConfig) -> Vec<DiscoveredKind> {
+    let mut kinds: Vec<_> = mysql
+        .tables
+        .iter()
+        .map(|table| {
+            sql_table_kind(
+                format!("{}.{}", table.database, table.table),
+                mysql.schema_version,
+                &table.key,
+            )
+        })
+        .collect();
+    kinds.push(sql_transaction_kind("__mysql_transaction"));
+    kinds
+}
+
+#[cfg(feature = "mssql")]
+fn mssql_discovered(mssql: &MssqlSourceConfig) -> Vec<DiscoveredKind> {
+    let mut kinds: Vec<_> = mssql
+        .tables
+        .iter()
+        .map(|table| {
+            sql_table_kind(
+                format!("{}.{}", table.schema, table.table),
+                mssql.schema_version,
+                &table.key,
+            )
+        })
+        .collect();
+    kinds.push(sql_transaction_kind("__mssql_transaction"));
+    kinds
+}
+
+#[cfg(any(feature = "mysql", feature = "mssql"))]
+fn sql_table_kind(kind: String, version: u64, keys: &[String]) -> DiscoveredKind {
+    let mut fields = std::collections::BTreeMap::from([("payload".into(), FieldType::Text)]);
+    for key in keys {
+        fields.insert(key.clone(), FieldType::Text);
+    }
+    DiscoveredKind {
+        kind,
+        schema: Schema {
+            version,
+            key_fields: keys.to_vec(),
+            fields,
+        },
+        metadata: Default::default(),
+    }
+}
+
+#[cfg(any(feature = "mysql", feature = "mssql"))]
+fn sql_transaction_kind(kind: &str) -> DiscoveredKind {
+    DiscoveredKind {
+        kind: kind.into(),
+        schema: Schema {
+            version: 1,
+            key_fields: vec![],
+            fields: std::collections::BTreeMap::from([("transaction_id".into(), FieldType::Text)]),
+        },
+        metadata: Default::default(),
+    }
+}
+
+fn historian_discovered() -> Vec<DiscoveredKind> {
+    vec![DiscoveredKind {
+        kind: crate::historian::SAMPLE_KIND.into(),
+        schema: Schema::text(),
+        metadata: Default::default(),
+    }]
 }
 
 fn document(
@@ -207,7 +408,14 @@ pub fn trust_revoke(
 fn pki_dir(instance: &InstanceConfig) -> Result<&Path, Error> {
     match &instance.source {
         SourceConfig::OpcUa(opcua) => Ok(&opcua.pki_dir),
-        SourceConfig::Fixture(_) => Err(Error::new("trust does not apply to fixture")),
+        SourceConfig::Historian(historian) => match &historian.adapter {
+            HistorianAdapterConfig::OpcUa(opcua) => Ok(&opcua.pki_dir),
+            _ => Err(Error::new("trust does not apply to this historian adapter")),
+        },
+        other => Err(Error::new(format!(
+            "trust does not apply to {}",
+            other.family()
+        ))),
     }
 }
 
@@ -220,29 +428,12 @@ pub(crate) fn prepare_opcua_pki(pki: &Path) -> Result<(), Error> {
 
 #[cfg(feature = "opcua")]
 impl crate::config::OpcUaSourceConfig {
-    fn connector_config(&self, id: &str) -> Result<crate::opcua::Config, Error> {
+    pub(crate) fn connector_config(&self, id: &str) -> Result<crate::opcua::Config, Error> {
         let authentication = if let Some(path) = &self.credential_file {
-            let secret = std::fs::read_to_string(path).map_err(|_| {
-                Error::new(format!("credential file {} is unreadable", path.display()))
-            })?;
-            if secret.trim().is_empty() {
-                return Err(Error::new(format!(
-                    "credential file {} is empty",
-                    path.display()
-                )));
-            }
-            let mut lines = secret.lines();
-            let user = lines.next().unwrap_or("");
-            let password = lines.next().unwrap_or("");
-            if user.is_empty() || password.is_empty() || lines.next().is_some() {
-                return Err(Error::new(format!(
-                    "credential file {} must contain user and password on two lines",
-                    path.display()
-                )));
-            }
+            let (user, password) = FileCredential::new(path).user_password()?;
             crate::opcua::Authentication::UserName {
-                user: user.to_string(),
-                password: password.to_string(),
+                user: user.expose().to_string(),
+                password: password.expose().to_string(),
             }
         } else {
             crate::opcua::Authentication::X509 {
@@ -272,6 +463,31 @@ impl crate::config::OpcUaSourceConfig {
             max_nodes: usize::try_from(self.max_nodes).unwrap_or(usize::MAX),
             timeout: std::time::Duration::from_millis(self.timeout_ms),
             schema_version: self.schema_version,
+        })
+    }
+
+    pub(crate) fn subscription_config(&self) -> Result<crate::opcua::SubscriptionConfig, Error> {
+        let state_dir = self
+            .state_dir
+            .clone()
+            .ok_or_else(|| Error::new("OPC UA subscription state_dir is required"))?;
+        Ok(crate::opcua::SubscriptionConfig {
+            nodes: self
+                .nodes
+                .iter()
+                .map(|node| crate::opcua::subscription_node(node))
+                .collect::<Result<Vec<_>, Error>>()?,
+            publishing_interval: std::time::Duration::from_millis(
+                self.publishing_interval_ms.unwrap_or(1000),
+            ),
+            sampling_interval: std::time::Duration::from_millis(
+                self.sampling_interval_ms.unwrap_or(500),
+            ),
+            deadband: self.deadband,
+            queue_size: self.queue_size.unwrap_or(10),
+            state_dir,
+            max_pending_bytes: usize::try_from(self.max_pending_bytes.unwrap_or(16 * 1024 * 1024))
+                .unwrap_or(usize::MAX),
         })
     }
 }
