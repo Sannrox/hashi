@@ -8,17 +8,17 @@
 
 [Try it](#try-it) · [How it works](#how-it-works) · [Vision](VISION.md) · [Operations](docs/operations.md) · [Decisions](docs/decisions/README.md)
 
-> Status: v0.1 MVP families are in tree. SQL Server CDC and SQL Server
-> historian mapping are in tree; Oracle CDC stays on the v0.2 roadmap. See
-> [VISION.md](VISION.md).
+> Status: v0.1 MVP families are in tree. SQL Server CDC, SQL Server
+> historian mapping, and PostgreSQL CDC are in tree; Oracle CDC stays on
+> the v0.2 roadmap. See [VISION.md](VISION.md).
 
 Hashi (橋, bridge) is a standalone connector engine written in Rust. It reads
 industrial sources — OPC UA (browse, subscriptions, historical access), MQTT
 3.1.1 and 5 (including Sparkplug B payloads), Modbus TCP and RTU, and process
 historians — and operational databases by change data capture — MySQL snapshot
-and GTID capture, and SQL Server snapshot with LSN change data capture (change
-tracking fallback); Oracle and PostgreSQL follow the same contract on the
-roadmap — and delivers typed, keyed records to sinks the rest of the stack
+and GTID capture, SQL Server snapshot with LSN change data capture (change
+tracking fallback), and PostgreSQL snapshot with logical-replication slots;
+Oracle follows the same contract on the roadmap — and delivers typed, keyed records to sinks the rest of the stack
 consumes.
 
 - **One connector contract.** Every source family implements check, discover
@@ -102,7 +102,7 @@ server certificates before capture ([docs/operations.md](docs/operations.md)).
 ```mermaid
 flowchart LR
   I[OPC UA / MQTT / Modbus / historians] --> C
-  D[MySQL / SQL Server change data capture] --> C
+  D[MySQL / SQL Server / PostgreSQL change data capture] --> C
   C[connector: check, discover, read] --> R[run loop]
   R --> S[sink: JSON Lines, Parquet, topic log, platform adapter]
   S -- ack --> R
@@ -123,8 +123,8 @@ Lines, partitioned Apache Parquet, a file-backed Kafka-compatible topic log
 (idempotent producer, key = record key; no live broker in `cargo test`), and a
 versioned platform source-adapter protocol. A store-and-forward disk buffer
 keeps reading while the uplink is down. Modbus polling, optional OPC UA secure
-discovery/subscriptions, optional MySQL snapshot/GTID capture, and optional
-SQL Server capture are implemented. Other source families follow the roadmap.
+discovery/subscriptions, optional MySQL snapshot/GTID capture, optional
+SQL Server capture, and optional PostgreSQL logical replication are implemented. Other source families follow the roadmap.
 Tests use fixture sources and isolated simulators.
 
 ## Documentation
@@ -138,6 +138,7 @@ Tests use fixture sources and isolated simulators.
 - [OPC UA sessions, discovery, and subscriptions](docs/opcua.md)
 - [MySQL snapshot and change capture](docs/mysql.md)
 - [SQL Server snapshot and change capture](docs/mssql.md)
+- [PostgreSQL snapshot and change capture](docs/postgres.md)
 - [MQTT subscriptions](docs/mqtt.md)
 - [Historian backfill and live tail](docs/historian.md)
 - [Outbox one-shot run mode](docs/outbox.md)
@@ -153,7 +154,7 @@ make test-integration   # optional protocol features and simulator fixtures
 ```
 
 Default Cargo features are `parquet` and `modbus`. `mqtt`, `mysql`, `mssql`,
-`opcua`, and `opcua-simulator` stay off until selected. `cargo check
+`postgres`, `opcua`, and `opcua-simulator` stay off until selected. `cargo check
 --no-default-features` builds the runtime without Parquet or serialport. The
 crate graph stays one package
 ([docs/decisions/0001-single-package-crate-graph.md](docs/decisions/0001-single-package-crate-graph.md)).

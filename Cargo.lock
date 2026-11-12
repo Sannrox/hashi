@@ -1057,12 +1057,14 @@ version = "0.1.0"
 dependencies = [
  "async-opcua",
  "async-trait",
+ "bytes",
  "chrono",
  "fencing-lease",
  "futures-util",
  "mysql_async",
  "mysql_common",
  "parquet",
+ "postgres-protocol",
  "prost",
  "rumqttc",
  "rustls",
@@ -1072,9 +1074,13 @@ dependencies = [
  "sha2 0.10.9",
  "tiberius",
  "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+ "tokio-rustls",
  "tokio-util",
  "toml",
  "url",
+ "webpki-roots 0.26.11",
  "x509-cert",
 ]
 
@@ -2645,6 +2651,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-postgres-rustls"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27d684bad428a0f2481f42241f821db42c54e2dc81d8c00db8536c506b0a0144"
+dependencies = [
+ "const-oid 0.9.6",
+ "ring",
+ "rustls",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "x509-cert",
 ]
 
 [[package]]

@@ -17,6 +17,8 @@ use crate::config::MqttSourceConfig;
 use crate::config::MssqlSourceConfig;
 #[cfg(feature = "mysql")]
 use crate::config::MysqlSourceConfig;
+#[cfg(feature = "postgres")]
+use crate::config::PostgresSourceConfig;
 use crate::config::{Config, HistorianAdapterConfig, InstanceConfig, SourceConfig};
 use crate::contract::DiscoveredKind;
 use crate::credential::FileCredential;
@@ -25,7 +27,8 @@ use crate::fake::{FakeSource, record};
     feature = "mqtt",
     feature = "modbus",
     feature = "mysql",
-    feature = "mssql"
+    feature = "mssql",
+    feature = "postgres"
 ))]
 use crate::schema::FieldType;
 use crate::schema::Schema;
@@ -179,6 +182,17 @@ pub fn discover(config: &Config, instance: Option<&str>) -> Result<DiscoverOutco
                 Err(Error::new("hashi discover needs the mssql feature"))
             }
         }
+        SourceConfig::Postgres(postgres) => {
+            #[cfg(feature = "postgres")]
+            {
+                document(instance, "postgres", postgres_discovered(postgres))
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                let _ = postgres;
+                Err(Error::new("hashi discover needs the postgres feature"))
+            }
+        }
         SourceConfig::Historian(_) => document(instance, "historian", historian_discovered()),
     }
 }
@@ -285,7 +299,24 @@ fn mssql_discovered(mssql: &MssqlSourceConfig) -> Vec<DiscoveredKind> {
     kinds
 }
 
-#[cfg(any(feature = "mysql", feature = "mssql"))]
+#[cfg(feature = "postgres")]
+fn postgres_discovered(postgres: &PostgresSourceConfig) -> Vec<DiscoveredKind> {
+    let mut kinds: Vec<_> = postgres
+        .tables
+        .iter()
+        .map(|table| {
+            sql_table_kind(
+                format!("{}.{}", table.schema, table.table),
+                postgres.schema_version,
+                &table.key,
+            )
+        })
+        .collect();
+    kinds.push(sql_transaction_kind("__postgres_transaction"));
+    kinds
+}
+
+#[cfg(any(feature = "mysql", feature = "mssql", feature = "postgres"))]
 fn sql_table_kind(kind: String, version: u64, keys: &[String]) -> DiscoveredKind {
     let mut fields = std::collections::BTreeMap::from([("payload".into(), FieldType::Text)]);
     for key in keys {
@@ -302,7 +333,7 @@ fn sql_table_kind(kind: String, version: u64, keys: &[String]) -> DiscoveredKind
     }
 }
 
-#[cfg(any(feature = "mysql", feature = "mssql"))]
+#[cfg(any(feature = "mysql", feature = "mssql", feature = "postgres"))]
 fn sql_transaction_kind(kind: &str) -> DiscoveredKind {
     DiscoveredKind {
         kind: kind.into(),

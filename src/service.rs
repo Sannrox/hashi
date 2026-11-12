@@ -327,6 +327,7 @@ pub(crate) fn open_connector(
         SourceConfig::Modbus(modbus) => open_modbus(&id, modbus),
         SourceConfig::Mysql(mysql) => open_mysql(&id, mysql),
         SourceConfig::Mssql(mssql) => open_mssql(&id, mssql),
+        SourceConfig::Postgres(postgres) => open_postgres(&id, postgres),
         SourceConfig::Historian(historian) => open_historian(&id, historian),
     }
 }
@@ -695,6 +696,50 @@ fn open_mssql(
     {
         let _ = (id, mssql);
         Err(needs_feature("mssql", "mssql"))
+    }
+}
+
+fn open_postgres(
+    id: &str,
+    postgres: &crate::config::PostgresSourceConfig,
+) -> Result<Box<dyn Connector>, Error> {
+    #[cfg(feature = "postgres")]
+    {
+        let password = FileCredential::new(&postgres.credential_file)
+            .current()?
+            .expose()
+            .to_string();
+        Ok(Box::new(crate::postgres::PostgresConnector::connect(
+            crate::postgres::Config {
+                id: id.to_string(),
+                host: postgres.host.clone(),
+                port: postgres.port,
+                user: postgres.user.clone(),
+                password,
+                database: postgres.database.clone(),
+                tables: postgres
+                    .tables
+                    .iter()
+                    .map(|table| crate::postgres::Table {
+                        schema: table.schema.clone(),
+                        table: table.table.clone(),
+                        key: table.key.clone(),
+                    })
+                    .collect(),
+                state_dir: postgres.state_dir.clone(),
+                chunk_rows: usize::try_from(postgres.chunk_rows).unwrap_or(usize::MAX),
+                max_batch_bytes: usize::try_from(postgres.max_batch_bytes).unwrap_or(usize::MAX),
+                schema_version: postgres.schema_version,
+                timeout: Duration::from_millis(postgres.timeout_ms),
+                max_lag: Duration::from_millis(postgres.max_lag_ms),
+                allow_insecure_lab: postgres.allow_insecure_lab,
+            },
+        )?))
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (id, postgres);
+        Err(needs_feature("postgres", "postgres"))
     }
 }
 
