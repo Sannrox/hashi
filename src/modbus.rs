@@ -736,14 +736,9 @@ impl<T: Transport, C: Clock> Connector for ModbusConnector<T, C> {
                 }
             }
             if self.pending.is_empty() {
-                let next_due = self
-                    .state
-                    .iter()
-                    .flat_map(|state| state.due.iter().map(|due| (*due).max(state.retry_at)))
-                    .min()
-                    .ok_or_else(|| Error::new("Modbus has no poll groups"))?;
-                let wait = next_due.saturating_sub(self.clock.now_ms()).max(1);
-                self.clock.sleep_ms(wait as u64);
+                // Caught up until the next due poll; the service pass returns
+                // so later instances run and `--once` can exit.
+                return Ok(None);
             }
         }
         self.persist_pending()?;

@@ -66,6 +66,20 @@ impl MemorySink {
     }
 }
 
+impl<T: Sink + ?Sized> Sink for Box<T> {
+    fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
+        (**self).deliver(record, idk)
+    }
+
+    fn recover(&mut self) -> Result<(), DeliverError> {
+        (**self).recover()
+    }
+
+    fn admit(&mut self, token: u64) -> Result<(), DeliverError> {
+        (**self).admit(token)
+    }
+}
+
 impl Sink for MemorySink {
     fn deliver(&mut self, record: &Record, idk: &IdempotencyKey) -> Result<(), DeliverError> {
         if self.poison_keys.iter().any(|key| key == &record.key) {

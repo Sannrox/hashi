@@ -72,6 +72,32 @@ impl FileCredential {
         }
         Ok(Secret(value.to_string()))
     }
+
+    /// Username then password, one per line. Values never appear in the error.
+    pub fn user_password(&self) -> Result<(Secret, Secret), Error> {
+        let text = fs::read_to_string(&self.path).map_err(|_| {
+            Error::new(format!(
+                "credential file {} is unreadable",
+                self.path.display()
+            ))
+        })?;
+        if text.trim().is_empty() {
+            return Err(Error::new(format!(
+                "credential file {} is empty",
+                self.path.display()
+            )));
+        }
+        let mut lines = text.lines();
+        let user = lines.next().unwrap_or("");
+        let password = lines.next().unwrap_or("");
+        if user.is_empty() || password.is_empty() || lines.next().is_some() {
+            return Err(Error::new(format!(
+                "credential file {} must contain user and password on two lines",
+                self.path.display()
+            )));
+        }
+        Ok((Secret(user.to_string()), Secret(password.to_string())))
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +128,40 @@ mod tests {
         fs::remove_file(&path).unwrap();
         let error = credential.current().unwrap_err().message;
         assert!(error.contains("unreadable") && !error.contains("second"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_two_line_file_is_user_then_password_and_never_prints() {
+        let dir = std::env::temp_dir().join(format!(
+            "hashi-credential-user-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("login");
+        fs::write(&path, "alice\nsecret-value\n").unwrap();
+        let (user, password) = FileCredential::new(&path).user_password().unwrap();
+        assert_eq!(user.expose(), "alice");
+        assert_eq!(password.expose(), "secret-value");
+        for printed in [format!("{user}"), format!("{password:?}")] {
+            assert!(
+                !printed.contains("alice") && !printed.contains("secret"),
+                "{printed}"
+            );
+        }
+        fs::write(&path, "alice\n").unwrap();
+        let error = FileCredential::new(&path)
+            .user_password()
+            .unwrap_err()
+            .message;
+        assert!(
+            error.contains("two lines") && !error.contains("alice"),
+            "{error}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

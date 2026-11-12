@@ -199,6 +199,24 @@ impl hashi::runtime::Clock for TestClock {
         self.0.fetch_add(ms as i64, Ordering::SeqCst);
     }
 }
+
+fn tick(clock: &TestClock) {
+    clock.0.fetch_add(1, Ordering::SeqCst);
+}
+
+fn wait_record<C: Connector>(
+    source: &mut C,
+    from: Option<u64>,
+    clock: &TestClock,
+) -> hashi::contract::Record {
+    for _ in 0..10_000 {
+        if let Some(record) = source.read(from, None).unwrap() {
+            return record;
+        }
+        tick(clock);
+    }
+    panic!("modbus produced no record");
+}
 struct SelectiveFailure {
     requests: Arc<std::sync::Mutex<Vec<(u8, i64)>>>,
     clock: TestClock,
@@ -443,11 +461,18 @@ fn runtime_keeps_polling_and_healthy_groups_do_not_reset_failing_group_backoff()
         source,
         hashi::MemorySink::new(),
         hashi::FileCheckpoint::open(path.join("checkpoint")).unwrap(),
-        clock,
+        clock.clone(),
         hashi::RuntimeConfig::new("poller"),
     );
-    let result = rt.run_while(|r| r.delivered < 8).unwrap();
-    assert_eq!(result.delivered, 8);
+    let mut delivered = 0u64;
+    while delivered < 8 {
+        let result = rt.run_while(|r| r.delivered < 8 - delivered).unwrap();
+        if result.delivered == 0 {
+            tick(&clock);
+        }
+        delivered += result.delivered;
+    }
+    assert_eq!(delivered, 8);
     let times = attempts.lock().unwrap();
     assert_eq!(times.len(), 4);
     let gaps: Vec<i64> = times.windows(2).map(|pair| pair[1] - pair[0]).collect();
@@ -487,12 +512,12 @@ fn failing_first_group_cannot_starve_healthy_groups() {
             attempts,
             clock: clock.clone(),
         },
-        clock,
+        clock.clone(),
         &path,
     )
     .unwrap();
-    assert_eq!(source.read(None, None).unwrap().unwrap().kind, "bad");
-    let next = source.read(Some(0), None).unwrap().unwrap();
+    assert_eq!(wait_record(&mut source, None, &clock).kind, "bad");
+    let next = wait_record(&mut source, Some(0), &clock);
     assert_eq!(next.kind, "good");
     assert_eq!(next.quality, None);
     drop(source);
@@ -569,7 +594,7 @@ fn restart_preserves_device_backoff_and_request_reservations() {
             &path,
         )
         .unwrap();
-        let row = source.read(position.checked_sub(1), None).unwrap().unwrap();
+        let row = wait_record(&mut source, position.checked_sub(1), &clock);
         assert_eq!(row.position, position);
         source.acknowledge(position).unwrap();
     }

@@ -268,13 +268,26 @@ impl<F: Family> Kit<'_, F> {
         Ok(())
     }
 
+    fn run_until_one_delivery(&mut self) -> Result<(), Error> {
+        let mark = lock(&self.delivered).len();
+        let started = std::time::Instant::now();
+        loop {
+            self.runtime_mut()?
+                .run_while(|report: &RunReport| report.delivered == 0)?;
+            if lock(&self.delivered).len() > mark || started.elapsed() >= DRAIN_DEADLINE {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
     /// Stops after one delivery, drops the runtime and connector as a kill would,
     /// then resumes from the durable checkpoint with a fresh connector.
     fn interruption_and_resume(&mut self) -> Result<(), Error> {
         let expected = self.family.produce(&["k5", "k6", "k7"])?;
         let mark = lock(&self.delivered).len();
-        self.runtime_mut()?
-            .run_while(|report: &RunReport| report.delivered == 0)?;
+        self.run_until_one_delivery()?;
         if let Some(runtime) = &mut self.runtime {
             runtime.release_lease()?;
         }
@@ -385,8 +398,7 @@ impl<F: Family> Kit<'_, F> {
     fn kill_active(&mut self) -> Result<(), Error> {
         let expected = self.family.produce(&["ka1", "ka2"])?;
         let mark = lock(&self.delivered).len();
-        self.runtime_mut()?
-            .run_while(|report: &RunReport| report.delivered == 0)?;
+        self.run_until_one_delivery()?;
         let acked: Vec<Record> = lock(&self.delivered)[mark..]
             .iter()
             .map(|(record, _)| record.clone())

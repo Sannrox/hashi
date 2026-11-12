@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::config::{Config, InstanceConfig, SinkConfig};
+use crate::config::{Config, InstanceConfig};
 use crate::{CheckpointStore, Error, FileCheckpoint};
 
 #[derive(Debug, Serialize)]
@@ -63,12 +63,10 @@ pub fn collect(config: &Config) -> Bundle {
 }
 
 fn instance_diagnostics(config: &Config, instance: &InstanceConfig) -> InstanceDiagnostics {
-    let source = instance.source.family();
-    let SinkConfig::Jsonl(_) = &instance.sink;
     let mut diagnostics = InstanceDiagnostics {
         name: instance.name.clone(),
-        source,
-        sink: "jsonl",
+        source: instance.source.family(),
+        sink: instance.sink.family(),
         checkpoint: None,
         quarantined_by_reason: BTreeMap::new(),
         schema_kinds: BTreeMap::new(),
