@@ -14,7 +14,9 @@ on:
       - "scripts/release-manifest.py"
       - "scripts/release-sbom.py"
       - "scripts/release-package.sh"
+      - "scripts/tenkai-profile.py"
       - "scripts/validate-release.sh"
+      - "deploy/tenkai.toml"
       - "scripts/changelog-draft.sh"
       - "security/release-tag-key.asc"
       - "security/release-tag-fingerprints"
@@ -179,6 +181,52 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  push-image:
+    name: Push release image
+    needs: [verify-tag, package]
+    if: needs.verify-tag.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again
+          # here. Only "release not found" or a draft may continue.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hashi-release
+          path: dist
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Load, tag, and push
+        env:
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          image="ghcr.io/sannrox/hashi:${version}"
+          tar="dist/hashi-${version}-image.tar"
+          [[ -f "$tar" ]] || { echo "missing ${tar}" >&2; exit 1; }
+          docker load -i "$tar"
+          docker tag "hashi:v${version}" "$image"
+          docker push "$image"
+
   attest:
     name: Attest artifacts
     needs: [verify-tag, package]
@@ -235,7 +283,7 @@ jobs:
   # a draft that a re-run for the same tag resumes.
   publish:
     name: GitHub Release
-    needs: [verify-tag, package, attest]
+    needs: [verify-tag, package, attest, push-image]
     if: needs.verify-tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:

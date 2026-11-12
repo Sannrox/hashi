@@ -1,0 +1,54 @@
+# tenkai product manifest for hashi.
+#
+# Deploys the connector engine from the tagged image. Commands are
+# self-contained (no repo checkout). The tagged release publishes
+# ghcr.io/sannrox/hashi:<version> (version tag only). Put hashi.toml and
+# the credential files it names in the workdir before install.
+
+[product]
+name = "hashi"
+version = "0.1.0"
+description = "Connector engine (industrial protocols and change data capture)"
+
+[deploy]
+workdir = "."
+install = """
+set -e
+IMG=ghcr.io/sannrox/hashi:0.1.0
+test -f hashi.toml
+docker pull "$IMG"
+DIGEST=$(docker image inspect --format '{{.Id}}' "$IMG")
+case "$DIGEST" in sha256:*) ;; *) echo "image has no sha256 id" >&2; exit 1 ;; esac
+docker rm -f hashi >/dev/null 2>&1 || true
+# Host uid so relative checkpoint, buffer, and sink paths under /work are writable.
+docker run -d --name hashi --user "$(id -u):$(id -g)" -v "$PWD:/work" -p 127.0.0.1:9464:9464 "$DIGEST" run --config /work/hashi.toml --listen 0.0.0.0:9464
+"""
+uninstall = "docker rm -f hashi"
+health = """
+for i in $(seq 1 30); do
+  curl -fsS http://127.0.0.1:9464/healthz >/dev/null && exit 0
+  sleep 1
+done
+exit 1
+"""
+
+[delivery]
+has_migration = false
+changes_identity_config = false
+
+# Contracts this release provides to dependents (Tenkai profile v2). The pin
+# is a digest of hashi@<product.version>. Contract versions are derived from
+# the shipped capture and sink surfaces; `python3 scripts/tenkai-profile.py
+# --check` refuses a stale block.
+[compatibility]
+version = 2
+# Evidence binds one release digest; one day is Tenkai's maximum.
+max_evidence_age_ms = 86400000
+
+[compatibility.components.hashi.pin]
+kind = "digest"
+value = "sha256:7401f6e2072e7ef467c236b1cac9f2b33e2270fb2c4387f8d83538ba59bc1ad6"
+
+[compatibility.components.hashi.provides]
+"connector.capture" = "0.2.0"
+"hashi.sink" = "0.2.0"
