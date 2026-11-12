@@ -66,8 +66,10 @@ reported as such, without the parser's message.
 build image and copies it onto an empty base, running as an unprivileged user.
 The build needs crate downloads; the image needs nothing at run time.
 Release images are tagged with the version only; there is no `latest` tag.
-Deploy by digest. Signed `v*` tags and GitHub Releases are described in
-[RELEASING.md](../RELEASING.md).
+Deploy by digest. A tagged release also publishes
+`ghcr.io/sannrox/hashi:<version>`. `deploy/tenkai.toml` is the Tenkai product
+for that image; it provides `connector.capture` and `hashi.sink`. Signed `v*`
+tags and GitHub Releases are described in [RELEASING.md](../RELEASING.md).
 
 ```sh
 docker build -t hashi:local .

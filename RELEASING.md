@@ -35,8 +35,8 @@ The workflow refuses unsigned or lightweight tags.
    the last final tag, so a final release's notes include what its release
    candidates shipped. Pull requests never edit `CHANGELOG.md`; the release
    step writes the section from merged work.
-3. Land the version-bump pull request. The crate version and CHANGELOG
-   heading move together.
+3. Land the version-bump pull request. The crate version, `deploy/tenkai.toml`
+   product version, and CHANGELOG heading move together.
 
 ## Tag
 
@@ -78,12 +78,17 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 - runs the release checks, tests, builds the binary and the image, writes an
   SBOM and the family release manifest (component, version, `git_sha`, binary
   and image digests, gate flags) from that commit, and attests provenance;
+- pushes the image to `ghcr.io/sannrox/hashi:<version>` (version tag only);
 - drafts the GitHub Release with `gh release create <tag> --verify-tag` from
   the matching CHANGELOG section, attaches every asset and the attestation
   URLs, and publishes only then.
 
 The release image is tagged with the version only. There is no `latest` tag.
-Deploy the image by digest.
+Deploy the image by digest. `deploy/tenkai.toml` is the Tenkai product for
+that image. Its compatibility profile provides `connector.capture` and
+`hashi.sink` at the versions derived from the surfaces this tree ships.
+`bash scripts/validate-release.sh` refuses a product whose profile does not
+match.
 
 To retry a failed release, fix the workflow on `main` and run it again for the
 same tag:

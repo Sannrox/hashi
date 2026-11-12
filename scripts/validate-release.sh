@@ -14,6 +14,8 @@ fail() {
 python3 scripts/changelog-notes.py --self-test
 python3 scripts/release-manifest.py --self-test
 python3 scripts/release-sbom.py --self-test
+python3 scripts/tenkai-profile.py --self-test
+python3 scripts/tenkai-profile.py --check
 bash scripts/verify-release-tag.sh self-test
 
 workflow=".github/workflows/release.yml"
@@ -69,7 +71,7 @@ fi
 python3 - "$workflow" <<'PY_JOBS' || fail "${workflow} must refuse a published release before every upload, publish, or attestation"
 import re, sys
 body = open(sys.argv[1]).read().split("\njobs:\n", 1)[1]
-mutating = ("gh release upload", "gh release create", "gh release edit", "gh release delete-asset", "actions/attest")
+mutating = ("gh release upload", "gh release create", "gh release edit", "gh release delete-asset", "actions/attest", "docker push")
 guard = "- name: Refuse a published release"
 bad = []
 for block in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body):
@@ -86,7 +88,7 @@ fi
   || fail "${workflow} every published-release guard must accept only a draft or release not found"
 grep -F 'gh release delete-asset "$TAG" "$name" --yes' "$workflow" >/dev/null \
   || fail "${workflow} must drop an earlier run's assets when it resumes a draft"
-grep -F "needs: [verify-tag, package, attest]" "$workflow" >/dev/null \
+grep -F "needs: [verify-tag, package, attest, push-image]" "$workflow" >/dev/null \
   || fail "${workflow} must publish only after every artifact job, so a re-run can resume the draft"
 grep -F "id-token: write" "$workflow" >/dev/null || fail "${workflow} must request id-token for provenance"
 grep -F "attestations: write" "$workflow" >/dev/null || fail "${workflow} must request attestations permission"
