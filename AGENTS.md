@@ -10,7 +10,7 @@ Operator docs live in `docs/`. A new ADR is the next numbered file following
 to the `docs/decisions/README.md` index.
 
 Affected areas used in Issues and impact notes: runtime, checkpoint, sink,
-buffer, modbus, opcua, mqtt, mysql, schema, outbox, and ops (configuration,
+buffer, modbus, opcua, mqtt, mysql, postgres, schema, outbox, and ops (configuration,
 CLI, metrics, diagnostics, and the static image).
 
 ## Build, Test, and Development Commands
@@ -291,7 +291,7 @@ silently drop or duplicate data.
 - connector check/discover/read versus durable checkpoints;
 - at-least-once delivery versus sink ack and the store-and-forward buffer;
 - schema drift versus quarantine;
-- protocol adapters (Modbus, OPC UA, MQTT, MySQL) versus optional features;
+- protocol adapters (Modbus, OPC UA, MQTT, MySQL, PostgreSQL) versus optional features;
 - configuration, CLI, metrics, diagnostics, and the static image.
 
 ### Verification matrix

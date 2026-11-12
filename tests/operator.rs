@@ -121,3 +121,30 @@ fn discover_lists_mysql_tables_from_config_without_connecting() {
     );
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[cfg(feature = "postgres")]
+#[test]
+fn discover_lists_postgres_tables_from_config_without_connecting() {
+    let dir = work_dir();
+    fs::write(dir.join("secrets/postgres"), "password").unwrap();
+    let path = dir.join("hashi.toml");
+    fs::write(
+        &path,
+        "checkpoint_dir = \"state\"\n\n[[instance]]\nname = \"line-1\"\n\
+         source.postgres = { host = \"127.0.0.1\", port = 1, user = \"hashi\", database = \"plant\", \
+         credential_file = \"secrets/postgres\", tables = [{ schema = \"public\", table = \"items\" }], \
+         state_dir = \"postgres\", chunk_rows = 100, max_batch_bytes = 1048576, schema_version = 1, \
+         timeout_ms = 20, max_lag_ms = 60000 }\n\
+         sink.jsonl = { dir = \"out\" }\n",
+    )
+    .unwrap();
+    let (ok, stdout, stderr) = hashi(&["discover", "--config", path.to_str().unwrap()]);
+    assert!(ok, "{stderr}{stdout}");
+    assert!(stdout.contains("\"source\": \"postgres\""), "{stdout}");
+    assert!(stdout.contains("\"kind\": \"public.items\""), "{stdout}");
+    assert!(
+        stdout.contains("\"kind\": \"__postgres_transaction\""),
+        "{stdout}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

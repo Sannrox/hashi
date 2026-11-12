@@ -35,6 +35,8 @@ pub mod outbox;
 #[cfg(feature = "parquet")]
 pub mod parquet;
 pub mod platform;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod runtime;
 pub mod schema;
 pub mod service;

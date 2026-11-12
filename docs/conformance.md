@@ -37,9 +37,10 @@ return one key per change set, since it reports current state.
 | OPC UA | In-process simulator | Refused: a schema revision on an existing spool fails closed ([opcua.md](opcua.md)) | Build & Test, OPC UA container fixture |
 | MQTT | Disposable broker | Schema revision | MQTT container fixture |
 | MySQL | Disposable database | `ALTER TABLE ... ADD COLUMN` | MySQL container fixture |
+| PostgreSQL | Disposable database | `ALTER TABLE ... ADD COLUMN` | PostgreSQL container fixture |
 
 Run one family locally with `cargo test --test conformance_modbus` (default feature `modbus`),
 `cargo test --features opcua-simulator --test opcua_subscription opcua_passes`,
 or the family's container script (`scripts/test-mqtt-container.sh`,
-`scripts/test-mysql-container.sh`). The MySQL script runs its tests one at a
+`scripts/test-mysql-container.sh`, `scripts/test-postgres-container.sh`). The MySQL and PostgreSQL scripts run their tests one at a
 time because they share one disposable server.

@@ -45,11 +45,11 @@ sink.jsonl = { dir = "out/line-1" }
   backend.
 - `instance.name`: `A-Z a-z 0-9 - _`, unique.
 - `instance.source.<family>`: one section per source family. Implemented
-  families: `fixture`, `opcua`, `mqtt`, `modbus`, `mysql`, `mssql`, and
-  `historian` (nested `adapter.opcua`, `adapter.mysql`, or `adapter.mssql`).
+  families: `fixture`, `opcua`, `mqtt`, `modbus`, `mysql`, `mssql`, `postgres`,
+  and `historian` (nested `adapter.opcua`, `adapter.mysql`, or `adapter.mssql`).
   A family compiled out of the binary is refused by name. Credentials stay
   file paths; `credential_file` is user then password on two lines for OPC UA
-  and MQTT, the password only for MySQL and SQL Server. OPC UA `hashi run`
+  and MQTT, the password only for MySQL, SQL Server, and PostgreSQL. OPC UA `hashi run`
   also needs `nodes` and `state_dir` to subscribe; `nodes` use a numeric
   namespace (`ns=` or `i=`), and `nsu=` is resolved at `hashi discover`.
 - `instance.sink.<family>`: `jsonl`, `parquet`, or `kafka` (file-backed topic

@@ -173,6 +173,7 @@ pub enum SourceConfig {
     Modbus(ModbusSourceConfig),
     Mysql(MysqlSourceConfig),
     Mssql(MssqlSourceConfig),
+    Postgres(PostgresSourceConfig),
     Historian(HistorianSourceConfig),
 }
 
@@ -185,6 +186,7 @@ impl SourceConfig {
             Self::Modbus(_) => "modbus",
             Self::Mysql(_) => "mysql",
             Self::Mssql(_) => "mssql",
+            Self::Postgres(_) => "postgres",
             Self::Historian(_) => "historian",
         }
     }
@@ -217,6 +219,10 @@ impl SourceConfig {
             Self::Mssql(mssql) => {
                 mssql.credential_file = base.join(&mssql.credential_file);
                 mssql.state_dir = base.join(&mssql.state_dir);
+            }
+            Self::Postgres(postgres) => {
+                postgres.credential_file = base.join(&postgres.credential_file);
+                postgres.state_dir = base.join(&postgres.state_dir);
             }
             Self::Historian(historian) => {
                 historian.state_dir = base.join(&historian.state_dir);
@@ -508,6 +514,44 @@ impl SourceConfig {
                 }
                 if mssql.max_lag_ms == 0 {
                     return invalid("source.mssql.max_lag_ms", "must be at least 1");
+                }
+            }
+            Self::Postgres(postgres) => {
+                if postgres.host.trim().is_empty() {
+                    return invalid("source.postgres.host", "must not be empty");
+                }
+                if postgres.port == 0 {
+                    return invalid("source.postgres.port", "must be at least 1");
+                }
+                if postgres.user.trim().is_empty() {
+                    return invalid("source.postgres.user", "must not be empty");
+                }
+                if postgres.database.trim().is_empty() {
+                    return invalid("source.postgres.database", "must not be empty");
+                }
+                if postgres.credential_file.as_os_str().is_empty() {
+                    return invalid("source.postgres.credential_file", "must not be empty");
+                }
+                if postgres.tables.is_empty() {
+                    return invalid("source.postgres.tables", "list at least one table");
+                }
+                if postgres.state_dir.as_os_str().is_empty() {
+                    return invalid("source.postgres.state_dir", "must not be empty");
+                }
+                if postgres.chunk_rows == 0 {
+                    return invalid("source.postgres.chunk_rows", "must be at least 1");
+                }
+                if postgres.max_batch_bytes == 0 {
+                    return invalid("source.postgres.max_batch_bytes", "must be at least 1");
+                }
+                if postgres.schema_version == 0 {
+                    return invalid("source.postgres.schema_version", "must be at least 1");
+                }
+                if postgres.timeout_ms == 0 {
+                    return invalid("source.postgres.timeout_ms", "must be at least 1");
+                }
+                if postgres.max_lag_ms == 0 {
+                    return invalid("source.postgres.max_lag_ms", "must be at least 1");
                 }
             }
             Self::Historian(historian) => {
@@ -884,6 +928,37 @@ pub struct MssqlSourceConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MssqlTableConfig {
+    pub schema: String,
+    pub table: String,
+    #[serde(default)]
+    pub key: Vec<String>,
+}
+
+/// `source.postgres = { host, port, user, database, credential_file, tables, ... }`.
+///
+/// The credential file is the password only. Distinct from `lease.backend = "postgres"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresSourceConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub database: String,
+    pub credential_file: PathBuf,
+    pub tables: Vec<PostgresTableConfig>,
+    pub state_dir: PathBuf,
+    pub chunk_rows: u64,
+    pub max_batch_bytes: u64,
+    pub schema_version: u64,
+    pub timeout_ms: u64,
+    pub max_lag_ms: u64,
+    #[serde(default)]
+    pub allow_insecure_lab: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresTableConfig {
     pub schema: String,
     pub table: String,
     #[serde(default)]
@@ -1425,6 +1500,15 @@ mod tests {
              sink.jsonl = { dir = \"out\" }";
         let parsed = Config::parse(&config(mssql), Path::new("/etc/hashi")).unwrap();
         assert_eq!(parsed.instances[0].source.family(), "mssql");
+
+        let postgres = "name = \"line-1\"\n\
+             source.postgres = { host = \"db\", port = 5432, user = \"hashi\", database = \"plant\", \
+             credential_file = \"secrets/postgres\", tables = [{ schema = \"public\", table = \"items\" }], \
+             state_dir = \"postgres\", chunk_rows = 100, max_batch_bytes = 1048576, schema_version = 1, \
+             timeout_ms = 20000, max_lag_ms = 60000 }\n\
+             sink.jsonl = { dir = \"out\" }";
+        let parsed = Config::parse(&config(postgres), Path::new("/etc/hashi")).unwrap();
+        assert_eq!(parsed.instances[0].source.family(), "postgres");
 
         let error = Config::parse(
             &config(&valid_instance().replace("sink.jsonl", "sink.platform")),
