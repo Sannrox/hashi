@@ -43,7 +43,8 @@ sink.jsonl = { dir = "out/line-1" }
   refused. A standby waits on the lease and resumes from the last checkpoint.
   Hashi has no hard PostgreSQL dependency; a single-box site keeps the file
   backend.
-- `instance.name`: `A-Z a-z 0-9 - _`, unique.
+- `instance.name`: `A-Z a-z 0-9 - _`, unique. `hashi run` needs at least one
+  instance; a file with only `writer` entries serves `hashi write` alone.
 - `instance.source.<family>`: one section per source family. Implemented
   families: `fixture`, `opcua`, `mqtt`, `modbus`, `mysql`, `mssql`, `postgres`,
   and `historian` (nested `adapter.opcua`, `adapter.mysql`, or `adapter.mssql`).
@@ -61,6 +62,10 @@ sink.jsonl = { dir = "out/line-1" }
 - `instance.buffer` (optional): a store-and-forward disk buffer between the
   source and the sink, for sites whose uplink drops. See
   [Store-and-forward buffer](#store-and-forward-buffer).
+- `writer` (optional, repeatable): a write target for `hashi write`, with
+  `name` (same rules as `instance.name`, unique across instances and writers)
+  and `target.opcua` (the `source.opcua` connection fields, `timeout_ms`, and
+  an `allow` list of node ids). See [OPC UA write-back](write.md).
 
 Unknown fields are refused, and every error names its field, for example
 `invalid config: instance[0].source.fixture.records: must be at least 1`.

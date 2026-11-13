@@ -53,6 +53,7 @@ pub fn trust(dir: &Path, certificate: &Path) {
 }
 pub struct Simulator {
     pub endpoint: String,
+    #[allow(dead_code)]
     pub root: NodeId,
     pub value: NodeId,
     handle: ServerHandle,
@@ -243,6 +244,20 @@ impl Simulator {
                     .insert(&mut *space)
                 );
             }
+            // Writable, and outside Equipment so discovery fixtures do not see it.
+            assert!(
+                VariableBuilder::new(
+                    &NodeId::new(ns, "Setpoint"),
+                    opcua::types::QualifiedName::new(ns, "Setpoint"),
+                    "Setpoint"
+                )
+                .data_type(DataTypeId::Double)
+                .value(10.0f64)
+                .access_level(AccessLevel::CURRENT_READ | AccessLevel::CURRENT_WRITE)
+                .user_access_level(AccessLevel::CURRENT_READ | AccessLevel::CURRENT_WRITE)
+                .organized_by(ObjectId::ObjectsFolder)
+                .insert(&mut *space)
+            );
             for index in 0..count {
                 let name = format!("Sample{index}");
                 assert!(
@@ -326,6 +341,33 @@ impl Simulator {
                 value,
             )
             .unwrap();
+    }
+    /// The writable Double variable.
+    #[allow(dead_code)]
+    pub fn setpoint(&self) -> NodeId {
+        NodeId::new(self.value.namespace, "Setpoint")
+    }
+    #[allow(dead_code)]
+    pub fn read(&self, node: &NodeId) -> Option<Variant> {
+        let manager = self
+            .handle
+            .node_managers()
+            .get_of_type::<SimpleNodeManager>()
+            .unwrap();
+        let space = manager.address_space().read();
+        match space.find(node)? {
+            opcua::nodes::NodeType::Variable(variable) => {
+                variable
+                    .value(
+                        opcua::types::TimestampsToReturn::Neither,
+                        &Default::default(),
+                        &Default::default(),
+                        0.0,
+                    )
+                    .value
+            }
+            _ => None,
+        }
     }
     #[allow(dead_code)]
     pub fn set_value(

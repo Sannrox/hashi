@@ -19,7 +19,7 @@ use crate::config::MssqlSourceConfig;
 use crate::config::MysqlSourceConfig;
 #[cfg(feature = "postgres")]
 use crate::config::PostgresSourceConfig;
-use crate::config::{Config, HistorianAdapterConfig, InstanceConfig, SourceConfig};
+use crate::config::{Config, HistorianAdapterConfig, InstanceConfig, SourceConfig, WriterTarget};
 use crate::contract::DiscoveredKind;
 use crate::credential::FileCredential;
 use crate::fake::{FakeSource, record};
@@ -377,21 +377,20 @@ fn document(
 
 /// List rejected and trusted certificates for an OPC UA instance.
 pub fn trust_list(config: &Config, instance: Option<&str>) -> Result<TrustDocument, Error> {
-    let instance = select_instance(config, instance)?;
-    let pki = pki_dir(instance)?;
+    let (name, pki) = trust_target(config, instance)?;
     #[cfg(feature = "opcua")]
     {
         let store = trust::list(pki)?;
         Ok(TrustDocument {
             schema_version: OPERATOR_SCHEMA_VERSION,
-            instance: instance.name.clone(),
+            instance: name.to_string(),
             rejected: store.rejected,
             trusted: store.trusted,
         })
     }
     #[cfg(not(feature = "opcua"))]
     {
-        let _ = pki;
+        let _ = (name, pki);
         Err(Error::new("hashi trust needs the opcua feature"))
     }
 }
@@ -402,16 +401,15 @@ pub fn trust_approve(
     instance: Option<&str>,
     sha256: &str,
 ) -> Result<TrustDocument, Error> {
-    let instance = select_instance(config, instance)?;
-    let pki = pki_dir(instance)?;
+    let (name, pki) = trust_target(config, instance)?;
     #[cfg(feature = "opcua")]
     {
         trust::approve(pki, sha256)?;
-        trust_list(config, Some(&instance.name))
+        trust_list(config, Some(name))
     }
     #[cfg(not(feature = "opcua"))]
     {
-        let _ = (pki, sha256);
+        let _ = (name, pki, sha256);
         Err(Error::new("hashi trust needs the opcua feature"))
     }
 }
@@ -422,18 +420,31 @@ pub fn trust_revoke(
     instance: Option<&str>,
     sha256: &str,
 ) -> Result<TrustDocument, Error> {
-    let instance = select_instance(config, instance)?;
-    let pki = pki_dir(instance)?;
+    let (name, pki) = trust_target(config, instance)?;
     #[cfg(feature = "opcua")]
     {
         trust::revoke(pki, sha256)?;
-        trust_list(config, Some(&instance.name))
+        trust_list(config, Some(name))
     }
     #[cfg(not(feature = "opcua"))]
     {
-        let _ = (pki, sha256);
+        let _ = (name, pki, sha256);
         Err(Error::new("hashi trust needs the opcua feature"))
     }
+}
+
+/// The PKI store `trust` manages and the name it reports: a writer's target
+/// when `name` names a writer, otherwise the selected instance's source.
+fn trust_target<'a>(config: &'a Config, name: Option<&str>) -> Result<(&'a str, &'a Path), Error> {
+    if let Some(name) = name
+        && let Some(writer) = config.writers.iter().find(|writer| writer.name == name)
+    {
+        return match &writer.target {
+            WriterTarget::OpcUa(opcua) => Ok((&writer.name, &opcua.pki_dir)),
+        };
+    }
+    let instance = select_instance(config, name)?;
+    Ok((&instance.name, pki_dir(instance)?))
 }
 
 fn pki_dir(instance: &InstanceConfig) -> Result<&Path, Error> {

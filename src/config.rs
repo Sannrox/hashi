@@ -18,6 +18,11 @@
 //! sink.jsonl = { dir = "out/line-1" }
 //! # Optional store-and-forward buffer in front of the sink (#47).
 //! buffer = { dir = "buffer/line-1", max_bytes = 1073741824, max_age_secs = 86400, when_full = "stop" }
+//!
+//! # Optional write target for `hashi write` (#98), with its own connection.
+//! [[writer]]
+//! name = "line-1-setpoints"
+//! target.opcua = { endpoint = "opc.tcp://plc:4840", application_uri = "urn:site:hashi-writer", pki_dir = "pki/writer", policy = "basic256sha256", credential_file = "secrets/writer", timeout_ms = 5000, allow = ["ns=2;s=Setpoint"] }
 //! ```
 
 use std::collections::BTreeSet;
@@ -57,8 +62,106 @@ pub struct Config {
     /// Lock store for instance leases. Absent: a file slot under `checkpoint_dir`.
     #[serde(default)]
     pub lease: LeaseConfig,
-    #[serde(rename = "instance")]
+    /// Read instances for `hashi run`. Absent: none, for a writer-only file.
+    #[serde(rename = "instance", default)]
     pub instances: Vec<InstanceConfig>,
+    /// Write targets for `hashi write`. Absent: none.
+    #[serde(rename = "writer", default)]
+    pub writers: Vec<WriterConfig>,
+}
+
+/// `[[writer]]`: a destination for host write commands. Its name shares the
+/// checkpoint directory namespace with instances (the ledger lives in
+/// `checkpoint_dir/<name>`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterConfig {
+    pub name: String,
+    pub target: WriterTarget,
+}
+
+/// One section per target family.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum WriterTarget {
+    #[serde(rename = "opcua")]
+    OpcUa(OpcUaWriterConfig),
+}
+
+/// `target.opcua = { endpoint, application_uri, pki_dir, policy, ..., allow }`.
+///
+/// The connection fields mean what they mean on `source.opcua`. Give a writer
+/// its own `pki_dir` (a running reader holds its PKI store exclusively) and
+/// preferably its own credential. `allow` lists the node ids a command may
+/// name, compared as exact strings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpcUaWriterConfig {
+    pub endpoint: String,
+    pub application_uri: String,
+    pub pki_dir: PathBuf,
+    pub policy: String,
+    #[serde(default)]
+    pub allow_insecure_lab: bool,
+    #[serde(default)]
+    pub credential_file: Option<PathBuf>,
+    #[serde(default)]
+    pub user_certificate: Option<PathBuf>,
+    #[serde(default)]
+    pub user_private_key: Option<PathBuf>,
+    pub timeout_ms: u64,
+    pub allow: Vec<String>,
+}
+
+impl OpcUaWriterConfig {
+    /// The connection as a source section, so validation and session setup
+    /// stay one code path. The allow list stands in for discovery roots.
+    pub(crate) fn connection(&self) -> OpcUaSourceConfig {
+        OpcUaSourceConfig {
+            endpoint: self.endpoint.clone(),
+            application_uri: self.application_uri.clone(),
+            pki_dir: self.pki_dir.clone(),
+            policy: self.policy.clone(),
+            allow_insecure_lab: self.allow_insecure_lab,
+            credential_file: self.credential_file.clone(),
+            user_certificate: self.user_certificate.clone(),
+            user_private_key: self.user_private_key.clone(),
+            roots: self.allow.clone(),
+            max_nodes: self.allow.len() as u64,
+            timeout_ms: self.timeout_ms,
+            schema_version: 1,
+            nodes: Vec::new(),
+            publishing_interval_ms: None,
+            sampling_interval_ms: None,
+            deadband: None,
+            queue_size: None,
+            state_dir: None,
+            max_pending_bytes: None,
+        }
+    }
+
+    fn validate(&self, field: &impl Fn(&str) -> String) -> Result<(), String> {
+        if self.allow.is_empty() || self.allow.iter().any(|node| node.trim().is_empty()) {
+            return Err(format!(
+                "invalid config: {}: list at least one node id",
+                field("target.opcua.allow")
+            ));
+        }
+        if self.allow.len() > 10_000 {
+            return Err(format!(
+                "invalid config: {}: at most 10000 node ids",
+                field("target.opcua.allow")
+            ));
+        }
+        self.connection().validate(field, "target.opcua")
+    }
+
+    fn resolve_paths(&mut self, base: &Path) {
+        self.pki_dir = base.join(&self.pki_dir);
+        join_opt(base, &mut self.credential_file);
+        join_opt(base, &mut self.user_certificate);
+        join_opt(base, &mut self.user_private_key);
+    }
 }
 
 /// `[lease]` section. The lock store is independent of checkpoint files.
@@ -1109,6 +1212,11 @@ impl Config {
                 buffer.dir = base.join(&buffer.dir);
             }
         }
+        for writer in &mut config.writers {
+            match &mut writer.target {
+                WriterTarget::OpcUa(opcua) => opcua.resolve_paths(base),
+            }
+        }
         Ok(config)
     }
 
@@ -1168,8 +1276,8 @@ impl Config {
                 }
             }
         }
-        if self.instances.is_empty() {
-            return invalid("instance".into(), "declare at least one instance");
+        if self.instances.is_empty() && self.writers.is_empty() {
+            return invalid("instance".into(), "declare at least one instance or writer");
         }
         let mut names = BTreeSet::new();
         // Leases fence one instance's checkpoint, not a shared sink, so two
@@ -1236,6 +1344,23 @@ impl Config {
                 }
             }
         }
+        for (index, writer) in self.writers.iter().enumerate() {
+            let field = |name: &str| format!("writer[{index}].{name}");
+            if writer.name.is_empty()
+                || !writer
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return invalid(field("name"), "use 1 or more of A-Z a-z 0-9 - _");
+            }
+            if !names.insert(writer.name.as_str()) {
+                return invalid(field("name"), "duplicates another instance or writer");
+            }
+            match &writer.target {
+                WriterTarget::OpcUa(opcua) => opcua.validate(&field).map_err(Error::new)?,
+            }
+        }
         Ok(())
     }
 }
@@ -1293,6 +1418,46 @@ mod tests {
             .unwrap_err()
             .message;
         assert!(error.contains("source.opcua.credential_file"), "{error}");
+    }
+
+    /// A writer resolves paths like a source, needs an allow list, and shares
+    /// the checkpoint directory namespace with instances.
+    #[test]
+    fn a_writer_section_is_parsed_and_validated() {
+        let writer = |name: &str, allow: &str| {
+            format!(
+                "{}\n[[writer]]\nname = \"{name}\"\n\
+                 target.opcua = {{ endpoint = \"opc.tcp://127.0.0.1:4840/\", application_uri = \"urn:hashi:writer\", \
+                 pki_dir = \"pki/writer\", policy = \"basic256sha256\", credential_file = \"secrets/writer\", \
+                 timeout_ms = 3000, allow = [{allow}] }}\n",
+                config(&valid_instance())
+            )
+        };
+        let parsed = Config::parse(
+            &writer("setpoints", "\"ns=2;s=Setpoint\""),
+            Path::new("/etc/hashi"),
+        )
+        .unwrap();
+        let WriterTarget::OpcUa(opcua) = &parsed.writers[0].target;
+        // A writer-only file is valid; `hashi run` refuses it separately.
+        let writer_only = writer("setpoints", "\"ns=2;s=Setpoint\"")
+            .replace(&config(&valid_instance()), "checkpoint_dir = \"state\"\n");
+        let parsed_writer_only = Config::parse(&writer_only, Path::new(".")).unwrap();
+        assert!(parsed_writer_only.instances.is_empty());
+        assert!(crate::Service::from_config(&parsed_writer_only).is_err());
+        assert_eq!(opcua.pki_dir, Path::new("/etc/hashi/pki/writer"));
+        assert_eq!(opcua.allow, ["ns=2;s=Setpoint"]);
+        for (text, field) in [
+            (writer("setpoints", ""), "writer[0].target.opcua.allow"),
+            (writer("line-1", "\"ns=2;s=Setpoint\""), "writer[0].name"),
+            (
+                writer("setpoints", "\"ns=2;s=Setpoint\"").replace("basic256sha256", "none"),
+                "writer[0].target.opcua.allow_insecure_lab",
+            ),
+        ] {
+            let error = Config::parse(&text, Path::new(".")).unwrap_err().message;
+            assert!(error.contains(field), "{error}");
+        }
     }
 
     /// A buffer section resolves its directory like the sink's, defaults to
