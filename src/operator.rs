@@ -441,6 +441,9 @@ fn trust_target<'a>(config: &'a Config, name: Option<&str>) -> Result<(&'a str, 
     {
         return match &writer.target {
             WriterTarget::OpcUa(opcua) => Ok((&writer.name, &opcua.pki_dir)),
+            WriterTarget::Mqtt(_) => Err(Error::new(
+                "trust does not apply to MQTT writers; set ca_file instead",
+            )),
         };
     }
     let instance = select_instance(config, name)?;

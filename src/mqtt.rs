@@ -7,6 +7,7 @@
 //! One message can yield several records (Sparkplug B); it is acknowledged
 //! after the last of them is committed.
 pub mod sparkplug;
+pub mod write;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -131,10 +132,23 @@ enum Session {
 
 /// Protocol-neutral view of the events this connector acts on.
 enum Event {
-    ConnAck { session_present: bool },
-    SubAck { granted: Vec<bool> },
+    ConnAck {
+        session_present: bool,
+    },
+    SubAck {
+        granted: Vec<bool>,
+    },
     Publish(Publish),
     AckSent(u16),
+    /// QoS 2 publish received by the broker; `refused` when an MQTT 5 broker
+    /// answered with a failure reason (it then drops the message).
+    PubRec {
+        refused: bool,
+    },
+    /// QoS 2 exchange complete; `ok` is false for an MQTT 5 failure reason.
+    PubComp {
+        ok: bool,
+    },
     Disconnected,
     Other,
 }
@@ -149,52 +163,7 @@ impl MqttConnector {
                 "call MQTT synchronous API outside an async runtime",
             ));
         }
-        let transport = match &config.transport {
-            Transport::Plain => MqttTransport::Tcp,
-            Transport::Tls {
-                ca_file,
-                client_certificate,
-            } => MqttTransport::Tls(TlsConfiguration::Rustls(Arc::new(tls(
-                ca_file,
-                client_certificate.as_ref(),
-            )?))),
-        };
-        let session = match config.protocol {
-            Protocol::V311 => {
-                let mut options =
-                    rumqttc::MqttOptions::new(&config.client_id, &config.host, config.port);
-                options
-                    .set_clean_session(false)
-                    .set_manual_acks(true)
-                    .set_keep_alive(config.keep_alive)
-                    .set_max_packet_size(config.max_packet_bytes, config.max_packet_bytes)
-                    .set_transport(transport);
-                if let Some((user, password)) = &config.user_name {
-                    options.set_credentials(user, password);
-                }
-                let (client, connection) = rumqttc::Client::new(options, 64);
-                Session::V311(client, Box::new(connection))
-            }
-            Protocol::V5 => {
-                let mut options =
-                    v5::MqttOptions::new(&config.client_id, &config.host, config.port);
-                let expiry = u32::try_from(config.session_expiry.as_secs()).unwrap_or(u32::MAX);
-                options
-                    .set_clean_start(false)
-                    .set_session_expiry_interval(Some(expiry))
-                    .set_manual_acks(true)
-                    .set_keep_alive(config.keep_alive)
-                    .set_max_packet_size(Some(
-                        u32::try_from(config.max_packet_bytes).unwrap_or(u32::MAX),
-                    ))
-                    .set_transport(transport);
-                if let Some((user, password)) = &config.user_name {
-                    options.set_credentials(user, password);
-                }
-                let (client, connection) = v5::Client::new(options, 64);
-                Session::V5(client, Box::new(connection))
-            }
-        };
+        let session = Session::open(&config, true)?;
         let filters = config
             .routes
             .iter()
@@ -275,7 +244,7 @@ impl MqttConnector {
                 self.generation += 1;
                 self.connected = false;
             }
-            Event::Other => {}
+            Event::PubRec { .. } | Event::PubComp { .. } | Event::Other => {}
         }
         Ok(())
     }
@@ -452,6 +421,60 @@ impl Connector for MqttConnector {
 }
 
 impl Session {
+    /// A persistent session (`persistent`: the subscriber) keeps unacknowledged
+    /// messages across reconnects and acknowledges manually. A clean one (the
+    /// writer) starts and ends with no broker-side state.
+    fn open(config: &Config, persistent: bool) -> Result<Self, Error> {
+        let transport = match &config.transport {
+            Transport::Plain => MqttTransport::Tcp,
+            Transport::Tls {
+                ca_file,
+                client_certificate,
+            } => MqttTransport::Tls(TlsConfiguration::Rustls(Arc::new(tls(
+                ca_file,
+                client_certificate.as_ref(),
+            )?))),
+        };
+        Ok(match config.protocol {
+            Protocol::V311 => {
+                let mut options =
+                    rumqttc::MqttOptions::new(&config.client_id, &config.host, config.port);
+                options
+                    .set_clean_session(!persistent)
+                    .set_manual_acks(persistent)
+                    .set_keep_alive(config.keep_alive)
+                    .set_max_packet_size(config.max_packet_bytes, config.max_packet_bytes)
+                    .set_transport(transport);
+                if let Some((user, password)) = &config.user_name {
+                    options.set_credentials(user, password);
+                }
+                let (client, connection) = rumqttc::Client::new(options, 64);
+                Self::V311(client, Box::new(connection))
+            }
+            Protocol::V5 => {
+                let mut options =
+                    v5::MqttOptions::new(&config.client_id, &config.host, config.port);
+                if persistent {
+                    let expiry = u32::try_from(config.session_expiry.as_secs()).unwrap_or(u32::MAX);
+                    options.set_session_expiry_interval(Some(expiry));
+                }
+                options
+                    .set_clean_start(!persistent)
+                    .set_manual_acks(persistent)
+                    .set_keep_alive(config.keep_alive)
+                    .set_max_packet_size(Some(
+                        u32::try_from(config.max_packet_bytes).unwrap_or(u32::MAX),
+                    ))
+                    .set_transport(transport);
+                if let Some((user, password)) = &config.user_name {
+                    options.set_credentials(user, password);
+                }
+                let (client, connection) = v5::Client::new(options, 64);
+                Self::V5(client, Box::new(connection))
+            }
+        })
+    }
+
     /// `None` on timeout or a connection error; the next call reconnects.
     fn recv(&mut self, wait: Duration) -> Result<Option<Event>, Error> {
         let closed = || Error::new("MQTT client closed");
@@ -479,6 +502,8 @@ impl Session {
                             .collect(),
                     },
                     rumqttc::Packet::Publish(publish) => Event::Publish(Publish::V311(publish)),
+                    rumqttc::Packet::PubRec(_) => Event::PubRec { refused: false },
+                    rumqttc::Packet::PubComp(_) => Event::PubComp { ok: true },
                     _ => Event::Other,
                 })),
                 Ok(Ok(rumqttc::Event::Outgoing(rumqttc::Outgoing::PubAck(pkid)))) => {
@@ -509,6 +534,16 @@ impl Session {
                             .collect(),
                     },
                     v5::Incoming::Publish(publish) => Event::Publish(Publish::V5(publish)),
+                    v5::Incoming::PubRec(ack) => Event::PubRec {
+                        refused: !matches!(
+                            ack.reason,
+                            v5::mqttbytes::v5::PubRecReason::Success
+                                | v5::mqttbytes::v5::PubRecReason::NoMatchingSubscribers
+                        ),
+                    },
+                    v5::Incoming::PubComp(ack) => Event::PubComp {
+                        ok: ack.reason == v5::mqttbytes::v5::PubCompReason::Success,
+                    },
                     _ => Event::Other,
                 })),
                 Ok(Ok(v5::Event::Outgoing(rumqttc::Outgoing::PubAck(pkid)))) => {
@@ -546,6 +581,18 @@ impl Session {
                 .try_publish(topic, v5::mqttbytes::QoS::AtMostOnce, false, payload)
                 .map_err(|_| ()),
         };
+    }
+
+    /// Queues one QoS 2 publish without blocking. `false`: nothing was queued.
+    fn try_publish_exactly_once(&self, topic: &str, payload: Vec<u8>) -> bool {
+        match self {
+            Self::V311(client, _) => client
+                .try_publish(topic, rumqttc::QoS::ExactlyOnce, false, payload)
+                .is_ok(),
+            Self::V5(client, _) => client
+                .try_publish(topic, v5::mqttbytes::QoS::ExactlyOnce, false, payload)
+                .is_ok(),
+        }
     }
 
     fn ack(&self, publish: &Publish) -> Result<(), Error> {

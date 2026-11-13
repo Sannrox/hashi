@@ -789,3 +789,80 @@ fn mqtt_survives_a_soak_with_every_fault() {
         assert!(report.faults.contains_key(&fault), "{fault:?}: {report:#?}");
     }
 }
+
+/// Write-back (#107): one QoS 2 publish per command id, answered from the
+/// ledger on a rerun, and nothing published for a topic that is not allowed.
+#[test]
+#[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
+fn a_write_command_is_published_once_at_qos2_on_both_protocols() {
+    use hashi::write::{Command, CommandFile, Outcome};
+    for (protocol, name) in [(Protocol::V311, "v311"), (Protocol::V5, "v5")] {
+        let prefix = unique("hashi/write");
+        let topic = format!("{prefix}/setpoint");
+        let dir = temp_dir("mqtt-write");
+        let config = hashi::Config::parse(
+            &format!(
+                "checkpoint_dir = \"state\"\n[[writer]]\nname = \"commands\"\n\
+                 target.mqtt = {{ host = \"127.0.0.1\", port = {port}, protocol = \"{name}\", \
+                 client_id = \"{client}\", allow_insecure_lab = true, timeout_ms = 5000, allow = [\"{topic}\"] }}\n",
+                port = port("HASHI_MQTT_PORT"),
+                client = unique("writer"),
+            ),
+            &dir,
+        )
+        .unwrap();
+        let mut options =
+            rumqttc::MqttOptions::new(unique("observer"), "127.0.0.1", port("HASHI_MQTT_PORT"));
+        options.set_keep_alive(Duration::from_secs(30));
+        let (observer, mut connection) = rumqttc::Client::new(options, 8);
+        observer
+            .subscribe(format!("{prefix}/#"), rumqttc::QoS::ExactlyOnce)
+            .unwrap();
+        loop {
+            match connection.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::SubAck(_)))) => break,
+                Ok(Ok(_)) => {}
+                other => panic!("observer failed: {other:?}"),
+            }
+        }
+        let commands = CommandFile {
+            version: 1,
+            commands: vec![
+                Command {
+                    id: "c1".into(),
+                    target: topic.clone(),
+                    value: serde_json::json!({"sp": 42}),
+                },
+                Command {
+                    id: "c2".into(),
+                    target: format!("{prefix}/not-listed"),
+                    value: 1.into(),
+                },
+            ],
+        };
+        for _ in 0..2 {
+            let results = hashi::write::run(&config, "commands", &commands).unwrap();
+            assert_eq!(results.results[0].outcome, Outcome::Applied, "{protocol:?}");
+            assert!(matches!(
+                results.results[1].outcome,
+                Outcome::Refused { .. }
+            ));
+        }
+        let mut received = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while let Some(wait) = until.checked_duration_since(std::time::Instant::now()) {
+            if let Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)))) =
+                connection.recv_timeout(wait)
+            {
+                received.push((publish.topic, publish.payload.to_vec()));
+            }
+        }
+        assert_eq!(
+            received,
+            [(topic, br#"{"sp":42}"#.to_vec())],
+            "{protocol:?}"
+        );
+        observer.disconnect().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

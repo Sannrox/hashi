@@ -403,7 +403,9 @@ pub fn run(config: &Config, name: &str, commands: &CommandFile) -> Result<Result
     })
 }
 
-#[cfg(feature = "opcua")]
+/// Opens the writer's target lazily, through [`apply`]. A target family whose
+/// feature is not built is a configuration error.
+#[cfg_attr(not(all(feature = "opcua", feature = "mqtt")), allow(unused_variables))]
 fn apply_to(
     target: &WriterTarget,
     name: &str,
@@ -412,6 +414,7 @@ fn apply_to(
     commands: &[Command],
 ) -> Result<Vec<CommandResult>, Error> {
     match target {
+        #[cfg(feature = "opcua")]
         WriterTarget::OpcUa(opcua) => apply(
             ledger,
             lease,
@@ -419,19 +422,18 @@ fn apply_to(
             || crate::opcua::OpcUaConnector::connect(opcua.connection().connector_config(name)?),
             commands,
         ),
-    }
-}
-
-#[cfg(not(feature = "opcua"))]
-fn apply_to(
-    target: &WriterTarget,
-    _: &str,
-    _: &mut Ledger,
-    _: &mut InstanceLease,
-    _: &[Command],
-) -> Result<Vec<CommandResult>, Error> {
-    match target {
+        #[cfg(not(feature = "opcua"))]
         WriterTarget::OpcUa(_) => Err(Error::new("OPC UA writers need the opcua feature")),
+        #[cfg(feature = "mqtt")]
+        WriterTarget::Mqtt(mqtt) => apply(
+            ledger,
+            lease,
+            &mqtt.allow,
+            || crate::mqtt::write::MqttWriter::connect(mqtt.connection().connector_config(name)?),
+            commands,
+        ),
+        #[cfg(not(feature = "mqtt"))]
+        WriterTarget::Mqtt(_) => Err(Error::new("MQTT writers need the mqtt feature")),
     }
 }
 

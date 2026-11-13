@@ -6,6 +6,8 @@ provider supplies TLS. Hashi owns acknowledgment timing, routing, decoding, and
 the connector contract. Call the synchronous API from a dedicated OS thread
 outside a Tokio runtime.
 
+To publish host write commands to MQTT topics, see [write-back](write.md).
+
 ## Configure a subscription
 
 ```rust,ignore

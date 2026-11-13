@@ -23,6 +23,11 @@
 //! [[writer]]
 //! name = "line-1-setpoints"
 //! target.opcua = { endpoint = "opc.tcp://plc:4840", application_uri = "urn:site:hashi-writer", pki_dir = "pki/writer", policy = "basic256sha256", credential_file = "secrets/writer", timeout_ms = 5000, allow = ["ns=2;s=Setpoint"] }
+//!
+//! # Or an MQTT target (#107): QoS 2 publishes to exactly listed topics.
+//! [[writer]]
+//! name = "line-1-commands"
+//! target.mqtt = { host = "broker", port = 8883, protocol = "v5", client_id = "hashi-line-1-writer", ca_file = "pki/broker-ca.pem", timeout_ms = 5000, allow = ["plant/line-1/setpoint"] }
 //! ```
 
 use std::collections::BTreeSet;
@@ -86,6 +91,7 @@ pub struct WriterConfig {
 pub enum WriterTarget {
     #[serde(rename = "opcua")]
     OpcUa(OpcUaWriterConfig),
+    Mqtt(MqttWriterConfig),
 }
 
 /// `target.opcua = { endpoint, application_uri, pki_dir, policy, ..., allow }`.
@@ -161,6 +167,98 @@ impl OpcUaWriterConfig {
         join_opt(base, &mut self.credential_file);
         join_opt(base, &mut self.user_certificate);
         join_opt(base, &mut self.user_private_key);
+    }
+}
+
+/// `target.mqtt = { host, port, protocol, client_id, ..., allow }`.
+///
+/// The connection fields mean what they mean on `source.mqtt`. Give the writer
+/// its own `client_id`: a broker drops the older of two sessions under one id.
+/// `allow` lists the topic names a command may name, compared as exact
+/// strings; wildcards are refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MqttWriterConfig {
+    pub host: String,
+    pub port: u16,
+    pub protocol: String,
+    pub client_id: String,
+    #[serde(default)]
+    pub allow_insecure_lab: bool,
+    #[serde(default)]
+    pub credential_file: Option<PathBuf>,
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    #[serde(default)]
+    pub client_certificate: Option<PathBuf>,
+    #[serde(default)]
+    pub client_private_key: Option<PathBuf>,
+    #[serde(default)]
+    pub keep_alive_secs: Option<u64>,
+    pub timeout_ms: u64,
+    pub allow: Vec<String>,
+}
+
+/// Largest MQTT packet a writer sends or accepts.
+pub const MQTT_WRITER_MAX_PACKET_BYTES: u64 = 256 * 1024;
+
+impl MqttWriterConfig {
+    /// The connection as a source section, so validation and connection setup
+    /// stay one code path. Each allowed topic stands in for a route.
+    pub(crate) fn connection(&self) -> MqttSourceConfig {
+        MqttSourceConfig {
+            host: self.host.clone(),
+            port: self.port,
+            protocol: self.protocol.clone(),
+            client_id: self.client_id.clone(),
+            routes: self
+                .allow
+                .iter()
+                .map(|topic| MqttRouteConfig {
+                    filter: topic.clone(),
+                    kind: "write".into(),
+                    decoder: "raw".into(),
+                })
+                .collect(),
+            allow_insecure_lab: self.allow_insecure_lab,
+            credential_file: self.credential_file.clone(),
+            ca_file: self.ca_file.clone(),
+            client_certificate: self.client_certificate.clone(),
+            client_private_key: self.client_private_key.clone(),
+            shared_group: None,
+            session_expiry_secs: None,
+            keep_alive_secs: self.keep_alive_secs,
+            timeout_ms: self.timeout_ms,
+            max_packet_bytes: MQTT_WRITER_MAX_PACKET_BYTES,
+            schema_version: 1,
+            sparkplug_state_dir: None,
+        }
+    }
+
+    fn validate(&self, field: &impl Fn(&str) -> String) -> Result<(), String> {
+        let topic_ok = |topic: &String| {
+            !topic.is_empty() && !topic.contains(['+', '#', '\0']) && topic.len() <= 65535
+        };
+        if self.allow.is_empty() || !self.allow.iter().all(topic_ok) {
+            return Err(format!(
+                "invalid config: {}: list at least one topic name, without wildcards",
+                field("target.mqtt.allow")
+            ));
+        }
+        if self.allow.len() > 10_000 {
+            return Err(format!(
+                "invalid config: {}: at most 10000 topics",
+                field("target.mqtt.allow")
+            ));
+        }
+        self.connection().validate(field, "target.mqtt")
+    }
+
+    fn resolve_paths(&mut self, base: &Path) {
+        join_opt(base, &mut self.credential_file);
+        join_opt(base, &mut self.ca_file);
+        join_opt(base, &mut self.client_certificate);
+        join_opt(base, &mut self.client_private_key);
     }
 }
 
@@ -368,87 +466,7 @@ impl SourceConfig {
                 }
             }
             Self::OpcUa(opcua) => opcua.validate(field, "source.opcua")?,
-            Self::Mqtt(mqtt) => {
-                if mqtt.host.trim().is_empty() {
-                    return invalid("source.mqtt.host", "must not be empty");
-                }
-                if mqtt.port == 0 {
-                    return invalid("source.mqtt.port", "must be at least 1");
-                }
-                if !matches!(mqtt.protocol.as_str(), "v311" | "v5") {
-                    return invalid("source.mqtt.protocol", "use v311 or v5");
-                }
-                if mqtt.client_id.trim().is_empty() {
-                    return invalid("source.mqtt.client_id", "must not be empty");
-                }
-                if mqtt.routes.is_empty() {
-                    return invalid("source.mqtt.routes", "list at least one route");
-                }
-                for route in &mqtt.routes {
-                    if route.filter.trim().is_empty() || route.kind.trim().is_empty() {
-                        return invalid("source.mqtt.routes", "filter and kind must not be empty");
-                    }
-                    if !matches!(route.decoder.as_str(), "json" | "raw" | "sparkplug_b") {
-                        return invalid(
-                            "source.mqtt.routes",
-                            "decoder is json, raw, or sparkplug_b",
-                        );
-                    }
-                }
-                if mqtt.timeout_ms == 0 {
-                    return invalid("source.mqtt.timeout_ms", "must be at least 1");
-                }
-                if mqtt.max_packet_bytes == 0 {
-                    return invalid("source.mqtt.max_packet_bytes", "must be at least 1");
-                }
-                if mqtt.schema_version == 0 {
-                    return invalid("source.mqtt.schema_version", "must be at least 1");
-                }
-                if mqtt.session_expiry_secs == Some(0) {
-                    return invalid("source.mqtt.session_expiry_secs", "must be at least 1");
-                }
-                if mqtt.keep_alive_secs == Some(0) {
-                    return invalid("source.mqtt.keep_alive_secs", "must be at least 1");
-                }
-                let tls = mqtt
-                    .ca_file
-                    .as_ref()
-                    .is_some_and(|path| !path.as_os_str().is_empty());
-                if !tls && !mqtt.allow_insecure_lab {
-                    return invalid(
-                        "source.mqtt.ca_file",
-                        "required unless allow_insecure_lab is set",
-                    );
-                }
-                let cert = mqtt
-                    .client_certificate
-                    .as_ref()
-                    .is_some_and(|path| !path.as_os_str().is_empty());
-                let key = mqtt
-                    .client_private_key
-                    .as_ref()
-                    .is_some_and(|path| !path.as_os_str().is_empty());
-                if cert != key {
-                    return invalid(
-                        "source.mqtt.client_certificate",
-                        "set both client_certificate and client_private_key",
-                    );
-                }
-                if mqtt
-                    .routes
-                    .iter()
-                    .any(|route| route.decoder == "sparkplug_b")
-                    && mqtt
-                        .sparkplug_state_dir
-                        .as_ref()
-                        .is_none_or(|path| path.as_os_str().is_empty())
-                {
-                    return invalid(
-                        "source.mqtt.sparkplug_state_dir",
-                        "required by sparkplug_b routes",
-                    );
-                }
-            }
+            Self::Mqtt(mqtt) => mqtt.validate(field, "source.mqtt")?,
             Self::Modbus(modbus) => {
                 if modbus.state_dir.as_os_str().is_empty() {
                     return invalid("source.modbus.state_dir", "must not be empty");
@@ -719,6 +737,90 @@ impl SourceConfig {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+impl MqttSourceConfig {
+    /// Shared by `source.mqtt` and `target.mqtt` (through
+    /// [`MqttWriterConfig::connection`]); `prefix` names the section in errors.
+    fn validate(&self, field: &impl Fn(&str) -> String, prefix: &str) -> Result<(), String> {
+        let invalid = |name: &str, problem: &str| {
+            Err(format!(
+                "invalid config: {}: {problem}",
+                field(&format!("{prefix}.{name}"))
+            ))
+        };
+        if self.host.trim().is_empty() {
+            return invalid("host", "must not be empty");
+        }
+        if self.port == 0 {
+            return invalid("port", "must be at least 1");
+        }
+        if !matches!(self.protocol.as_str(), "v311" | "v5") {
+            return invalid("protocol", "use v311 or v5");
+        }
+        if self.client_id.trim().is_empty() {
+            return invalid("client_id", "must not be empty");
+        }
+        if self.routes.is_empty() {
+            return invalid("routes", "list at least one route");
+        }
+        for route in &self.routes {
+            if route.filter.trim().is_empty() || route.kind.trim().is_empty() {
+                return invalid("routes", "filter and kind must not be empty");
+            }
+            if !matches!(route.decoder.as_str(), "json" | "raw" | "sparkplug_b") {
+                return invalid("routes", "decoder is json, raw, or sparkplug_b");
+            }
+        }
+        if self.timeout_ms == 0 {
+            return invalid("timeout_ms", "must be at least 1");
+        }
+        if self.max_packet_bytes == 0 {
+            return invalid("max_packet_bytes", "must be at least 1");
+        }
+        if self.schema_version == 0 {
+            return invalid("schema_version", "must be at least 1");
+        }
+        if self.session_expiry_secs == Some(0) {
+            return invalid("session_expiry_secs", "must be at least 1");
+        }
+        if self.keep_alive_secs == Some(0) {
+            return invalid("keep_alive_secs", "must be at least 1");
+        }
+        let tls = self
+            .ca_file
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty());
+        if !tls && !self.allow_insecure_lab {
+            return invalid("ca_file", "required unless allow_insecure_lab is set");
+        }
+        let cert = self
+            .client_certificate
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty());
+        let key = self
+            .client_private_key
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty());
+        if cert != key {
+            return invalid(
+                "client_certificate",
+                "set both client_certificate and client_private_key",
+            );
+        }
+        if self
+            .routes
+            .iter()
+            .any(|route| route.decoder == "sparkplug_b")
+            && self
+                .sparkplug_state_dir
+                .as_ref()
+                .is_none_or(|path| path.as_os_str().is_empty())
+        {
+            return invalid("sparkplug_state_dir", "required by sparkplug_b routes");
         }
         Ok(())
     }
@@ -1215,6 +1317,7 @@ impl Config {
         for writer in &mut config.writers {
             match &mut writer.target {
                 WriterTarget::OpcUa(opcua) => opcua.resolve_paths(base),
+                WriterTarget::Mqtt(mqtt) => mqtt.resolve_paths(base),
             }
         }
         Ok(config)
@@ -1359,6 +1462,7 @@ impl Config {
             }
             match &writer.target {
                 WriterTarget::OpcUa(opcua) => opcua.validate(&field).map_err(Error::new)?,
+                WriterTarget::Mqtt(mqtt) => mqtt.validate(&field).map_err(Error::new)?,
             }
         }
         Ok(())
@@ -1438,7 +1542,9 @@ mod tests {
             Path::new("/etc/hashi"),
         )
         .unwrap();
-        let WriterTarget::OpcUa(opcua) = &parsed.writers[0].target;
+        let WriterTarget::OpcUa(opcua) = &parsed.writers[0].target else {
+            panic!("an OPC UA writer")
+        };
         // A writer-only file is valid; `hashi run` refuses it separately.
         let writer_only = writer("setpoints", "\"ns=2;s=Setpoint\"")
             .replace(&config(&valid_instance()), "checkpoint_dir = \"state\"\n");
@@ -1456,6 +1562,46 @@ mod tests {
             ),
         ] {
             let error = Config::parse(&text, Path::new(".")).unwrap_err().message;
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
+    /// An MQTT writer reuses the source connection rules under its own field
+    /// names and refuses wildcard topics.
+    #[test]
+    fn an_mqtt_writer_section_is_parsed_and_validated() {
+        let writer = |fields: &str| {
+            format!(
+                "checkpoint_dir = \"state\"\n[[writer]]\nname = \"commands\"\n\
+                 target.mqtt = {{ host = \"broker\", port = 8883, protocol = \"v5\", client_id = \"w\", \
+                 timeout_ms = 3000, {fields} }}\n"
+            )
+        };
+        let parsed = Config::parse(
+            &writer("ca_file = \"ca.pem\", allow = [\"plant/a/setpoint\"]"),
+            Path::new("/etc/hashi"),
+        )
+        .unwrap();
+        let WriterTarget::Mqtt(mqtt) = &parsed.writers[0].target else {
+            panic!("an MQTT writer")
+        };
+        assert_eq!(
+            mqtt.ca_file.as_deref(),
+            Some(Path::new("/etc/hashi/ca.pem"))
+        );
+        for (fields, field) in [
+            (
+                "ca_file = \"ca.pem\", allow = [\"plant/+/setpoint\"]",
+                "writer[0].target.mqtt.allow",
+            ),
+            (
+                "allow = [\"plant/a/setpoint\"]",
+                "writer[0].target.mqtt.ca_file",
+            ),
+        ] {
+            let error = Config::parse(&writer(fields), Path::new("."))
+                .unwrap_err()
+                .message;
             assert!(error.contains(field), "{error}");
         }
     }
