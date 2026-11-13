@@ -213,6 +213,11 @@ impl Service {
     /// Instances open lazily on their first pass, so one unavailable
     /// directory does not stop the others; it is retried on later passes.
     pub fn from_config(config: &Config) -> Result<Self, Error> {
+        if config.instances.is_empty() {
+            return Err(Error::new(
+                "invalid config: instance: hashi run needs at least one instance",
+            ));
+        }
         Ok(Self {
             checkpoint_dir: config.checkpoint_dir.clone(),
             leases: lease::open_store(&config.lease)?,

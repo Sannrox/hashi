@@ -5,5 +5,5 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
 COPY examples ./examples
-RUN cargo test --locked --features opcua-simulator --test opcua_discovery --test opcua_subscription --no-run -j 2
-CMD ["cargo", "test", "--locked", "--features", "opcua-simulator", "--test", "opcua_discovery", "--test", "opcua_subscription", "--", "--nocapture"]
+RUN cargo test --locked --features opcua-simulator --test opcua_discovery --test opcua_subscription --test opcua_write --no-run -j 2
+CMD ["cargo", "test", "--locked", "--features", "opcua-simulator", "--test", "opcua_discovery", "--test", "opcua_subscription", "--test", "opcua_write", "--", "--nocapture"]

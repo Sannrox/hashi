@@ -2,12 +2,14 @@
 pub mod historian;
 mod history;
 mod subscription;
+mod write;
 pub use history::HistoryConfig;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 pub use subscription::SubscriptionConfig;
+pub use write::PreparedWrite;
 
 use crate::contract::{CheckReport, DiscoveredKind, Position, Record};
 use crate::schema::{FieldType, Schema};

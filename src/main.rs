@@ -5,7 +5,9 @@
 //! `hashi discover --config <file> [--instance <name>]` prints discovered
 //! kinds; `hashi trust list|approve|revoke` reviews OPC UA server trust;
 //! `hashi outbox` runs MySQL change capture once for a sandboxed host, from
-//! the files its `CONNECTOR_*` variables name (see `hashi::outbox`).
+//! the files its `CONNECTOR_*` variables name (see `hashi::outbox`);
+//! `hashi write --config <file> --writer <name> <commands.json>` applies host
+//! write commands and prints one result per command (see `hashi::write`).
 
 use std::net::TcpListener;
 use std::process::ExitCode;
@@ -15,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hashi::observe::{Metrics, serve};
 use hashi::{Config, DiscoverOutcome, Service};
 
-const USAGE: &str = "usage: hashi run --config <file> [--once] [--interval-ms <n>] [--listen <addr>]\n       hashi diagnostics --config <file>\n       hashi discover --config <file> [--instance <name>]\n       hashi trust list --config <file> [--instance <name>]\n       hashi trust approve --config <file> [--instance <name>] <sha256>\n       hashi trust revoke --config <file> [--instance <name>] <sha256>\n       hashi outbox";
+const USAGE: &str = "usage: hashi run --config <file> [--once] [--interval-ms <n>] [--listen <addr>]\n       hashi diagnostics --config <file>\n       hashi discover --config <file> [--instance <name>]\n       hashi trust list --config <file> [--instance <name>]\n       hashi trust approve --config <file> [--instance <name>] <sha256>\n       hashi trust revoke --config <file> [--instance <name>] <sha256>\n       hashi outbox\n       hashi write --config <file> --writer <name> <commands.json>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -33,6 +35,7 @@ fn main() -> ExitCode {
         "discover" => discover(&args[1..]),
         "trust" => trust(&args[1..]),
         "outbox" => outbox(&args[1..]),
+        "write" => write(&args[1..]),
         _ => Err(USAGE.into()),
     };
     match outcome {
@@ -72,6 +75,44 @@ fn outbox(args: &[String]) -> Result<ExitCode, String> {
     }
     #[cfg(not(feature = "mysql"))]
     Err("hashi outbox needs the mysql feature".into())
+}
+
+/// Exit 0 when every command was applied, 1 when any was refused or unknown.
+fn write(args: &[String]) -> Result<ExitCode, String> {
+    let mut config_path = None;
+    let mut writer = None;
+    let mut commands_path = None;
+    let mut values = args.iter();
+    while let Some(arg) = values.next() {
+        match arg.as_str() {
+            "--config" => config_path = Some(values.next().ok_or(USAGE)?.clone()),
+            "--writer" => writer = Some(values.next().ok_or(USAGE)?.clone()),
+            value if !value.starts_with('-') && commands_path.is_none() => {
+                commands_path = Some(value.to_string())
+            }
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let (Some(config_path), Some(writer), Some(commands_path)) =
+        (config_path, writer, commands_path)
+    else {
+        return Err(USAGE.into());
+    };
+    let config = Config::load(config_path.as_ref()).map_err(|error| error.message)?;
+    let text = std::fs::read_to_string(&commands_path)
+        .map_err(|_| format!("command file {commands_path} is unreadable"))?;
+    let commands = hashi::write::CommandFile::parse(&text).map_err(|error| error.message)?;
+    let results = hashi::write::run(&config, &writer, &commands).map_err(|error| error.message)?;
+    print_json(&results)?;
+    let applied = results
+        .results
+        .iter()
+        .all(|result| result.outcome == hashi::write::Outcome::Applied);
+    Ok(if applied {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn diagnostics(args: &[String]) -> Result<ExitCode, String> {

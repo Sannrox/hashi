@@ -42,6 +42,7 @@ pub mod schema;
 pub mod service;
 pub mod sink;
 pub mod soak;
+pub mod write;
 
 pub use buffer::StoreAndForward;
 pub use checkpoint::{
