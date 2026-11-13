@@ -778,7 +778,7 @@ checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
 [[package]]
 name = "fencing-lease"
 version = "0.1.0"
-source = "git+https://github.com/Sannrox/agent-kit?rev=7adf5da3254b6a78f93c49837ab9f7cd6103b2d0#7adf5da3254b6a78f93c49837ab9f7cd6103b2d0"
+source = "git+https://github.com/Sannrox/fencing-lease?tag=v0.1.0#907c5743bd13c4be6c683a4155b479491823fbff"
 dependencies = [
  "libc",
  "postgres",
