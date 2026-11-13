@@ -65,7 +65,8 @@ sink.jsonl = { dir = "out/line-1" }
 - `writer` (optional, repeatable): a write target for `hashi write`, with
   `name` (same rules as `instance.name`, unique across instances and writers)
   and `target.opcua` (the `source.opcua` connection fields, `timeout_ms`, and
-  an `allow` list of node ids). See [OPC UA write-back](write.md).
+  an `allow` list of node ids) or `target.mqtt` (the `source.mqtt` connection
+  fields without routes, and an `allow` list of topics). See [write-back](write.md).
 
 Unknown fields are refused, and every error names its field, for example
 `invalid config: instance[0].source.fixture.records: must be at least 1`.

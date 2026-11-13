@@ -137,7 +137,7 @@ Tests use fixture sources and isolated simulators.
 - [Schema drift and quarantine](docs/schema-drift.md)
 - [Modbus polling](docs/modbus.md)
 - [OPC UA sessions, discovery, and subscriptions](docs/opcua.md)
-- [OPC UA write-back](docs/write.md)
+- [Write-back (OPC UA, MQTT)](docs/write.md)
 - [MySQL snapshot and change capture](docs/mysql.md)
 - [SQL Server snapshot and change capture](docs/mssql.md)
 - [PostgreSQL snapshot and change capture](docs/postgres.md)

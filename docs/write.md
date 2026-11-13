@@ -1,8 +1,8 @@
-# OPC UA write-back
+# Write-back
 
 `hashi write` applies write commands that the host has already authorized. It
-does not decide whether a write is allowed; it only refuses node ids that the
-writer's configuration does not list. One run reads a command file, applies
+does not decide whether a write is allowed; it only refuses targets (OPC UA
+node ids or MQTT topics) that the writer's configuration does not list. One run reads a command file, applies
 each command in order, prints the results as JSON, and exits.
 
 ```sh
@@ -11,10 +11,10 @@ hashi write --config hashi.toml --writer line-1-setpoints commands.json
 
 The exit code is 0 when every command was applied, 1 when any was refused or
 unknown, and 2 for a usage, configuration, lease, or ledger error. Hashi
-connects only when a command needs the server, so ids already in the ledger
-are answered even while the server is unreachable.
+connects only when a command needs the target, so ids already in the ledger
+are answered even while the server or broker is unreachable.
 
-## Writer
+## OPC UA writer
 
 ```toml
 [[writer]]
@@ -31,6 +31,39 @@ list. `allow` lists the node ids that a command may name. They are compared as
 exact strings, so write them in the same form the host uses. A writer name
 shares the checkpoint directory namespace with instances.
 
+## MQTT writer
+
+```toml
+[[writer]]
+name = "line-1-commands"
+target.mqtt = { host = "broker", port = 8883, protocol = "v5", client_id = "hashi-line-1-writer", ca_file = "pki/broker-ca.pem", timeout_ms = 5000, allow = ["plant/line-1/setpoint"] }
+```
+
+The connection fields mean what they mean on `source.mqtt`
+([MQTT](mqtt.md)): TLS through `ca_file` (and optionally
+`client_certificate` with `client_private_key`), `credential_file` with the user
+and password, and `allow_insecure_lab` for plaintext. Give the writer its own
+`client_id`, because a broker drops the older of two sessions that share one.
+`allow` lists the topic names that a command may name. They are compared as
+exact strings, and wildcards are refused. Limit the writer's broker user to
+those topics as well.
+
+Each command is one QoS 2 publish, not retained, whose payload is the command
+value as compact JSON text: `42.5`, `true`, `"on"` (with the quotes), or
+`{"sp":42}`. A packet over 256 KiB is refused before sending.
+
+`applied` means the broker completed the QoS 2 exchange (PUBCOMP). That is
+broker delivery, not confirmation by a device or any subscriber. An MQTT 3.1.1
+broker may also complete the exchange for a publish its access rules drop. An
+MQTT 5 broker that answers with a failure reason gives `refused`. Session loss
+or no PUBCOMP within `timeout_ms` gives `unknown`.
+
+The session is clean and never reconnects, because a resumed session would
+resend an unconfirmed publish. After a publish ends `refused` or `unknown`, the
+session is closed and the remaining commands in that run are refused before
+sending. Rerun them with the same ids. `hashi trust` does not apply to MQTT
+writers.
+
 ## Commands and results
 
 ```json
@@ -40,7 +73,8 @@ shares the checkpoint directory namespace with instances.
 ```
 
 `id` is chosen by the host and identifies one intended write for the lifetime
-of the writer's ledger. `value` is a JSON scalar. Hashi reads the node's
+of the writer's ledger. For MQTT, `target` is a topic and `value` is any JSON
+value (see above). For OPC UA, `value` is a JSON scalar. Hashi reads the node's
 DataType and converts the value: Boolean, the signed and unsigned integer types
 (the value must fit), Float, Double, Duration, and String. Other types are
 refused.
@@ -53,8 +87,8 @@ refused.
 
 | Outcome | Meaning | Same id again |
 | --- | --- | --- |
-| `applied` | The server returned Good for the write. | Answers `applied` from the ledger without sending. |
-| `refused` | The write was not applied. The `reason` field says why: not in `allow`, no connection, value does not fit, node unreadable, or the server returned a Bad status. | Pre-send refusals are not recorded and may be retried. A server refusal is recorded and answers again. |
+| `applied` | OPC UA: the server returned Good for the write. MQTT: the broker sent PUBCOMP. | Answers `applied` from the ledger without sending. |
+| `refused` | The write was not applied. The `reason` field says why: not in `allow`, no connection, value does not fit, node unreadable, the server returned a Bad status, or an MQTT 5 broker returned a failure reason. | Pre-send refusals are not recorded and may be retried. A server refusal is recorded and answers again. |
 | `unknown` | The request was sent but no clear answer arrived (lost session, timeout), or an earlier run crashed after recording intent. | Answers `unknown` without sending. Check the node and use a new id if the write is still wanted. |
 
 An id reused with a different target or value is refused without sending.
@@ -79,9 +113,9 @@ read them from the ledger. A successor that finds a predecessor paused inside
 a send waits for the fence; if its own hold lapsed meanwhile, it exits 2 and a
 rerun continues.
 
-The session is opened without automatic reconnects, and the write request is
-never retried. After a write ends `unknown`, the session is closed, and the
-remaining commands in that run are refused. Each command waits up to
+The OPC UA session is opened without automatic reconnects, and the write
+request is never retried. After a write ends `unknown`, the session is closed,
+and the remaining commands in that run are refused. Each command waits up to
 `timeout_ms` for the server, so a stalled server makes a long file slow to
 refuse.
 

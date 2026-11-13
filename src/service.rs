@@ -913,7 +913,7 @@ fn mysql_connector_config(
 
 #[cfg(feature = "mqtt")]
 impl MqttSourceConfig {
-    fn connector_config(&self, id: &str) -> Result<crate::mqtt::Config, Error> {
+    pub(crate) fn connector_config(&self, id: &str) -> Result<crate::mqtt::Config, Error> {
         let user_name = match &self.credential_file {
             Some(path) => {
                 let (user, password) = FileCredential::new(path).user_password()?;

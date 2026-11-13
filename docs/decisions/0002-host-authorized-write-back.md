@@ -30,7 +30,7 @@ send the same command twice.
 - Requests are sent once. No client-side retry and no session reconnect while
   a write is in flight.
 - Protocols implement one small `Target` (prepare without side effects, send
-  once). MQTT (#107) adds a second target on the same ledger.
+  once). MQTT (#107) adds a second target on the same ledger: one QoS 2 publish on a clean session that never reconnects, `applied` at PUBCOMP.
 
 ## Consequences
 
