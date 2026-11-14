@@ -7,14 +7,14 @@
 
 [product]
 name = "hashi"
-version = "0.1.0"
+version = "0.2.0"
 description = "Connector engine (industrial protocols and change data capture)"
 
 [deploy]
 workdir = "."
 install = """
 set -e
-IMG=ghcr.io/sannrox/hashi:0.1.0
+IMG=ghcr.io/sannrox/hashi:0.2.0
 test -f hashi.toml
 docker pull "$IMG"
 DIGEST=$(docker image inspect --format '{{.Id}}' "$IMG")
@@ -47,7 +47,7 @@ max_evidence_age_ms = 86400000
 
 [compatibility.components.hashi.pin]
 kind = "digest"
-value = "sha256:7401f6e2072e7ef467c236b1cac9f2b33e2270fb2c4387f8d83538ba59bc1ad6"
+value = "sha256:6af37f4f2c7ff2c80dc0febec71ebcf726efab4a725b7fea7728e203420f4c94"
 
 [compatibility.components.hashi.provides]
 "connector.capture" = "0.2.0"
