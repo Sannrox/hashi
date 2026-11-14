@@ -10,6 +10,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-14
+
+Every implemented source and sink now runs from the run file, PostgreSQL joins
+change data capture, and hosts can write back to OPC UA and MQTT at most once
+per command id. Config schema stays `version = 1`; existing files, checkpoints,
+cursors and the outbox contract are unchanged.
+
+### Upgrade and rollback
+
+- No action is needed for existing `fixture` + `jsonl` run files.
+- Rolling back to 0.1.0 refuses run files that use the new source, sink or
+  `[[writer]]` sections. Keep a 0.1.0-compatible file if you may roll back.
+- A PostgreSQL source owns a replication slot and publication on the server.
+  If you stop using it, drop the slot, or the server keeps WAL for it.
+- Write ledgers (`checkpoint_dir/<writer>/writes.v1.log`) are never compacted
+  in this release.
+- The Tenkai product manifest uses compatibility profile v2; older Tenkai
+  servers refuse it.
+
+### Added
+
+- `hashi run` selects every implemented family from the run file. Sources:
+  `fixture`, `opcua`, `mqtt`, `modbus`, `mysql`, `mssql`, `historian`,
+  `postgres`. Sinks: `jsonl`, `parquet`, and a Kafka-compatible topic log.
+  Unknown keys and kinds are refused with their location, and
+  `hashi diagnostics` reports each instance's source and sink family (#102).
+- PostgreSQL change data capture (`source.postgres`, optional `postgres`
+  feature): a consistent snapshot under an exported snapshot, then logical
+  replication with before images where replica identity supplies them, and
+  checkpoints tied to the replication slot. A dropped slot, recycled WAL, a
+  unique-key change or an unknown relation fails closed (#103).
+- Host-authorized write-back with `hashi write` and `hashi::write`. A
+  `[[writer]]` writes only to allow-listed OPC UA nodes or MQTT topics, at most
+  once per command id, through a fenced durable ledger that survives crash and
+  takeover. Each command reports `applied`, `refused` or `unknown`; an
+  `unknown` command is never resent. MQTT publishes at QoS 2, and `applied`
+  means broker delivery, not device confirmation (#108, #110).
+- `hashi discover` and `hashi trust list|approve|revoke` inspect a configured
+  source and manage OPC UA server certificates. Discover never trusts a
+  certificate on its own (#101).
+- `deploy/tenkai.toml` is the Tenkai product for the release image. It provides
+  `connector.capture` and `hashi.sink` 0.2.0. Tagged releases push
+  `ghcr.io/sannrox/hashi:<version>`; there is no `latest` tag, so deploy by
+  digest (#104).
+
+### Changed
+
+- Releases run from `main` for a signed tag, and `vX.Y.Z-rc.N` tags publish as
+  GitHub pre-releases (#90).
+- `fencing-lease` now comes from its own repository at its signed `v0.1.0`
+  tag. Lease, fencing and failover behavior are unchanged (#111).
+
+### Fixed
+
+- The release manifest keeps its gate flags; the packaging job can read pull
+  requests again (#91).
+
+### Security
+
+- Known, not reachable: the `mqtt` feature's `rumqttc` dependency still pulls
+  `rustls-webpki` 0.102 (RUSTSEC-2026-0382). Hashi hands `rumqttc` its own TLS
+  configuration on the patched 0.103 line, so the old copy is unused (#62).
+
 ## [0.1.0] - 2026-11-02
 
 First tagged release, prepared for signature and immutable release verification.
