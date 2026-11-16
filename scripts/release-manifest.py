@@ -59,7 +59,7 @@ def binaries_from_dir(dist: pathlib.Path) -> list[dict[str, str]]:
             continue
         if path.name in SKIP_NAMES:
             continue
-        if path.suffix == ".cdx.json" or path.name.endswith(".intoto.jsonl"):
+        if path.name.endswith(".cdx.json") or path.name.endswith(".intoto.jsonl"):
             continue
         if path.name.endswith("-image.tar"):
             continue
