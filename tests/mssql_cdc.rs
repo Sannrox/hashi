@@ -361,16 +361,19 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
         try_exec(&mut client, "EXEC sys.sp_cdc_scan").await;
     });
     let mut last = end;
-    let mut found_five = false;
+    let mut five = None;
     for _ in 0..16 {
         last = next(&mut source, &last)
             .unwrap_or_else(|error| panic!("cdc after capture-instance switch: {}", error.message));
         if last.key == "[5]" {
-            found_five = true;
+            five = Some(last.clone());
             break;
         }
     }
-    assert!(found_five);
+    // Only the new capture instance carries `extra`; the old one stays enabled.
+    let five: serde_json::Value =
+        serde_json::from_str(&five.expect("row 5 is captured").payload).unwrap();
+    assert_eq!(five["extra"], 9, "{five}");
     let discovered = source.discover().unwrap();
     assert!(
         discovered
