@@ -147,6 +147,7 @@ fn ten_thousand_monitored_items_have_bounded_batches_and_measured_latency() {
     let burst = Instant::now();
     server.update_samples(10_000);
     let mut ages = Vec::new();
+    let mut burst_keys = std::collections::BTreeSet::new();
     for _ in 0..10_000 {
         let record = source.read(from, None).unwrap().unwrap();
         assert!(
@@ -155,9 +156,12 @@ fn ten_thousand_monitored_items_have_bounded_batches_and_measured_latency() {
                 .unwrap()
                 >= 100_000.0
         );
+        assert!(from.is_none_or(|p| record.position > p));
         from = Some(record.position);
+        burst_keys.insert(record.key);
         ages.push(DateTime::now().as_chrono().timestamp_millis() - record.source_ts_ms);
     }
+    assert_eq!(burst_keys.len(), 10_000, "every node reports once");
     ages.sort();
     eprintln!(
         "10k change burst={:?}, records/s={:.0}, source-to-read age p50={}ms, p99={}ms",

@@ -213,17 +213,30 @@ fn runtime(
     )
 }
 
-fn delivered(sinks: &[MemorySink]) -> BTreeMap<(String, i64), usize> {
-    let mut seen = BTreeMap::new();
+/// Each delivered sample, by (tag, offset from START_MS), as (value, quality)
+/// per delivery, so a duplicate shows up as a second entry.
+type Delivered = BTreeMap<(String, i64), Vec<(f64, Option<String>)>>;
+
+fn delivered(sinks: &[MemorySink]) -> Delivered {
+    let mut seen = Delivered::new();
     for sink in sinks {
         for (record, _) in &sink.delivered {
             let (tag, ts) = record.key.split_once('@').unwrap();
-            *seen
-                .entry((tag.to_string(), ts.parse::<i64>().unwrap() - START_MS))
-                .or_insert(0) += 1;
+            let payload: serde_json::Value = serde_json::from_str(&record.payload).unwrap();
+            seen.entry((tag.to_string(), ts.parse::<i64>().unwrap() - START_MS))
+                .or_default()
+                .push((payload["value"].as_f64().unwrap(), record.quality.clone()));
         }
     }
     seen
+}
+
+/// The expected map for samples delivered once, all with quality `good`.
+fn good(samples: &[(&str, i64, f64)]) -> Delivered {
+    samples
+        .iter()
+        .map(|&(tag, ts, value)| ((tag.into(), ts), vec![(value, Some("good".into()))]))
+        .collect()
 }
 
 #[test]
@@ -243,17 +256,15 @@ fn sql_historian_backfills_and_tails_through_a_mapping() {
     let report = first.run().unwrap();
     assert_eq!(report.delivered, 5);
     let (_, first_sink, _) = first.into_parts();
-    let backfilled = delivered(&[first_sink]);
-    assert!(backfilled.values().all(|count| *count == 1), "overlap");
     assert_eq!(
-        backfilled.keys().cloned().collect::<Vec<_>>(),
-        vec![
-            ("line.pressure".into(), 1_000),
-            ("line.pressure".into(), 2_000),
-            ("line.temp".into(), 1_000),
-            ("line.temp".into(), 2_000),
-            ("line.temp".into(), 3_000),
-        ]
+        delivered(&[first_sink]),
+        good(&[
+            ("line.pressure", 1_000, 10.0),
+            ("line.pressure", 2_000, 20.0),
+            ("line.temp", 1_000, 1.0),
+            ("line.temp", 2_000, 2.0),
+            ("line.temp", 3_000, 3.0),
+        ])
     );
 
     insert_tail(&database);
@@ -264,10 +275,7 @@ fn sql_historian_backfills_and_tails_through_a_mapping() {
     let (_, tail_sink, _) = tail.into_parts();
     assert_eq!(
         delivered(&[tail_sink]),
-        BTreeMap::from([
-            (("line.temp".into(), 21_000), 1),
-            (("line.temp".into(), 22_000), 1),
-        ])
+        good(&[("line.temp", 21_000, 21.0), ("line.temp", 22_000, 22.0)])
     );
 
     let mut historian = SqlHistorian::connect(config(&database)).unwrap();
