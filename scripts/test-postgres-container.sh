@@ -22,12 +22,4 @@ port="$(docker port "$container" 5432/tcp | sed 's/.*://')"
 export HASHI_POSTGRES_DISPOSABLE=1 HASHI_POSTGRES_TEST_PORT="$port" HASHI_POSTGRES_CONTAINER="$container" \
   HASHI_POSTGRES_PASSWORD=hashi-fixture-only \
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target}"
-# TEMPORARY concurrency proof for #118: two suites against one server.
-cargo test --locked --features postgres --test postgres_cdc --no-run
-cargo test --locked --features postgres --test postgres_cdc -- --ignored --test-threads=1 > /tmp/pg-run-a.log 2>&1 & a=$!
-cargo test --locked --features postgres --test postgres_cdc -- --ignored --test-threads=1 > /tmp/pg-run-b.log 2>&1 & b=$!
-status=0
-wait "$a" || status=1
-wait "$b" || status=1
-for run in a b; do echo "== run $run"; grep -E "^test |test result" "/tmp/pg-run-$run.log"; done
-exit "$status"
+cargo test --locked --features postgres --test postgres_cdc -- --ignored --nocapture --test-threads=1
