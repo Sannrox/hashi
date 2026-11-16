@@ -544,3 +544,79 @@ fn a_relation_change_is_discovered_before_its_rows_dispatch() {
         "{rows:?}"
     );
 }
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-postgres-container.sh"]
+fn a_frame_beyond_the_batch_bound_fails_the_stream_visibly() {
+    assert_eq!(
+        std::env::var("HASHI_POSTGRES_DISPOSABLE").as_deref(),
+        Ok("1")
+    );
+    let port = std::env::var("HASHI_POSTGRES_TEST_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let database = format!("hashi_frame_{}", std::process::id());
+    let path = std::env::temp_dir().join(format!(
+        "hashi-postgres-frame-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let sql = |statements: &str| {
+        runtime.block_on(async {
+            let client = connect(port, &database).await;
+            exec(&client, statements).await;
+        })
+    };
+    runtime.block_on(async {
+        let admin = connect(port, "postgres").await;
+        exec(&admin, &format!("CREATE DATABASE {database}")).await;
+    });
+    sql(
+        "CREATE TABLE public.items (id INT PRIMARY KEY, value TEXT NOT NULL);
+         ALTER TABLE public.items REPLICA IDENTITY FULL;",
+    );
+    // Frame bound: 8 KiB plus 64 KiB protocol overhead.
+    let mut source = PostgresConnector::connect(Config {
+        max_batch_bytes: 8 * 1024,
+        ..config(port, &database, path.join("source"))
+    })
+    .unwrap();
+    // Reads until `stop` holds for a record, or returns the first error.
+    let mut cursor: (Option<u64>, Option<String>) = (None, None);
+    let mut read_until = |source: &mut PostgresConnector, stop: &dyn Fn(&Record) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "no record or error");
+            match source.read(cursor.0, cursor.1.as_deref()) {
+                Ok(Some(record)) => {
+                    cursor = (
+                        Some(record.position),
+                        record.source.as_ref().and_then(|s| s.cursor.clone()),
+                    );
+                    if stop(&record) {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(error) => return Err(error),
+            }
+        }
+    };
+
+    sql("INSERT INTO public.items VALUES (1, repeat('s', 1024));");
+    read_until(&mut source, &|record| record.key == "[1]")
+        .expect("a row under the bound is captured");
+
+    sql("INSERT INTO public.items VALUES (2, repeat('x', 200000));");
+    let error = read_until(&mut source, &|_| false).unwrap_err();
+    assert!(
+        error.to_string().contains("exceeds max_batch_bytes"),
+        "{error}"
+    );
+    assert!(!source.check().unwrap().ok, "the reader reports failure");
+}

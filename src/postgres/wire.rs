@@ -18,9 +18,18 @@ enum Conn {
     Tls(Box<TlsStream<TcpStream>>),
 }
 
+/// Protocol overhead allowed on top of `max_batch_bytes` for one frame:
+/// CopyData and XLogData headers plus per-column pgoutput markers.
+const FRAME_OVERHEAD: usize = 64 * 1024;
+
 pub(super) struct Replication {
     conn: Conn,
     buf: BytesMut,
+    /// Largest frame payload buffered before failing, derived from
+    /// `max_batch_bytes`, so memory per frame is bounded by configuration.
+    /// Measured on the wire: values that shrink when decoded (blank-padded
+    /// `char(n)`, hex `bytea`) count at their wire size.
+    max_frame: usize,
 }
 
 impl Replication {
@@ -57,6 +66,7 @@ impl Replication {
         let mut session = Self {
             conn,
             buf: BytesMut::new(),
+            max_frame: config.max_batch_bytes.saturating_add(FRAME_OVERHEAD),
         };
         session.startup(config).await?;
         session.authenticate(config).await?;
@@ -293,6 +303,11 @@ impl Replication {
         if len < 4 {
             return Err(Error::new("PostgreSQL replication message is invalid"));
         }
+        if len - 4 > self.max_frame {
+            return Err(Error::new(
+                "PostgreSQL replication message exceeds max_batch_bytes; raise it to capture this row",
+            ));
+        }
         self.fill(1 + len).await?;
         let _ = self.buf.split_to(5);
         Ok((tag, self.buf.split_to(len - 4).freeze()))
@@ -460,6 +475,39 @@ fn take_cstr<'a>(buf: &mut &'a [u8]) -> Result<Option<&'a str>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_frame_fails_from_its_header() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(oversized_frame());
+    }
+
+    async fn oversized_frame() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut frame = vec![b'd'];
+            frame.extend(u32::MAX.to_be_bytes());
+            socket.write_all(&frame).await.unwrap();
+            // Hold the socket open: the reader must not wait for the body.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let mut session = Replication {
+            conn: Conn::Plain(TcpStream::connect(addr).await.unwrap()),
+            buf: BytesMut::new(),
+            max_frame: 1024,
+        };
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), session.read_message())
+            .await
+            .expect("an oversized header fails without buffering the body")
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds max_batch_bytes"));
+        server.abort();
+    }
 
     #[test]
     fn field_m_reads_message() {
