@@ -562,7 +562,7 @@ mod sparkplug_b {
 
     #[test]
     #[ignore = "requires the disposable broker created by scripts/test-mqtt-container.sh"]
-    fn a_sequence_gap_requests_a_rebirth_and_unknown_aliases_are_quarantined() {
+    fn a_sequence_gap_requests_a_rebirth_and_quarantines_data_until_it() {
         let group = unique("g");
         let state = temp_dir("hashi-sparkplug-gap");
         let connector =
@@ -597,17 +597,20 @@ mod sparkplug_b {
             .filter(|r| r.key.ends_with("/temp"))
             .map(|r| json(r)["value"].as_f64().unwrap())
             .collect();
-        assert_eq!(temps, vec![20.0, 1.0, 2.0, 20.0]);
+        // After the gap no certificate is trusted until the rebirth: 2.0 is quarantined.
+        assert_eq!(temps, vec![20.0, 1.0, 20.0]);
         let quarantined = FileCheckpoint::open(&state)
             .unwrap()
             .quarantined("mqtt-fixture", "line-a")
             .unwrap();
-        assert_eq!(quarantined.len(), 1);
-        assert_eq!(quarantined[0].kind, UNRESOLVED_KIND);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&quarantined[0].payload).unwrap()["alias"],
-            9
-        );
+        assert!(quarantined.iter().all(|r| r.kind == UNRESOLVED_KIND));
+        let aliases: Vec<serde_json::Value> = quarantined
+            .iter()
+            .map(|r| {
+                serde_json::from_str::<serde_json::Value>(&r.payload).unwrap()["alias"].clone()
+            })
+            .collect();
+        assert_eq!(aliases, vec![1, 9]);
     }
 
     #[test]
