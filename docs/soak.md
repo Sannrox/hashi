@@ -4,7 +4,9 @@
 for a configured duration. Each cycle produces one change and drains until it
 arrives, one change at a time so a sampling source never overwrites one before
 it is read. Faults are injected on a schedule through the family's
-`soak::Faults` hooks, and the run ends with a final drain.
+`soak::Faults` hooks. A run that reaches its duration before every fault kind
+has been injected keeps going and injects the missing kinds back to back, so a
+slow host still covers each one. The run ends with a final drain.
 
 Every change produced must be delivered. One that never is, is a gap: the
 report names it and the run fails. A connector that cannot be rebuilt after a
