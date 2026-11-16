@@ -83,7 +83,12 @@ refers to them must reach the same instance.
 - A data message from a node without a birth, one whose sequence number skips,
   or one with a metric missing from the certificates makes the connector
   publish an NCMD `Node Control/Rebirth` request (QoS 0, at most once per
-  `timeout` per node). Known aliases keep resolving.
+  `timeout` per node).
+- A sequence gap may have hidden a birth or death that changed a
+  certificate, so it drops every certificate of that node, durably. Data by
+  alias or by name is unresolved until births register them again (the NBIRTH
+  for the node's own metrics, a DBIRTH for a device's), never attributed
+  through the old certificate.
 - An NBIRTH without `seq` or `bdSeq`, a topic whose shape does not match its
   message type, or a `seq` above 255 changes no state. A birth that declares an
   alias or a name twice leaves that identity unresolved.
@@ -136,5 +141,5 @@ instances on a shared subscription split the load without loss, and TLS refuses
 a client without a trusted certificate.
 The Sparkplug B proofs use an edge node simulator that answers rebirth
 requests: birth, alias resolution and device lifecycle, a sequence gap that
-triggers one rebirth with an unknown alias quarantined, and a reconnect at
+triggers one rebirth and quarantines the data until it, and a reconnect at
 QoS 1 that resolves queued alias-only data from durable birth state.

@@ -269,7 +269,16 @@ impl Hosts {
                 changed = true;
             }
             "DBIRTH" | "DDEATH" | "NDATA" | "DDATA" => {
-                needs_rebirth = !node.born || !node.check_seq(payload.seq);
+                let gap = node.born && !node.check_seq(payload.seq);
+                needs_rebirth = !node.born || gap;
+                if gap {
+                    // A lost message may have been a birth or death that changed a
+                    // certificate. Trust none until births replace them; persisted, so
+                    // a restart does not trust them again either.
+                    node.metrics.clear();
+                    node.aliases.clear();
+                    changed = true;
+                }
                 if matches!(parsed.message, "DBIRTH" | "DDEATH") {
                     // A device death invalidates its certificate until the next DBIRTH.
                     node.metrics.retain(|(owner, _), _| *owner != device);
@@ -701,11 +710,61 @@ mod tests {
             .decode("plant", "spBv1.0/g/NDATA/e", &later, 1_000)
             .unwrap();
         assert!(rebirth.is_some(), "a sequence gap requests a rebirth");
-        assert_eq!(
-            payloads(&records)[0]["value"],
-            3,
-            "known aliases still resolve"
+        assert_eq!(records[0].kind, UNRESOLVED_KIND);
+    }
+
+    #[test]
+    fn a_gap_hides_a_realiasing_birth_so_data_stays_unresolved_until_rebirth() {
+        let dir = dir();
+        let mut hosts = Hosts::open(&dir, 60_000).unwrap();
+        hosts
+            .decode("plant", "spBv1.0/g/NBIRTH/e", &born(vec![]), 0)
+            .unwrap();
+        let first = encode(
+            Some(1),
+            vec![metric(Some("old"), Some(5), Some(7), Value::Int(0))],
         );
+        hosts
+            .decode("plant", "spBv1.0/g/DBIRTH/e/d", &first, 0)
+            .unwrap();
+        // seq 2, a DBIRTH that moves alias 5 to "new", is lost.
+        let data = encode(Some(3), vec![metric(None, Some(5), None, Value::Int(42))]);
+        let (records, rebirth) = hosts
+            .decode("plant", "spBv1.0/g/DDATA/e/d", &data, 0)
+            .unwrap();
+        assert!(rebirth.is_some());
+        assert_eq!(records[0].kind, UNRESOLVED_KIND);
+        assert_eq!(payloads(&records)[0]["alias"], 5);
+        // A restart must not trust the invalidated certificates again.
+        drop(hosts);
+        let mut hosts = Hosts::open(&dir, 60_000).unwrap();
+        let named = encode(
+            Some(4),
+            vec![metric(Some("old"), None, None, Value::Int(43))],
+        );
+        let (records, rebirth) = hosts
+            .decode("plant", "spBv1.0/g/DDATA/e/d", &named, 0)
+            .unwrap();
+        assert_eq!(records[0].kind, UNRESOLVED_KIND, "names are stale too");
+        assert!(rebirth.is_some(), "the restarted host asks again");
+
+        hosts
+            .decode("plant", "spBv1.0/g/NBIRTH/e", &born(vec![]), 0)
+            .unwrap();
+        let reborn = encode(
+            Some(1),
+            vec![metric(Some("new"), Some(5), Some(7), Value::Int(0))],
+        );
+        hosts
+            .decode("plant", "spBv1.0/g/DBIRTH/e/d", &reborn, 0)
+            .unwrap();
+        let data = encode(Some(2), vec![metric(None, Some(5), None, Value::Int(44))]);
+        let (records, rebirth) = hosts
+            .decode("plant", "spBv1.0/g/DDATA/e/d", &data, 0)
+            .unwrap();
+        assert!(rebirth.is_none());
+        assert_eq!(records[0].key, "g/e/d/new");
+        assert_eq!(payloads(&records)[0]["value"], 44);
     }
 
     #[test]
