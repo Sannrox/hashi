@@ -438,3 +438,104 @@ impl hashi::conformance::Family for PostgresFamily {
         Ok(hashi::conformance::Drift::Reported("public.items".into()))
     }
 }
+
+// A pgoutput Relation message opens the transaction that first touches a
+// changed table. The runtime must see the new layout through discovery before
+// it dispatches any row of that transaction: a compatible change puts its
+// schema control ahead of the row, a breaking one quarantines the row.
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-postgres-container.sh"]
+fn a_relation_change_is_discovered_before_its_rows_dispatch() {
+    use hashi::schema::CONTROL_KIND;
+    use hashi::{FileCheckpoint, MemorySink, NullClock, Runtime, RuntimeConfig};
+    assert_eq!(
+        std::env::var("HASHI_POSTGRES_DISPOSABLE").as_deref(),
+        Ok("1")
+    );
+    let port = std::env::var("HASHI_POSTGRES_TEST_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let database = format!("hashi_relation_{}", std::process::id());
+    let path = std::env::temp_dir().join(format!(
+        "hashi-postgres-relation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let sql = |statements: &str| {
+        runtime.block_on(async {
+            let client = connect(port, &database).await;
+            exec(&client, statements).await;
+        })
+    };
+    runtime.block_on(async {
+        let admin = connect(port, "postgres").await;
+        exec(&admin, &format!("CREATE DATABASE {database}")).await;
+    });
+    sql("CREATE TABLE public.items (id INT PRIMARY KEY, value TEXT NOT NULL, count BIGINT NOT NULL);
+         ALTER TABLE public.items REPLICA IDENTITY FULL;
+         INSERT INTO public.items VALUES (1, 'one', 1);");
+    let source = PostgresConnector::connect(config(port, &database, path.join("source"))).unwrap();
+    let mut rt = Runtime::new(
+        source,
+        MemorySink::new(),
+        FileCheckpoint::open(path.join("checkpoints")).unwrap(),
+        NullClock { now_ms: 1 },
+        RuntimeConfig::new("relation"),
+    );
+    // Runs until `done` holds for the sink and the quarantine count.
+    let mut quarantined = 0u64;
+    let mut drain = |rt: &mut Runtime<_, MemorySink, _, _>,
+                     done: &dyn Fn(&MemorySink, u64) -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done(rt.sink(), quarantined) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime did not catch up"
+            );
+            quarantined += rt.run_while(|_| true).unwrap().quarantined;
+        }
+    };
+    let delivered = |sink: &MemorySink, key: &str| {
+        sink.delivered
+            .iter()
+            .position(|(record, _)| record.kind == "public.items" && record.key == key)
+    };
+    drain(&mut rt, &|sink, _| delivered(sink, "[1]").is_some());
+
+    sql(
+        "ALTER TABLE public.items ADD COLUMN extra INT NOT NULL DEFAULT 0;
+         INSERT INTO public.items VALUES (2, 'two', 2, 7);",
+    );
+    drain(&mut rt, &|sink, _| delivered(sink, "[2]").is_some());
+    let row = delivered(rt.sink(), "[2]").unwrap();
+    let control = rt
+        .sink()
+        .delivered
+        .iter()
+        .position(|(record, _)| record.kind == CONTROL_KIND && record.payload.contains("\"extra\""))
+        .expect("the compatible change emits a schema control");
+    assert!(
+        control < row,
+        "the schema control precedes the row it describes"
+    );
+
+    sql("ALTER TABLE public.items DROP COLUMN count;
+         INSERT INTO public.items VALUES (3, 'three', 9);");
+    drain(&mut rt, &|_, quarantined| quarantined > 0);
+    assert!(
+        delivered(rt.sink(), "[3]").is_none(),
+        "a row under a breaking change is never delivered"
+    );
+    let (_, _, store) = rt.into_parts();
+    let rows = store.quarantined("postgres-fixture", "relation").unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row.kind == "public.items" && row.key == "[3]"),
+        "{rows:?}"
+    );
+}
