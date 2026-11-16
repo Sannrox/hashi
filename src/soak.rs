@@ -6,7 +6,7 @@
 //! that never is, is a gap: the report names it and the run fails. A driver
 //! calls [`soak`] and writes the [`SoakReport`] as JSON.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -276,13 +276,25 @@ impl<'a, F: Faults> Soak<'a, F> {
         let started = Instant::now();
         let mut next_fault = interval;
         let mut rotation = faults.iter().copied().cycle();
-        while started.elapsed() < self.config.duration {
-            if !faults.is_empty()
-                && started.elapsed() >= next_fault
-                && let Some(fault) = rotation.next()
-            {
-                self.fault(fault)?;
+        // Every fault kind is injected at least once, however slow the host:
+        // past `duration`, the kinds still missing run back to back.
+        let mut missing: BTreeSet<Fault> = faults.iter().copied().collect();
+        loop {
+            let overtime = started.elapsed() >= self.config.duration;
+            if overtime && missing.is_empty() {
+                break;
+            }
+            let due = if overtime {
+                missing.first().copied()
+            } else if started.elapsed() >= next_fault {
                 next_fault += interval;
+                rotation.next()
+            } else {
+                None
+            };
+            if let Some(fault) = due {
+                self.fault(fault)?;
+                missing.remove(&fault);
             }
             self.produce()?;
             // One change at a time, so a sampling source never overwrites one
@@ -658,6 +670,28 @@ mod tests {
             json["faults"]["network_drop"].as_u64().map(|n| n >= 1),
             Some(true)
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_run_shorter_than_its_fault_interval_still_injects_every_fault() {
+        let mut family = LogFamily {
+            fixture: Shared::default(),
+            drop_at: None,
+            produced: 0,
+        };
+        let mut config = config();
+        config.duration = Duration::from_millis(100);
+        config.fault_interval = Some(Duration::from_secs(3600));
+        let dir = state_dir();
+        let report = soak(&mut family, "log", &dir, &config);
+        assert!(report.passed, "{report:?}");
+        let once: BTreeMap<_, _> = family
+            .faults()
+            .into_iter()
+            .map(|fault| (fault, 1))
+            .collect();
+        assert_eq!(report.faults, once, "{report:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
