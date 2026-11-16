@@ -239,7 +239,11 @@ fn snapshot_lsn_stream_restart_schema_and_dropped_slot() {
     runtime.block_on(async {
         let client = connect(port, &database).await;
         let slots: Vec<String> = client
-            .query("SELECT slot_name FROM pg_replication_slots", &[])
+            // Slots are cluster-wide; concurrent runs own other databases' slots.
+            .query(
+                "SELECT slot_name FROM pg_replication_slots WHERE database = current_database()",
+                &[],
+            )
             .await
             .unwrap()
             .into_iter()
@@ -263,9 +267,10 @@ fn snapshot_lsn_stream_restart_schema_and_dropped_slot() {
             .batch_execute(
                 "SELECT pg_terminate_backend(active_pid)
                  FROM pg_replication_slots
-                 WHERE active;
+                 WHERE active AND database = current_database();
                  SELECT pg_drop_replication_slot(slot_name)
-                 FROM pg_replication_slots;",
+                 FROM pg_replication_slots
+                 WHERE database = current_database();",
             )
             .await;
         exec(&client, "INSERT INTO public.items VALUES (99, 'gone', 1)").await;
