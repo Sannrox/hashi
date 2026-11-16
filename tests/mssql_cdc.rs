@@ -405,3 +405,94 @@ fn snapshot_lsn_stream_resume_capture_switch_and_retention() {
     assert!(!report.ok, "{}", report.message);
     assert!(report.message.contains("retention"));
 }
+
+// Every integer and temporal type the schema declares decodes through both
+// the snapshot and the CDC path, with values and with NULLs.
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mssql-container.sh"]
+fn integer_and_temporal_columns_decode() {
+    assert_eq!(std::env::var("HASHI_MSSQL_DISPOSABLE").as_deref(), Ok("1"));
+    let port = std::env::var("HASHI_MSSQL_TEST_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let database = format!("hashi_types_{}", std::process::id());
+    let path = std::env::temp_dir().join(format!(
+        "hashi-mssql-types-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let values = "200, -300, 70000, 9000000000, '2024-01-02 03:04:05', '2024-01-02 03:04:05.1234567', '2024-01-02', '03:04:05.5'";
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut client = connect(port, None).await;
+        exec(&mut client, &format!("CREATE DATABASE [{database}]")).await;
+        drop(client);
+        let mut client = connect(port, Some(&database)).await;
+        exec(
+            &mut client,
+            "CREATE TABLE dbo.items (id INT NOT NULL PRIMARY KEY, t TINYINT NULL, s SMALLINT NULL, i INT NULL, b BIGINT NULL, dt DATETIME NULL, dt2 DATETIME2(7) NULL, d DATE NULL, tm TIME(7) NULL)",
+        )
+        .await;
+        exec(
+            &mut client,
+            &format!("INSERT INTO dbo.items VALUES (1, {values}), (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"),
+        )
+        .await;
+        wait_agent(&mut client).await;
+        exec(&mut client, "EXEC sys.sp_cdc_enable_db").await;
+        exec(
+            &mut client,
+            "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', @source_name=N'items', @role_name=NULL, @supports_net_changes=0",
+        )
+        .await;
+        wait_capture_instance(&mut client, 1).await;
+        wait_max_lsn(&mut client).await;
+    });
+    let full = serde_json::json!({
+        "t": 200, "s": -300, "i": 70000, "b": 9000000000_i64,
+        "dt": "2024-01-02 03:04:05.000000",
+        "dt2": "2024-01-02 03:04:05.123456",
+        "d": "2024-01-02",
+        "tm": "03:04:05.500000",
+    });
+    let payload = |record: &Record| -> serde_json::Value {
+        let mut value: serde_json::Value = serde_json::from_str(&record.payload).unwrap();
+        value.as_object_mut().unwrap().remove("id");
+        value
+    };
+    let mut source = MssqlConnector::connect(config("127.0.0.1", port, &database, path)).unwrap();
+    let first = source.read(None, None).unwrap().unwrap();
+    assert_eq!(payload(&first), full);
+    let second = next(&mut source, &first).unwrap();
+    let nulls = payload(&second);
+    assert!(
+        nulls
+            .as_object()
+            .unwrap()
+            .values()
+            .all(serde_json::Value::is_null),
+        "{nulls}"
+    );
+    runtime.block_on(async {
+        let mut client = connect(port, Some(&database)).await;
+        exec(
+            &mut client,
+            &format!("INSERT INTO dbo.items VALUES (3, {values})"),
+        )
+        .await;
+        try_exec(&mut client, "EXEC sys.sp_cdc_scan").await;
+    });
+    let mut last = second;
+    for _ in 0..8 {
+        last = next(&mut source, &last).unwrap();
+        if last.key == "[3]" {
+            assert_eq!(payload(&last), full);
+            return;
+        }
+    }
+    panic!("CDC insert of row 3 was not delivered");
+}

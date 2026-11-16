@@ -224,73 +224,37 @@ pub(super) fn cells(row: &Row, start: usize, layout: &Layout) -> Result<Vec<Cell
         .columns
         .iter()
         .enumerate()
-        .map(|(i, column)| cell(row, start + i, column.field.clone()))
+        .map(|(i, column)| cell(row, start + i, column))
         .collect()
 }
 
-fn cell(row: &Row, index: usize, field: FieldType) -> Result<Cell, Error> {
-    match field {
-        FieldType::Bool => Ok(match row.try_get::<bool, _>(index).map_err(sql_error)? {
-            None => Cell::Null,
-            Some(v) => Cell::Bool(v),
-        }),
-        FieldType::I32 => match row.try_get::<i32, _>(index).map_err(sql_error)? {
-            None => match optional_i32(row, index)? {
-                None => Ok(Cell::Null),
-                Some(v) => Ok(Cell::I32(v)),
-            },
-            Some(v) => Ok(Cell::I32(v)),
-        },
-        FieldType::I64 => match row.try_get::<i64, _>(index).map_err(sql_error)? {
-            None => match optional_i32(row, index)? {
-                None => Ok(Cell::Null),
-                Some(v) => Ok(Cell::I64(i64::from(v))),
-            },
-            Some(v) => Ok(Cell::I64(v)),
-        },
-        FieldType::F32 => Ok(match row.try_get::<f32, _>(index).map_err(sql_error)? {
-            None => Cell::Null,
-            Some(v) => Cell::F32(v),
-        }),
-        FieldType::F64 => Ok(match row.try_get::<f64, _>(index).map_err(sql_error)? {
-            None => Cell::Null,
-            Some(v) => Cell::F64(v),
-        }),
-        FieldType::Bytes => Ok(match row.try_get::<&[u8], _>(index).map_err(sql_error)? {
-            None => Cell::Null,
-            Some(v) => Cell::Bytes(v.to_vec()),
-        }),
-        FieldType::Text => match row.try_get::<&str, _>(index).map_err(sql_error)? {
-            Some(v) => Ok(Cell::Text(v.to_owned())),
-            None => match text_cell(row, index)? {
-                Some(v) => Ok(Cell::Text(v)),
-                None => Ok(Cell::Null),
-            },
-        },
+/// Decodes one value with the Rust type the column's declared SQL type maps
+/// to. The driver rejects a mismatched type with an error rather than `None`,
+/// so the decoder is chosen up front, never by trial. NULL is `Cell::Null`.
+fn cell(row: &Row, index: usize, column: &Column) -> Result<Cell, Error> {
+    fn get<'a, T: tiberius::FromSql<'a>>(row: &'a Row, index: usize) -> Result<Option<T>, Error> {
+        row.try_get::<T, _>(index).map_err(sql_error)
     }
-}
-
-fn optional_i32(row: &Row, index: usize) -> Result<Option<i32>, Error> {
-    if let Ok(v) = row.try_get::<i16, _>(index) {
-        return Ok(v.map(i32::from));
-    }
-    if let Ok(v) = row.try_get::<u8, _>(index) {
-        return Ok(v.map(i32::from));
-    }
-    Ok(None)
-}
-
-fn text_cell(row: &Row, index: usize) -> Result<Option<String>, Error> {
-    if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(index) {
-        return Ok(v.map(|v| v.format("%Y-%m-%d %H:%M:%S%.6f").to_string()));
-    }
-    if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(index) {
-        return Ok(v.map(|v| v.format("%Y-%m-%d").to_string()));
-    }
-    if let Ok(v) = row.try_get::<chrono::NaiveTime, _>(index) {
-        return Ok(v.map(|v| v.format("%H:%M:%S%.6f").to_string()));
-    }
-    Ok(None)
+    let value = match (&column.field, column.sql_type.to_ascii_lowercase().as_str()) {
+        (FieldType::Bool, _) => get::<bool>(row, index)?.map(Cell::Bool),
+        (FieldType::I32, "tinyint") => get::<u8>(row, index)?.map(|v| Cell::I32(v.into())),
+        (FieldType::I32, "smallint") => get::<i16>(row, index)?.map(|v| Cell::I32(v.into())),
+        (FieldType::I32, _) => get::<i32>(row, index)?.map(Cell::I32),
+        (FieldType::I64, _) => get::<i64>(row, index)?.map(Cell::I64),
+        (FieldType::F32, _) => get::<f32>(row, index)?.map(Cell::F32),
+        (FieldType::F64, _) => get::<f64>(row, index)?.map(Cell::F64),
+        (FieldType::Bytes, _) => get::<&[u8]>(row, index)?.map(|v| Cell::Bytes(v.to_vec())),
+        (FieldType::Text, "datetime" | "datetime2" | "smalldatetime") => {
+            get::<chrono::NaiveDateTime>(row, index)?
+                .map(|v| Cell::Text(v.format("%Y-%m-%d %H:%M:%S%.6f").to_string()))
+        }
+        (FieldType::Text, "date") => get::<chrono::NaiveDate>(row, index)?
+            .map(|v| Cell::Text(v.format("%Y-%m-%d").to_string())),
+        (FieldType::Text, "time") => get::<chrono::NaiveTime>(row, index)?
+            .map(|v| Cell::Text(v.format("%H:%M:%S%.6f").to_string())),
+        (FieldType::Text, _) => get::<&str>(row, index)?.map(|v| Cell::Text(v.to_owned())),
+    };
+    Ok(value.unwrap_or(Cell::Null))
 }
 
 fn scalar(value: &Cell, column: &Column) -> Result<serde_json::Value, Error> {
