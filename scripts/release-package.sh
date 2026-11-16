@@ -36,6 +36,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$OUT" ]] || fail "usage: $0 --out dist [--tag vX.Y.Z] [--git-sha SHA]"
+# A tag package reads its gate flags from GitHub; only --skip-github opts out.
+if [[ -n "$TAG" ]]; then
+  if [[ "$SKIP_GITHUB" -eq 1 ]]; then
+    printf 'release-package: --skip-github: the manifest carries no gate flags\n' >&2
+  else
+    command -v gh >/dev/null 2>&1 || fail "gh is required to read gate labels; pass --skip-github to package without gate flags"
+  fi
+fi
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
@@ -103,7 +111,7 @@ for path in sorted(p for p in out.iterdir() if p.is_file() and p.name != "SHA256
 ' "$OUT"
 
 LABEL_ARGS=()
-if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; then
+if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]]; then
   # Gate flags cover exactly the pull requests merged into the release commit
   # since the nearest earlier final tag in its history: an rc tag never starts
   # the range, or a final release would drop the pull requests merged before
@@ -117,13 +125,25 @@ if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; the
     range="${prev}..${GIT_SHA}"
     query="merged:>=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$prev") ${query}"
   fi
+  # A failed or truncated lookup would publish a manifest without gate flags,
+  # so both stop packaging.
+  limit=1000
+  prs="$(gh pr list --state merged --limit "$limit" --search "$query" --json mergeCommit,labels)" \
+    || fail "could not read merged pull requests for gate labels; pass --skip-github to package without gate flags"
+  labels="$(python3 -c '
+import json, sys
+prs = json.load(sys.stdin)
+if len(prs) >= int(sys.argv[1]):
+    sys.exit(f"release-package: gate-label lookup reached the {sys.argv[1]} pull request limit")
+for pr in prs:
+    if pr.get("mergeCommit"):
+        for label in pr["labels"]:
+            print(pr["mergeCommit"]["oid"] + "\t" + label["name"])
+' "$limit" <<<"$prs")" || exit 1
   while IFS= read -r label; do
     [[ -n "$label" ]] && LABEL_ARGS+=(--label "$label")
   done < <(
-    gh pr list --state merged --limit 1000 --search "$query" --json mergeCommit,labels \
-      --jq '.[] | select(.mergeCommit != null) | .mergeCommit.oid as $oid | .labels[] | "\($oid)\t\(.name)"' 2>/dev/null \
-      | awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(git rev-list "$range") - \
-      | sort -u || true
+    awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(git rev-list "$range") - <<<"$labels" | sort -u
   )
 fi
 

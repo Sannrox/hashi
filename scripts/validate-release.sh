@@ -104,8 +104,7 @@ fi
 grep -F 'git rev-list "$range"' scripts/release-package.sh >/dev/null \
   && grep -F 'range="${prev}..${GIT_SHA}"' scripts/release-package.sh >/dev/null \
   || fail "scripts/release-package.sh must take gate flags only from pull requests in the release commit's history"
-# The gate-flag lookup discards its errors, so a token that cannot read pull
-# requests would silently drop every gate flag.
+# A token that cannot read pull requests would fail every tag package.
 python3 - "$workflow" <<'PY_PR_READ' || fail "${workflow} must grant pull-requests: read to the job that runs release-package.sh"
 import re, sys
 body = open(sys.argv[1]).read().split("\njobs:\n", 1)[1]
@@ -134,5 +133,26 @@ bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --sk
 expected="$(python3 scripts/changelog-notes.py "$version" | head -n 1)"
 [[ -n "$expected" ]] || fail "CHANGELOG.md has no section for ${version}"
 grep -F -- "$expected" "${notes_out}/RELEASE_NOTES.md" >/dev/null || fail "CHANGELOG notes missing the ${version} section"
+
+# A tag package without --skip-github fails closed when the gate-label lookup
+# cannot be trusted: gh missing, gh failing, or a result at the query limit.
+expect_package_failure() {
+  local message="$1" path="$2" output
+  if output="$(PATH="$path" bash scripts/release-package.sh --out "${tmp}/gh" --skip-build --skip-test --tag "v${version}" --git-sha "$(git rev-parse HEAD)" 2>&1)"; then
+    fail "tag package must fail when ${message}"
+  fi
+  [[ "$output" == *"$message"* ]] || fail "tag package failed without '${message}': ${output}"
+}
+mkdir -p "${tmp}/no-gh" "${tmp}/gh-fails" "${tmp}/gh-full" "${tmp}/gh-ok"
+for tool in bash dirname; do ln -s "$(command -v "$tool")" "${tmp}/no-gh/${tool}"; done
+printf '#!/bin/sh\necho "HTTP 401: Bad credentials" >&2\nexit 1\n' >"${tmp}/gh-fails/gh"
+printf '#!/bin/sh\npython3 -c "import json; print(json.dumps([{\\"mergeCommit\\": None, \\"labels\\": []}] * 1000))"\n' >"${tmp}/gh-full/gh"
+printf '#!/bin/sh\necho "[]"\n' >"${tmp}/gh-ok/gh"
+chmod +x "${tmp}"/gh-*/gh
+expect_package_failure "gh is required" "${tmp}/no-gh"
+expect_package_failure "could not read merged pull requests" "${tmp}/gh-fails:${PATH}"
+expect_package_failure "reached the 1000 pull request limit" "${tmp}/gh-full:${PATH}"
+PATH="${tmp}/gh-ok:${PATH}" bash scripts/release-package.sh --out "${tmp}/gh" --skip-build --skip-test --tag "v${version}" --git-sha "$(git rev-parse HEAD)" >/dev/null \
+  || fail "tag package must pass when the gate-label lookup succeeds"
 
 printf 'validate-release passed\n'
