@@ -34,19 +34,52 @@ CARGO = ROOT / "Cargo.toml"
 PRODUCT = ROOT / "deploy" / "tenkai.toml"
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
-# Semantic versions of the capture surface. Adding an optional field is a
-# minor; removing, renaming, or changing meaning is a major. The integer
+# Semantic versions of the capture surface: each field with its type and serde
+# attributes. Adding an optional field is a minor; removing, renaming, changing
+# a type or optionality, or changing meaning is a major. The integer
 # CONTRACT_VERSION is part of the key so a persistence bump cannot stay silent.
 CAPTURE_VERSIONS = {
     (
         2,
-        ("source", "kind", "key", "source_ts_ms", "ingest_ts_ms", "quality", "position", "payload"),
-        ("cursor", "change"),
-        ("operation", "before_image", "transaction_id", "commit_ts_ms"),
-        ("Insert", "Update", "Delete", "TransactionBegin", "TransactionEnd"),
-        ("ok", "message"),
-        ("kind", "schema", "metadata"),
-        ("connector", "instance", "record_kind", "key", "position"),
+        (
+            "source: Option<SourceMetadata>",
+            "kind: String",
+            "key: String",
+            "source_ts_ms: i64",
+            "ingest_ts_ms: i64",
+            "quality: Option<String>",
+            "position: Position",
+            "payload: String",
+        ),
+        ("#[serde(deny_unknown_fields)]", "cursor: Option<String>", "change: Option<Change>"),
+        (
+            "#[serde(deny_unknown_fields)]",
+            "operation: Operation",
+            "before_image: Option<String>",
+            "transaction_id: Option<String>",
+            "commit_ts_ms: Option<i64>",
+        ),
+        (
+            '#[serde(rename_all = "snake_case")]',
+            "Insert",
+            "Update",
+            "Delete",
+            "TransactionBegin",
+            "TransactionEnd",
+        ),
+        ("ok: bool", "message: String"),
+        (
+            "kind: String",
+            "schema: crate::schema::Schema",
+            "metadata: std::collections::BTreeMap<String, String>",
+        ),
+        (
+            "connector: String",
+            "instance: String",
+            "record_kind: String",
+            "key: String",
+            "position: Position",
+        ),
     ): "0.2.0",
 }
 
@@ -61,11 +94,23 @@ def fail(message: str) -> None:
     raise SystemExit(f"tenkai-profile: {message}")
 
 
-def rust_struct_fields(source: str, name: str) -> tuple[str, ...]:
-    marker = f"struct {name} {{"
+def rust_item(source: str, keyword: str, name: str) -> tuple[tuple[str, ...], str]:
+    """The `#[serde(...)]` attributes above `keyword name` and its brace body."""
+    marker = f"{keyword} {name} {{"
     start = source.find(marker)
     if start < 0:
-        fail(f"missing struct {name}")
+        fail(f"missing {keyword} {name}")
+    attrs: list[str] = []
+    # Walk up from the item's own line (`pub `) to the previous item's code,
+    # past blank and comment lines that Rust allows between attributes.
+    for line in reversed(source[:start].splitlines()[:-1]):
+        line = line.strip()
+        if not line or line.startswith("//"):
+            continue
+        if not line.startswith("#["):
+            break
+        if line.startswith("#[serde("):
+            attrs.append(normalize(line))
     i = start + len(marker)
     depth = 1
     while i < len(source) and depth:
@@ -75,48 +120,61 @@ def rust_struct_fields(source: str, name: str) -> tuple[str, ...]:
         elif char == "}":
             depth -= 1
         i += 1
-    body = source[start + len(marker) : i - 1]
+    return tuple(reversed(attrs)), source[start + len(marker) : i - 1]
+
+
+def normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
+def rust_struct_fields(source: str, name: str) -> tuple[str, ...]:
+    """Container serde attributes, then each field as `[#[serde(..)] ]name: Type`.
+
+    Types and serde attributes are part of the wire shape, so changing either
+    changes the surface and must be recorded in the version table.
+    """
+    attrs, body = rust_item(source, "struct", name)
     fields: list[str] = []
+    pending: list[str] = []
     for raw in body.splitlines():
         line = raw.strip()
-        if not line or line.startswith("//") or line.startswith("#["):
+        if not line or line.startswith("//"):
             continue
-        ident, sep, _rest = line.partition(":")
+        if line.startswith("#["):
+            if line.startswith("#[serde("):
+                pending.append(normalize(line))
+            continue
+        ident, sep, rest = line.partition(":")
         if sep != ":":
             continue
         ident = ident.strip().removeprefix("pub ").strip()
         if ident.isidentifier():
-            fields.append(ident)
+            fields.append(" ".join([*pending, f"{ident}: {normalize(rest.rstrip().rstrip(','))}"]))
+        pending = []
     if not fields:
         fail(f"struct {name} has no fields")
-    return tuple(fields)
+    return attrs + tuple(fields)
 
 
 def rust_enum_variants(source: str, name: str) -> tuple[str, ...]:
-    marker = f"enum {name} {{"
-    start = source.find(marker)
-    if start < 0:
-        fail(f"missing enum {name}")
-    i = start + len(marker)
-    depth = 1
-    while i < len(source) and depth:
-        char = source[i]
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-        i += 1
-    body = source[start + len(marker) : i - 1]
+    """Container serde attributes, then each variant as `[#[serde(..)] ]Name`."""
+    attrs, body = rust_item(source, "enum", name)
     variants: list[str] = []
+    pending: list[str] = []
     for raw in body.splitlines():
         line = raw.strip().rstrip(",")
-        if not line or line.startswith("//") or line.startswith("#["):
+        if not line or line.startswith("//"):
+            continue
+        if line.startswith("#["):
+            if line.startswith("#[serde("):
+                pending.append(normalize(line))
             continue
         if line.isidentifier():
-            variants.append(line)
+            variants.append(" ".join([*pending, line]))
+        pending = []
     if not variants:
         fail(f"enum {name} has no variants")
-    return tuple(variants)
+    return attrs + tuple(variants)
 
 
 def rust_const_u32(source: str, name: str) -> int:
@@ -141,6 +199,12 @@ def rust_const_str(source: str, name: str) -> str:
 
 def capture_surface(source: str | None = None) -> tuple:
     text = CONTRACT_RS.read_text() if source is None else source
+    # The surface is read line by line; an attribute split over lines would be
+    # missed silently, so refuse it.
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#[") and not line.endswith("]"):
+            fail(f"contract attributes must fit on one line: {line}")
     return (
         rust_const_u32(text, "CONTRACT_VERSION"),
         rust_struct_fields(text, "Record"),
@@ -302,6 +366,24 @@ def self_test() -> None:
     else:
         fail("self-test: extra capture field must be unknown")
 
+    # A type or wire-attribute change on an existing field is a new surface.
+    for old, new in [
+        ("pub quality: Option<String>,", "pub quality: String,"),
+        ("pub source_ts_ms: i64,", "pub source_ts_ms: u64,"),
+        ("    pub before_image: Option<String>,", '    #[serde(skip_serializing_if = "Option::is_none")]\n    pub before_image: Option<String>,'),
+        ('#[serde(rename_all = "snake_case")]', '#[serde(rename_all = "camelCase")]'),
+        ("    Insert,", '    #[serde(rename = "create")]\n    Insert,'),
+        ("#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct Change", '#[serde(rename_all = "camelCase")]\n\n// note\n#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct Change'),
+        ("#[serde(deny_unknown_fields)]\npub struct Change", '#[serde(\n    rename_all = "camelCase"\n)]\n#[serde(deny_unknown_fields)]\npub struct Change'),
+    ]:
+        if contract_src.count(old) != 1:
+            fail(f"self-test: fixture does not apply: {old}")
+        try:
+            capture_version(capture_surface(contract_src.replace(old, new)))
+        except SystemExit:
+            continue
+        fail(f"self-test: changed capture surface must be unknown: {new}")
+
     extra_sink = (sink[0], sink[1] + 1, sink[2], sink[3])
     try:
         sink_version(extra_sink)
@@ -348,13 +430,13 @@ def main(argv: list[str]) -> None:
         sink = sink_surface()
         print("capture")
         print(f"contract_version {capture[0]}")
-        print("record " + " ".join(capture[1]))
-        print("source_metadata " + " ".join(capture[2]))
-        print("change " + " ".join(capture[3]))
-        print("operation " + " ".join(capture[4]))
-        print("check_report " + " ".join(capture[5]))
-        print("discovered_kind " + " ".join(capture[6]))
-        print("idempotency_key " + " ".join(capture[7]))
+        print("record " + "; ".join(capture[1]))
+        print("source_metadata " + "; ".join(capture[2]))
+        print("change " + "; ".join(capture[3]))
+        print("operation " + "; ".join(capture[4]))
+        print("check_report " + "; ".join(capture[5]))
+        print("discovered_kind " + "; ".join(capture[6]))
+        print("idempotency_key " + "; ".join(capture[7]))
         print("---")
         print(
             f"protocol {sink[0]} version {sink[1]} magic {sink[2]} legacy {sink[3]}"
