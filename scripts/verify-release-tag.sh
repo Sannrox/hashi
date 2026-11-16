@@ -67,8 +67,15 @@ verify_release_tag() {
     [[ "$peeled" == "$expected_commit" ]] || fail "tag ${tag} resolves to ${peeled}, expected ${expected_commit}"
   fi
 
-  raw="$(git verify-tag --raw "$tag" 2>&1)" || true
-  [[ "$raw" == *VALIDSIG* ]] || fail "tag ${tag} is unsigned or the signature is not valid"
+  # The signing tool reports VALIDSIG whenever the signature matches, even
+  # for an expired or revoked key, so the exit status and GOODSIG both count.
+  local verified=1
+  raw="$(git verify-tag --raw "$tag" 2>&1)" || verified=0
+  if grep -Eq '^\[GNUPG:\] (EXPKEYSIG|REVKEYSIG|EXPSIG|BADSIG|ERRSIG) ' <<<"$raw"; then
+    fail "tag ${tag} has an expired, revoked, or bad signature"
+  fi
+  [[ "$verified" == 1 && "$raw" == *"[GNUPG:] GOODSIG "* && "$raw" == *VALIDSIG* ]] ||
+    fail "tag ${tag} is unsigned or the signature is not valid"
   status_fpr="$(awk '/^\[GNUPG:\] VALIDSIG / { print $3; exit }' <<<"$raw")"
   primary_fpr="$(awk '/^\[GNUPG:\] VALIDSIG / { print $12; exit }' <<<"$raw")"
   status_fpr="$(normalize_fpr "$status_fpr")"
@@ -88,6 +95,21 @@ expect_failure() {
     fail "expected verification failure containing: ${message}"
   fi
   [[ "$output" == *"$message"* ]] || fail "verification failed without expected message: ${message}"
+}
+
+# Generates a passphrase-less Ed25519 signing key in GNUPGHOME and prints its
+# fingerprint. Used by self_test only.
+self_test_key() {
+  gpg --batch --pinentry-mode loopback --passphrase '' \
+    --quick-generate-key "$1 <release-self-test@example.invalid>" ed25519 default never >/dev/null 2>&1
+  gpg --batch --list-secret-keys --with-colons "$1" 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}'
+}
+
+# Publishes the given keys, as they stand in GNUPGHOME, as the allowed release
+# keys (key file and fingerprints file). Used by self_test only.
+self_test_allow() {
+  gpg --batch --armor --export "$@" >"$RELEASE_TAG_KEY"
+  printf '%s\n' "$@" >"$RELEASE_TAG_FINGERPRINTS"
 }
 
 self_test() {
@@ -158,6 +180,25 @@ self_test() {
   # The release workflow passes the commit it will build; a tag for another
   # commit is refused.
   (cd "$work" && expect_failure "resolves to ${first}, expected ${rc}" v0.1.0 "$rc")
+
+  # An allowed key that has since expired or been revoked no longer releases:
+  # the signature still matches, but the published key says not to trust it.
+  local spent
+  spent="$(self_test_key "Expired self-test")"
+  git -C "$work" tag -d v0.2.0-rc.1 >/dev/null
+  git -C "$work" -c user.signingkey="$spent" tag -s v0.2.0-rc.1 -m "expired key" "$rc"
+  gpg --batch --quick-set-expire "$spent" seconds=1 >/dev/null 2>&1
+  sleep 2
+  self_test_allow "$fpr" "$spent"
+  (cd "$work" && expect_failure "expired, revoked, or bad signature" v0.2.0-rc.1 "$rc")
+
+  spent="$(self_test_key "Revoked self-test")"
+  git -C "$work" tag -d v0.2.0-rc.1 >/dev/null
+  git -C "$work" -c user.signingkey="$spent" tag -s v0.2.0-rc.1 -m "revoked key" "$rc"
+  sed 's/^:-----BEGIN/-----BEGIN/' "${gnupg}/openpgp-revocs.d/${spent}.rev" |
+    gpg --batch --import >/dev/null 2>&1
+  self_test_allow "$fpr" "$spent"
+  (cd "$work" && expect_failure "expired, revoked, or bad signature" v0.2.0-rc.1 "$rc")
 
   gpgconf --kill gpg-agent >/dev/null 2>&1 || true
   rm -rf "$tmp" || true
