@@ -430,6 +430,16 @@ fn integer_and_temporal_columns_decode() {
     runtime.block_on(async {
         let mut client = connect(port, None).await;
         exec(&mut client, &format!("CREATE DATABASE [{database}]")).await;
+        exec(
+            &mut client,
+            &format!("ALTER DATABASE [{database}] SET ALLOW_SNAPSHOT_ISOLATION ON"),
+        )
+        .await;
+        exec(
+            &mut client,
+            &format!("ALTER DATABASE [{database}] SET READ_COMMITTED_SNAPSHOT ON"),
+        )
+        .await;
         drop(client);
         let mut client = connect(port, Some(&database)).await;
         exec(
