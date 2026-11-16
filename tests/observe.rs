@@ -52,6 +52,10 @@ impl Drop for Running {
 
 fn get(addr: &str, path: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).unwrap();
+    // A server that stops answering fails the read instead of hanging the test.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     write!(stream, "GET {path} HTTP/1.1\r\nHost: hashi\r\n\r\n").unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
@@ -86,15 +90,24 @@ fn metrics_and_health_reflect_a_fixture_run() {
             .spawn()
             .unwrap(),
     );
+    // The first stderr line names the listen address. Read it on a thread so a
+    // binary that never prints it fails within the deadline instead of hanging.
     let mut stderr = BufReader::new(child.0.stderr.take().unwrap());
-    let mut line = String::new();
-    stderr.read_line(&mut line).unwrap();
+    let (sent, first) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = stderr.read_line(&mut line);
+        let _ = sent.send(line);
+        std::io::copy(&mut stderr, &mut std::io::sink())
+    });
+    let line = first
+        .recv_timeout(Duration::from_secs(20))
+        .expect("hashi did not report its listen address within 20 s");
     let addr = line
         .trim()
         .strip_prefix("hashi: listening on ")
         .unwrap_or_else(|| panic!("unexpected first line: {line}"))
         .to_string();
-    std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
 
     let metrics = wait_for(&addr, "/metrics", |_, body| {
         body.contains("hashi_records_delivered_total{instance=\"line-1\"} 3\n")

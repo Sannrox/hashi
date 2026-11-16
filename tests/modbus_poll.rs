@@ -465,7 +465,15 @@ fn runtime_keeps_polling_and_healthy_groups_do_not_reset_failing_group_backoff()
         hashi::RuntimeConfig::new("poller"),
     );
     let mut delivered = 0u64;
-    while delivered < 8 {
+    // About 150 passes deliver all eight today; the bound turns a stall into a failure.
+    for pass in 0.. {
+        if delivered >= 8 {
+            break;
+        }
+        assert!(
+            pass < 10_000,
+            "only {delivered} of 8 records after {pass} passes: polling or backoff stalled"
+        );
         let result = rt.run_while(|r| r.delivered < 8 - delivered).unwrap();
         if result.delivered == 0 {
             tick(&clock);
