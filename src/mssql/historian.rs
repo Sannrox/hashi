@@ -68,11 +68,7 @@ pub struct SqlHistorian {
 impl SqlHistorian {
     /// Connect, refuse a mapping that does not match the catalog, and load tags.
     pub fn connect(config: Config) -> Result<Self, Error> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return Err(Error::new(
-                "call SQL historian synchronous API outside an async runtime",
-            ));
-        }
+        outside_runtime()?;
         validate_config(&config)?;
         validate_mapping(&config.mapping)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -98,6 +94,7 @@ impl SqlHistorian {
 
     /// Re-check the mapping and report the discovered tags.
     pub fn check(&self) -> Result<CheckReport, Error> {
+        outside_runtime()?;
         self.runtime.block_on(async {
             tokio::time::timeout(self.config.timeout, async {
                 let mut client = connection(&self.config).await?;
@@ -607,6 +604,17 @@ fn sql_error(error: tiberius::error::Error) -> Error {
     }
 }
 
+/// The synchronous API blocks on its own runtime, which panics inside another
+/// one. Every entry point that blocks calls this first.
+fn outside_runtime() -> Result<(), Error> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(Error::new(
+            "call SQL historian synchronous API outside an async runtime",
+        ));
+    }
+    Ok(())
+}
+
 impl Historian for SqlHistorian {
     fn tags(&mut self) -> Result<Vec<Tag>, Error> {
         Ok(self
@@ -632,6 +640,7 @@ impl Historian for SqlHistorian {
             .ok_or_else(|| Error::new(format!("SQL historian tag {tag} is not in the mapping")))?;
         let tag_id = mapped.id.clone();
         let tag = mapped.name.clone();
+        outside_runtime()?;
         self.runtime.block_on(async {
             tokio::time::timeout(self.config.timeout, async {
                 let mut client = connection(&self.config).await?;
@@ -757,5 +766,36 @@ mod tests {
             NaiveDateTime::parse_from_str("2023-11-14 22:13:21.001000", "%Y-%m-%d %H:%M:%S%.6f")
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn blocking_calls_inside_a_runtime_return_an_error() {
+        let mut historian = SqlHistorian {
+            config: config(mapping(), true),
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+            tags: vec![MappedTag {
+                name: "line.temp".into(),
+                id: TagId::I32(1),
+            }],
+        };
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (check, read) = outer.block_on(async {
+            (
+                historian.check().map(|_| ()),
+                historian.read_raw("line.temp", 0, 1, 1).map(|_| ()),
+            )
+        });
+        for result in [check, read] {
+            let error = result.unwrap_err();
+            assert!(
+                error.message.contains("outside an async runtime"),
+                "{}",
+                error.message
+            );
+        }
     }
 }
