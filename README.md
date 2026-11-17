@@ -9,16 +9,15 @@
 [Try it](#try-it) · [How it works](#how-it-works) · [Vision](VISION.md) · [Operations](docs/operations.md) · [Decisions](docs/decisions/README.md)
 
 > Status: v0.1 MVP families are in tree. SQL Server CDC, SQL Server
-> historian mapping, and PostgreSQL CDC are in tree; Oracle CDC stays on
-> the v0.2 roadmap. See [VISION.md](VISION.md).
+> historian mapping, and PostgreSQL CDC are in tree. See
+> [VISION.md](VISION.md).
 
 Hashi (橋, bridge) is a standalone connector engine written in Rust. It reads
 industrial sources — OPC UA (browse, subscriptions, historical access), MQTT
 3.1.1 and 5 (including Sparkplug B payloads), Modbus TCP and RTU, and process
 historians — and operational databases by change data capture — MySQL snapshot
 and GTID capture, SQL Server snapshot with LSN change data capture (change
-tracking fallback), and PostgreSQL snapshot with logical-replication slots;
-Oracle follows the same contract on the roadmap — and delivers typed, keyed records to sinks the rest of the stack
+tracking fallback), and PostgreSQL snapshot with logical-replication slots — and delivers typed, keyed records to sinks the rest of the stack
 consumes.
 
 - **One connector contract.** Every source family implements check, discover
