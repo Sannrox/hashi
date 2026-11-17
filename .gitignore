@@ -3,3 +3,4 @@
 /.worktrees/
 .hashi-state/
 
+__pycache__/

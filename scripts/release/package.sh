@@ -2,11 +2,11 @@
 # Build release artifacts into --out without publishing or attesting.
 #
 # Usage:
-#   bash scripts/release-package.sh --out dist [--tag vX.Y.Z] [--git-sha SHA]
+#   bash scripts/release/package.sh --out dist [--tag vX.Y.Z] [--git-sha SHA]
 #        [--skip-build] [--skip-test] [--skip-github] [--with-images]
 set -euo pipefail
 
-ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_PATH"
 
 OUT=""
@@ -60,7 +60,7 @@ host_triple() {
 VERSION="$(crate_version)"
 if [[ -n "$TAG" ]]; then
   [[ "${TAG#v}" == "$VERSION" ]] || fail "tag ${TAG} does not match crate version ${VERSION}"
-  python3 "$ROOT_PATH/scripts/changelog-notes.py" "$VERSION" >"${OUT}/RELEASE_NOTES.md"
+  python3 "$ROOT_PATH/scripts/release/notes.py" "$VERSION" >"${OUT}/RELEASE_NOTES.md"
 fi
 if [[ -z "$GIT_SHA" ]]; then
   GIT_SHA="$(git rev-parse HEAD)"
@@ -98,7 +98,7 @@ if [[ "$WITH_IMAGES" -eq 1 ]]; then
   printf 'image %s digest %s\n' "$local_tag" "$digest"
 fi
 
-python3 "$ROOT_PATH/scripts/release-sbom.py" "${OUT}/hashi.cdx.json"
+python3 "$ROOT_PATH/scripts/release/sbom.py" "${OUT}/hashi.cdx.json"
 
 python3 -c '
 import hashlib, pathlib, sys
@@ -110,7 +110,7 @@ for path in sorted(p for p in out.iterdir() if p.is_file() and p.name != "SHA256
 (out / "SHA256SUMS").write_text("\n".join(lines) + ("\n" if lines else ""))
 ' "$OUT"
 
-LABEL_ARGS=()
+GATE_ARGS=()
 if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]]; then
   # Gate flags cover exactly the pull requests merged into the release commit
   # since the nearest earlier final tag in its history: an rc tag never starts
@@ -126,28 +126,18 @@ if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]]; then
     query="merged:>=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$prev") ${query}"
   fi
   # A failed or truncated lookup would publish a manifest without gate flags,
-  # so both stop packaging.
+  # so both stop packaging; manifest.py refuses a result at the limit and
+  # keeps only pull requests whose merge commit is in the range.
   limit=1000
-  prs="$(gh pr list --state merged --limit "$limit" --search "$query" --json mergeCommit,labels)" \
+  gates="$(mktemp -d "${TMPDIR:-/tmp}/hashi-gates.XXXXXX")"
+  trap 'rm -rf "$gates"' EXIT
+  gh pr list --state merged --limit "$limit" --search "$query" --json mergeCommit,labels >"${gates}/merged-prs.json" \
     || fail "could not read merged pull requests for gate labels; pass --skip-github to package without gate flags"
-  labels="$(python3 -c '
-import json, sys
-prs = json.load(sys.stdin)
-if len(prs) >= int(sys.argv[1]):
-    sys.exit(f"release-package: gate-label lookup reached the {sys.argv[1]} pull request limit")
-for pr in prs:
-    if pr.get("mergeCommit"):
-        for label in pr["labels"]:
-            print(pr["mergeCommit"]["oid"] + "\t" + label["name"])
-' "$limit" <<<"$prs")" || exit 1
-  while IFS= read -r label; do
-    [[ -n "$label" ]] && LABEL_ARGS+=(--label "$label")
-  done < <(
-    awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(git rev-list "$range") - <<<"$labels" | sort -u
-  )
+  git rev-list "$range" >"${gates}/range-commits"
+  GATE_ARGS=(--merged-prs "${gates}/merged-prs.json" --range-commits "${gates}/range-commits" --pr-limit "$limit")
 fi
 
-python3 "$ROOT_PATH/scripts/release-manifest.py" \
+python3 "$ROOT_PATH/scripts/release/manifest.py" \
   --component hashi \
   --version "$VERSION" \
   --git-sha "$GIT_SHA" \
@@ -155,7 +145,7 @@ python3 "$ROOT_PATH/scripts/release-manifest.py" \
   --dist "$OUT" \
   --out "${OUT}/hashi-release.json" \
   "${IMAGE_ARGS[@]}" \
-  "${LABEL_ARGS[@]}"
+  "${GATE_ARGS[@]}"
 
 echo "version=${VERSION}"
 echo "triple=${TRIPLE}"

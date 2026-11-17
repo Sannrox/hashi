@@ -72,12 +72,13 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 `release.yml` refuses a tagged run that does not start from `main`. It then:
 
 - checks out the tag and fetches the annotated tag object;
-- verifies the signed tag with main's `scripts/verify-release-tag.sh` and
+- verifies the signed tag with main's `scripts/release/verify-tag.sh` and
   main's allowed keys against the tagged commit's `Cargo.toml`;
 - requires the tagged commit to be on `main`;
-- runs the release checks, tests, builds the binary and the image, writes an
-  SBOM and the family release manifest (component, version, `git_sha`, binary
-  and image digests, gate flags) from that commit, and attests provenance;
+- runs the release tests (`scripts/tests/release/`) and the crate tests,
+  builds the binary and the image, writes an SBOM and the family release
+  manifest (component, version, `git_sha`, binary and image digests, gate
+  flags) from that commit, and attests provenance;
 - pushes the image to `ghcr.io/sannrox/hashi:<version>` (version tag only);
 - drafts the GitHub Release with `gh release create <tag> --verify-tag` from
   the matching CHANGELOG section, attaches every asset and the attestation
@@ -87,8 +88,8 @@ The release image is tagged with the version only. There is no `latest` tag.
 Deploy the image by digest. `deploy/tenkai.toml` is the Tenkai product for
 that image. Its compatibility profile provides `connector.capture` and
 `hashi.sink` at the versions derived from the surfaces this tree ships.
-`bash scripts/validate-release.sh` refuses a product whose profile does not
-match.
+`python3 scripts/tenkai-profile.py --check`, which `cargo test` runs, refuses a
+product whose profile does not match.
 
 To retry a failed release, fix the workflow on `main` and run it again for the
 same tag:
@@ -103,13 +104,37 @@ the sources) comes from the tagged commit, so a bug there needs a new rc or
 patch version.
 
 A re-run resumes the draft release and replaces all of its assets. Every job
-that attests, uploads, or publishes refuses a release that is already
-published, so neither a new run nor "Re-run failed jobs" on an old one can
-change it; cut a new version instead. One run per tag executes at a time.
+that attests, pushes the image, uploads, or publishes first runs
+`scripts/release/github-release.sh guard`, which refuses a release that is
+already published, so neither a new run nor "Re-run failed jobs" on an old
+one can change it; cut a new version instead. One run per tag executes at a
+time.
+
+A tag cut before the release scripts moved to `scripts/release/` cannot be
+re-run: main's workflow calls paths that commit does not have, and the run
+fails before it builds anything. Cut a new rc or patch version instead.
 
 Pull requests and `workflow_dispatch` without a tag dry-run the same packaging
 path on that ref. Dry runs never build the image, mint attestations, or touch
 a GitHub Release.
+
+## Release checks
+
+Workflow YAML only orchestrates; the logic lives in `scripts/release/`
+(`verify-tag.sh`, `package.sh`, `github-release.sh`, `notes.py`,
+`manifest.py`, `sbom.py`). `scripts/release/github-release.sh` is the only
+script that drafts or publishes a GitHub Release. Run the checks locally:
+
+```sh
+bash scripts/check-workflows.sh
+python3 -m pip install --require-hashes -r scripts/tests/requirements.txt
+python3 -m unittest discover -s scripts/tests -t .
+```
+
+`check-workflows.sh` runs a pinned workflow linter (actionlint) and a pinned
+workflow security auditor (zizmor) on every workflow. The unit tests cover
+each release script and assert the release invariants no linter expresses on
+the parsed workflow YAML.
 
 ## Provenance
 
