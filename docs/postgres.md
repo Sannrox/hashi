@@ -59,9 +59,12 @@ commit LSN. Markers do not promise atomic application by a sink.
 The staged-batch byte limit (`max_batch_bytes`) also bounds replication
 buffering. A frame whose declared length exceeds that limit plus 64 KiB of
 protocol overhead fails the stream from its header, before its body is read.
-The bound applies to the wire size, so values that shrink when decoded
-(blank-padded `char(n)`, hex `bytea`) count at their wire size. Raise
-`max_batch_bytes` and restart to capture such a row.
+The bound applies to the wire size. Decoding and staging usually grow a row
+(`bytea` hex becomes a JSON number array), so the bound only rejects rows that
+could not stage anyway. The exception is blank-padded `char(n)`: its trailing
+spaces are trimmed, so a wide `char(n)` column holding short values counts at
+its padded wire size. Raise `max_batch_bytes` and restart to capture such a
+row.
 
 The runtime owns checkpoint commits after sink acknowledgement. The source
 manifest owns received batches, not runtime delivery. Preserve both stores.
