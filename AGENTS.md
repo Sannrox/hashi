@@ -22,13 +22,21 @@ CLI, metrics, diagnostics, and the static image).
   They match the build, test, fmt and clippy jobs in `.github/workflows/ci.yml`:
   `cargo build --all-targets --all-features --locked`,
   `cargo test --all-features --locked`, `cargo fmt --check`,
-  `cargo clippy --all-targets --all-features --locked -- -D warnings`, and
-  `bash scripts/validate-release.sh`. CI also runs `cargo deny check licenses`,
-  OPC UA/MySQL/MQTT container fixtures, and the offline image.
-- `scripts/validate-release.sh` checks the release path (a `v*` tag push
-  dispatches `release.yml` from main for that tag): signed annotated tags,
-  CHANGELOG notes, SBOM, and the family release manifest. Pull requests and
-  dry runs must not publish or attest.
+  `cargo clippy --all-targets --all-features --locked -- -D warnings`,
+  `bash scripts/check-workflows.sh`, and
+  `python3 -m unittest discover -s scripts/tests -t .`. CI also runs
+  `cargo deny check licenses`, OPC UA/MySQL/MQTT container fixtures, and the
+  offline image.
+- `scripts/check-workflows.sh` lints every workflow with pinned actionlint and
+  zizmor binaries (checksum-verified, cached under
+  `${XDG_CACHE_HOME:-~/.cache}/check-workflows`).
+- The release path (a `v*` tag push dispatches `release.yml` from main for
+  that tag) lives in `scripts/release/`: signed annotated tags, CHANGELOG
+  notes, SBOM, the family release manifest, and `github-release.sh`, the only
+  script that drafts or publishes a GitHub Release. `scripts/tests/release/`
+  (stdlib `unittest`; install `scripts/tests/requirements.txt` with
+  `--require-hashes` first) tests each script and the workflows' parsed YAML.
+  Pull requests and dry runs must not publish or attest.
 
 GitHub Issues are the planning source of truth. Workflow Skills are shared;
 see `## Shared agent skills`. Never commit hostnames, home paths, secrets or
@@ -154,7 +162,9 @@ planned work with neither is not a running lane.
 
 Parallel lanes must not collide. Collision surfaces in this repository are
 config, checkpoint and quarantine files, sink outputs, the store-and-forward
-buffer, protocol connectors, schema state, and outbox host files. Lanes that
+buffer, protocol connectors, schema state, outbox host files, and the
+release path (`.github/workflows/`, `scripts/release/`,
+`scripts/tests/release/`, `scripts/check-workflows.sh`). Lanes that
 would both change one of these surfaces run in sequence, not in parallel.
 
 A lane publishes its first Verified commit to the claim branch as a draft Pull
@@ -204,6 +214,13 @@ covered by integration tests under `tests/`; configuration changes get parsing
 and default tests. Keep service-dependent tests ignored unless their
 prerequisites are intentionally available. Offline `cargo test` must stay green
 without optional protocol fixtures.
+
+The root `tests/` belongs to Cargo. Release scripts are tested with stdlib
+`unittest` under `scripts/tests/release/`, one file per script. Workflow
+invariants no linter expresses are asserted on the parsed YAML structure
+(triggers, permissions, job graph, step order, which script a step runs),
+never by grepping workflow text or matching step names. Tests use temp paths
+that include the process id and short gpg homes under `/tmp`.
 
 ## Commit & Pull Request Guidelines
 
@@ -308,7 +325,8 @@ the local gates (`make update`, `make validate`, `make test`,
 | protocol fixture | the matching `scripts/test-*-container.sh` |
 | configuration | parsing/default tests, `docs/run.md`, README |
 | static image | `scripts/test-offline-image.sh` |
-| release workflow | `bash scripts/validate-release.sh` |
+| release workflow | `bash scripts/check-workflows.sh` and `python3 -m unittest discover -s scripts/tests -t .` |
+| any workflow | `bash scripts/check-workflows.sh` |
 | docs / Skills | links and commands; `bash scripts/validate-workflow-skills.sh` |
 
 ### Release audit
