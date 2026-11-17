@@ -27,8 +27,8 @@ pub(super) struct Replication {
     buf: BytesMut,
     /// Largest frame payload buffered before failing, derived from
     /// `max_batch_bytes`, so memory per frame is bounded by configuration.
-    /// Measured on the wire: values that shrink when decoded (blank-padded
-    /// `char(n)`, hex `bytea`) count at their wire size.
+    /// Measured on the wire, which is at most the staged size except for
+    /// blank-padded `char(n)`, whose trailing spaces are trimmed on decode.
     max_frame: usize,
 }
 
