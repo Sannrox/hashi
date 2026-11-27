@@ -130,6 +130,32 @@ The container harness runs the same client/server fixture with `--network none`,
 a unique image tag, and no host ports or state mounts, then removes its image.
 This proves protocol behavior, not equipment interoperability.
 
+A second disposable image starts a foreign OPC UA server this repository does
+not compile, then runs the Hashi client in the same network namespace:
+
+```sh
+bash scripts/test-opcua-foreign-container.sh
+```
+
+`--network none` stays. The image tag is unique; the image is removed on exit.
+That run proves browse, subscribe across a server restart, raw Historical Access
+paging, untrusted-certificate refusal, and a namespace-table change against the
+foreign stack. It does not certify plant equipment. The in-process simulator
+fixtures stay the default `cargo test` path.
+
+Observed in the foreign fixture:
+
+- Continuation points are timestamps packed by the foreign history store, not
+  opaque vendor tokens.
+- An empty raw range returns an empty Good page rather than `GoodNoData`.
+- The foreign server does not offer policy `None`; Hashi still refuses `None`
+  without `allow_insecure_lab`.
+- After a process restart the server may still hold a subscription, so
+  `Publish` times out instead of returning `BadNoSubscription`. Hashi
+  recreates the subscription after reconnect.
+- Processed-history / interpolated node ids stay unused.
+- Alarms and conditions stay out of scope.
+
 ### Acceptance coverage
 
 The parent connector scope in #3 is delivered by #16, #17, and #18. The same
@@ -143,6 +169,7 @@ fixture commands above exercise these capabilities without an external server.
 | Recreated subscriptions and historical backfill across server restart, with overlap deduplication | [Historical restart fixture](../tests/opcua_subscription.rs) |
 | Unsupported history, unavailable ranges, retained boundaries, bounded receipts, and overflow recovery after restart | [Historical recovery fixture](../tests/opcua_subscription.rs) |
 | Throughput and latency for 10,000 monitored items | [Measurement procedure](#10000-item-fixture-measurements) |
+| Browse, subscribe, restart, raw Historical Access, certificate refusal, and namespace-table change against a foreign server | [Foreign container fixture](../tests/opcua_foreign.rs) |
 
 These checks establish simulator conformance. Historical retention and append-only
 source identity remain requirements of the source described below; this evidence
