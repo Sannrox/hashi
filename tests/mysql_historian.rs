@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use hashi::checkpoint::{Checkpoint, CheckpointStore, QuarantineRow};
 use hashi::historian::{Historian, HistorianConfig, HistorianConnector};
-use hashi::mysql::historian::{Config, Mapping, SqlHistorian};
+use hashi::mysql::historian::{Config, Mapping, PartitionCatalog, SqlHistorian};
 use hashi::runtime::Clock;
-use hashi::{Connector, Error, InstanceLease, MemorySink, Runtime, RuntimeConfig};
+use hashi::{Connector, Error, InstanceLease, MemorySink, Position, Runtime, RuntimeConfig};
 use mysql_async::{Conn, Opts, OptsBuilder, prelude::Queryable};
 
 const START_MS: i64 = 1_700_000_000_000;
@@ -47,6 +47,7 @@ fn mapping(database: &str) -> Mapping {
         tag_id_column: "id".into(),
         tag_name_column: "name".into(),
         value_table: "samples".into(),
+        partition_catalog: None,
         value_tag_column: "tag_id".into(),
         time_column: "ts".into(),
         value_column: "value".into(),
@@ -344,6 +345,208 @@ fn a_wrong_mapping_is_refused_at_check_time() {
         error
             .message
             .contains("column samples.stamp has the wrong type"),
+        "{}",
+        error.message
+    );
+}
+
+fn partitioned_mapping(database: &str) -> Mapping {
+    let mut mapping = mapping(database);
+    mapping.value_table.clear();
+    mapping.partition_catalog = Some(PartitionCatalog {
+        table: "partitions".into(),
+        value_table_column: "value_table".into(),
+        start_column: "start_ts".into(),
+        end_column: "end_ts".into(),
+    });
+    mapping
+}
+
+fn partitioned_config(database: &str) -> Config {
+    Config {
+        options: opts(),
+        mapping: partitioned_mapping(database),
+        timeout: Duration::from_secs(20),
+        allow_insecure_lab: true,
+    }
+}
+
+fn seed_partitioned(database: &str) {
+    seed(database, "");
+    for sql in [
+        "CREATE TABLE `{db}`.samples_p0 (tag_id INT NOT NULL, ts TIMESTAMP(6) NOT NULL, value DOUBLE NOT NULL, quality VARCHAR(32) NULL, PRIMARY KEY (tag_id, ts)) ENGINE=InnoDB",
+        "CREATE TABLE `{db}`.samples_p1 (tag_id INT NOT NULL, ts TIMESTAMP(6) NOT NULL, value DOUBLE NOT NULL, quality VARCHAR(32) NULL, PRIMARY KEY (tag_id, ts)) ENGINE=InnoDB",
+        "CREATE TABLE `{db}`.partitions (value_table VARCHAR(64) NOT NULL, start_ts TIMESTAMP(6) NOT NULL, end_ts TIMESTAMP(6) NOT NULL) ENGINE=InnoDB",
+        "INSERT INTO `{db}`.partitions (value_table, start_ts, end_ts) VALUES ('samples_p0', FROM_UNIXTIME(1700000000), FROM_UNIXTIME(1700000002)), ('samples_p1', FROM_UNIXTIME(1700000002), FROM_UNIXTIME(1700000004))",
+        "INSERT INTO `{db}`.samples_p0 (tag_id, ts, value, quality) VALUES (1, FROM_UNIXTIME(1700000001), 1.0, 'good'), (2, FROM_UNIXTIME(1700000001), 10.0, 'good')",
+        "INSERT INTO `{db}`.samples_p1 (tag_id, ts, value, quality) VALUES (1, FROM_UNIXTIME(1700000002), 2.0, 'good'), (1, FROM_UNIXTIME(1700000003), 3.0, 'good'), (2, FROM_UNIXTIME(1700000002), 20.0, 'good')",
+    ] {
+        exec_sql(database, sql);
+    }
+}
+
+fn exec_sql(database: &str, sql: &str) {
+    runtime_block(async {
+        let mut conn = Conn::new(opts()).await.unwrap();
+        conn.query_drop("SET SESSION time_zone='+00:00'")
+            .await
+            .unwrap();
+        conn.query_drop(sql.replace("{db}", database))
+            .await
+            .unwrap();
+        conn.disconnect().await.unwrap();
+    });
+}
+
+fn drain(
+    source: &mut Source,
+    mut from: Option<Position>,
+    mut cursor: Option<String>,
+    max: usize,
+) -> (Vec<String>, Option<Position>, Option<String>) {
+    let mut keys = Vec::new();
+    for _ in 0..max {
+        match source.read(from, cursor.as_deref()).unwrap() {
+            None => break,
+            Some(record) => {
+                from = Some(record.position);
+                cursor = record.source.and_then(|meta| meta.cursor);
+                keys.push(record.key);
+            }
+        }
+    }
+    (keys, from, cursor)
+}
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mysql-container.sh"]
+fn sql_historian_backfills_across_two_partitions() {
+    let database = database("parts");
+    seed_partitioned(&database);
+    let mut historian = SqlHistorian::connect(partitioned_config(&database)).unwrap();
+    assert!(historian.check().unwrap().ok);
+    let page = historian
+        .read_raw("line.temp", START_MS, START_MS + 3_000, 2)
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|sample| sample.ts_ms).collect::<Vec<_>>(),
+        vec![START_MS + 1_000, START_MS + 2_000]
+    );
+    let rest = historian
+        .read_raw("line.temp", page[1].ts_ms, START_MS + 3_000, 8)
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|sample| sample.ts_ms).collect::<Vec<_>>(),
+        vec![START_MS + 3_000]
+    );
+
+    let path = scratch("parts-state");
+    std::fs::create_dir_all(&path).unwrap();
+    let now = Rc::new(Cell::new(START_MS + 3_500));
+    let mut first = HistorianConnector::new(
+        "historian",
+        SqlHistorian::connect(partitioned_config(&database)).unwrap(),
+        FixtureClock(now.clone()),
+        HistorianConfig {
+            start_ms: START_MS,
+            chunk_ms: 4_000,
+            page_limit: 1,
+            settle_ms: 0,
+            max_reads_per_second: 0,
+            state_dir: path.clone(),
+        },
+    )
+    .unwrap();
+    let (head, from, cursor) = drain(&mut first, None, None, 2);
+    assert_eq!(
+        head,
+        vec![
+            format!("line.pressure@{}", START_MS + 1_000),
+            format!("line.pressure@{}", START_MS + 2_000)
+        ]
+    );
+    drop(first);
+    let mut resumed = HistorianConnector::new(
+        "historian",
+        SqlHistorian::connect(partitioned_config(&database)).unwrap(),
+        FixtureClock(now),
+        HistorianConfig {
+            start_ms: START_MS,
+            chunk_ms: 4_000,
+            page_limit: 1,
+            settle_ms: 0,
+            max_reads_per_second: 0,
+            state_dir: path,
+        },
+    )
+    .unwrap();
+    let (tail, _, _) = drain(&mut resumed, from, cursor, 8);
+    assert_eq!(
+        tail,
+        vec![
+            format!("line.temp@{}", START_MS + 1_000),
+            format!("line.temp@{}", START_MS + 2_000),
+            format!("line.temp@{}", START_MS + 3_000)
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mysql-container.sh"]
+fn sql_historian_refuses_uncovered_and_vanished_partitions() {
+    let holes = database("holes");
+    seed_partitioned(&holes);
+    let mut historian = SqlHistorian::connect(partitioned_config(&holes)).unwrap();
+    let error = historian
+        .read_raw("line.temp", START_MS + 5_000, START_MS + 6_000, 8)
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("does not cover the requested window"),
+        "{}",
+        error.message
+    );
+
+    let first = historian
+        .read_raw("line.temp", START_MS, START_MS + 3_000, 8)
+        .unwrap();
+    assert_eq!(first.len(), 3);
+    exec_sql(
+        &holes,
+        "DELETE FROM `{db}`.partitions WHERE value_table='samples_p0'",
+    );
+    let error = historian
+        .read_raw("line.temp", START_MS, START_MS + 3_000, 8)
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("does not cover the requested window")
+            || error.message.contains("changed during the read"),
+        "{}",
+        error.message
+    );
+
+    let empty = database("empty");
+    seed_partitioned(&empty);
+    exec_sql(&empty, "DELETE FROM `{db}`.partitions");
+    let error = refused(partitioned_config(&empty));
+    assert!(
+        error.message.contains("partition catalog is empty"),
+        "{}",
+        error.message
+    );
+
+    let missing = database("missing");
+    seed_partitioned(&missing);
+    exec_sql(
+        &missing,
+        "UPDATE `{db}`.partitions SET value_table='gone' WHERE value_table='samples_p0'",
+    );
+    let error = refused(partitioned_config(&missing));
+    assert!(
+        error.message.contains("table gone is missing"),
         "{}",
         error.message
     );

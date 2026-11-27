@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use hashi::checkpoint::{Checkpoint, CheckpointStore, QuarantineRow};
 use hashi::historian::{Historian, HistorianConfig, HistorianConnector};
-use hashi::mssql::historian::{Config, Mapping, SqlHistorian};
+use hashi::mssql::historian::{Config, Mapping, PartitionCatalog, SqlHistorian};
 use hashi::runtime::Clock;
-use hashi::{Connector, Error, InstanceLease, MemorySink, Runtime, RuntimeConfig};
+use hashi::{Connector, Error, InstanceLease, MemorySink, Position, Runtime, RuntimeConfig};
 use tiberius::{AuthMethod, Client, Config as SqlConfig};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
@@ -47,6 +47,7 @@ fn mapping() -> Mapping {
         tag_id_column: "id".into(),
         tag_name_column: "name".into(),
         value_table: "samples".into(),
+        partition_catalog: None,
         value_tag_column: "tag_id".into(),
         time_column: "ts".into(),
         value_column: "value".into(),
@@ -367,6 +368,200 @@ fn a_wrong_mapping_is_refused_at_check_time() {
         error
             .message
             .contains("column samples.stamp has the wrong type"),
+        "{}",
+        error.message
+    );
+}
+
+fn partitioned_mapping() -> Mapping {
+    let mut mapping = mapping();
+    mapping.value_table.clear();
+    mapping.partition_catalog = Some(PartitionCatalog {
+        table: "partitions".into(),
+        value_table_column: "value_table".into(),
+        start_column: "start_ts".into(),
+        end_column: "end_ts".into(),
+    });
+    mapping
+}
+
+fn partitioned_config(database: &str) -> Config {
+    let mut cfg = config(database);
+    cfg.mapping = partitioned_mapping();
+    cfg
+}
+
+fn seed_partitioned(database: &str) {
+    seed(database, "");
+    for sql in [
+        "CREATE TABLE dbo.samples_p0 (tag_id INT NOT NULL, ts DATETIME2(3) NOT NULL, value FLOAT NOT NULL, quality NVARCHAR(32) NULL, PRIMARY KEY (tag_id, ts))",
+        "CREATE TABLE dbo.samples_p1 (tag_id INT NOT NULL, ts DATETIME2(3) NOT NULL, value FLOAT NOT NULL, quality NVARCHAR(32) NULL, PRIMARY KEY (tag_id, ts))",
+        "CREATE TABLE dbo.partitions (value_table NVARCHAR(64) NOT NULL, start_ts DATETIME2(3) NOT NULL, end_ts DATETIME2(3) NOT NULL)",
+        "INSERT INTO dbo.partitions (value_table, start_ts, end_ts) VALUES (N'samples_p0', '2023-11-14 22:13:20.000', '2023-11-14 22:13:22.000'), (N'samples_p1', '2023-11-14 22:13:22.000', '2023-11-14 22:13:24.000')",
+        "INSERT INTO dbo.samples_p0 (tag_id, ts, value, quality) VALUES (1, '2023-11-14 22:13:21.000', 1.0, N'good'), (2, '2023-11-14 22:13:21.000', 10.0, N'good')",
+        "INSERT INTO dbo.samples_p1 (tag_id, ts, value, quality) VALUES (1, '2023-11-14 22:13:22.000', 2.0, N'good'), (1, '2023-11-14 22:13:23.000', 3.0, N'good'), (2, '2023-11-14 22:13:22.000', 20.0, N'good')",
+    ] {
+        exec_sql(database, sql);
+    }
+}
+
+fn exec_sql(database: &str, sql: &str) {
+    let port = fixture_port();
+    runtime_block(async {
+        let mut client = connect(port, Some(database)).await;
+        exec(&mut client, sql).await;
+    });
+}
+
+fn drain(
+    source: &mut Source,
+    mut from: Option<Position>,
+    mut cursor: Option<String>,
+    max: usize,
+) -> (Vec<String>, Option<Position>, Option<String>) {
+    let mut keys = Vec::new();
+    for _ in 0..max {
+        match source.read(from, cursor.as_deref()).unwrap() {
+            None => break,
+            Some(record) => {
+                from = Some(record.position);
+                cursor = record.source.and_then(|meta| meta.cursor);
+                keys.push(record.key);
+            }
+        }
+    }
+    (keys, from, cursor)
+}
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mssql-container.sh"]
+fn sql_historian_backfills_across_two_partitions() {
+    let database = database("parts");
+    seed_partitioned(&database);
+    let mut historian = SqlHistorian::connect(partitioned_config(&database)).unwrap();
+    assert!(historian.check().unwrap().ok);
+    let page = historian
+        .read_raw("line.temp", START_MS, START_MS + 3_000, 2)
+        .unwrap();
+    assert_eq!(
+        page.iter().map(|sample| sample.ts_ms).collect::<Vec<_>>(),
+        vec![START_MS + 1_000, START_MS + 2_000]
+    );
+    let rest = historian
+        .read_raw("line.temp", page[1].ts_ms, START_MS + 3_000, 8)
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|sample| sample.ts_ms).collect::<Vec<_>>(),
+        vec![START_MS + 3_000]
+    );
+
+    let path = scratch("parts-state");
+    std::fs::create_dir_all(&path).unwrap();
+    let now = Rc::new(Cell::new(START_MS + 3_500));
+    let mut first = HistorianConnector::new(
+        "historian",
+        SqlHistorian::connect(partitioned_config(&database)).unwrap(),
+        FixtureClock(now.clone()),
+        HistorianConfig {
+            start_ms: START_MS,
+            chunk_ms: 4_000,
+            page_limit: 1,
+            settle_ms: 0,
+            max_reads_per_second: 0,
+            state_dir: path.clone(),
+        },
+    )
+    .unwrap();
+    let (head, from, cursor) = drain(&mut first, None, None, 2);
+    assert_eq!(
+        head,
+        vec![
+            format!("line.pressure@{}", START_MS + 1_000),
+            format!("line.pressure@{}", START_MS + 2_000)
+        ]
+    );
+    drop(first);
+    let mut resumed = HistorianConnector::new(
+        "historian",
+        SqlHistorian::connect(partitioned_config(&database)).unwrap(),
+        FixtureClock(now),
+        HistorianConfig {
+            start_ms: START_MS,
+            chunk_ms: 4_000,
+            page_limit: 1,
+            settle_ms: 0,
+            max_reads_per_second: 0,
+            state_dir: path,
+        },
+    )
+    .unwrap();
+    let (tail, _, _) = drain(&mut resumed, from, cursor, 8);
+    assert_eq!(
+        tail,
+        vec![
+            format!("line.temp@{}", START_MS + 1_000),
+            format!("line.temp@{}", START_MS + 2_000),
+            format!("line.temp@{}", START_MS + 3_000)
+        ]
+    );
+}
+
+#[test]
+#[ignore = "requires the isolated database created by scripts/test-mssql-container.sh"]
+fn sql_historian_refuses_uncovered_and_vanished_partitions() {
+    let holes = database("holes");
+    seed_partitioned(&holes);
+    let mut historian = SqlHistorian::connect(partitioned_config(&holes)).unwrap();
+    let error = historian
+        .read_raw("line.temp", START_MS + 5_000, START_MS + 6_000, 8)
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("does not cover the requested window"),
+        "{}",
+        error.message
+    );
+
+    let first = historian
+        .read_raw("line.temp", START_MS, START_MS + 3_000, 8)
+        .unwrap();
+    assert_eq!(first.len(), 3);
+    exec_sql(
+        &holes,
+        "DELETE FROM dbo.partitions WHERE value_table=N'samples_p0'",
+    );
+    let error = historian
+        .read_raw("line.temp", START_MS, START_MS + 3_000, 8)
+        .unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("does not cover the requested window")
+            || error.message.contains("changed during the read"),
+        "{}",
+        error.message
+    );
+
+    let empty = database("empty");
+    seed_partitioned(&empty);
+    exec_sql(&empty, "DELETE FROM dbo.partitions");
+    let error = refused(partitioned_config(&empty));
+    assert!(
+        error.message.contains("partition catalog is empty"),
+        "{}",
+        error.message
+    );
+
+    let missing = database("missing");
+    seed_partitioned(&missing);
+    exec_sql(
+        &missing,
+        "UPDATE dbo.partitions SET value_table=N'gone' WHERE value_table=N'samples_p0'",
+    );
+    let error = refused(partitioned_config(&missing));
+    assert!(
+        error.message.contains("table gone is missing"),
         "{}",
         error.message
     );

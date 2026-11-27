@@ -58,14 +58,23 @@ use kind `historian.sample`, key `<tag>@<ts_ms>`, and a JSON payload with
 
 Enable the `mysql` Cargo feature and construct
 `mysql::historian::SqlHistorian` with connection options and a mapping: the
-tag table (identity and name columns), the value table (tag, time, value, and
-quality columns), and the database that holds them. `connect` checks that
-mapping against the catalog and refuses a missing table, a missing column, a
+tag table (identity and name columns), either one value table or a partition
+catalog of value tables, and the database that holds them. `value_table` and
+`partition_catalog` are mutually exclusive. `connect` checks that mapping
+against the catalog and refuses a missing table, a missing column, a
 time/value/name column of the wrong type, a nullable identity, time, value, or
 name column, a tag identity or name that is not unique, or identity columns
-that do not share a type and collation, before any sample is read. Raw reads select by the tag identity
-column so a case-insensitive name collation cannot mix two tags. Time bounds
-are millisecond watermarks even when the time column stores microseconds.
+that do not share a type and collation, before any sample is read. A partition
+catalog is a table of value-table name, range start, and range end (half-open
+`[start, end)` in catalog time). `connect` also refuses an empty catalog,
+overlapping or inverted ranges, a range that is not millisecond-aligned, and a
+named value table that fails the same column checks. Raw reads select by the tag identity column so a
+case-insensitive name collation cannot mix two tags. Time bounds are
+millisecond watermarks even when the time column stores microseconds. A hole
+in catalog coverage inside the requested window, or a catalog rotation that
+drops a used partition or inserts one over an already-read range, fails
+closed. Continuation is the last emitted timestamp. Changing catalog presence
+or identity is a new source revision: use a new `start_ms` and `state_dir`.
 Call the synchronous API from a dedicated OS thread outside a Tokio runtime.
 Verified TLS is required unless `allow_insecure_lab` explicitly permits a
 disposable plaintext fixture.
@@ -78,18 +87,28 @@ are not offered.
 
 Enable the `mssql` Cargo feature and construct
 `mssql::historian::SqlHistorian` with host, port, user, password, database,
-and a mapping: the tag table (identity and name columns), the value table
-(tag, time, value, and quality columns), and the schema that holds them
-(`mapping.database`). `connect` checks that mapping against the catalog and
-refuses a missing table, a missing column, a time/value/name column of the
-wrong type, a nullable identity, time, value, or name column, a tag identity
-or name that is not unique, or identity columns that do not share a type and
-collation, before any sample is read. Raw reads select by the tag identity
-column so a case-insensitive name collation cannot mix two tags. Time bounds
-are millisecond watermarks even when the time column stores fractional
-seconds. Call the synchronous API from a dedicated OS thread outside a Tokio
-runtime. Verified TLS is required unless `allow_insecure_lab` explicitly
-permits a disposable fixture with a server-selected certificate.
+and a mapping: the tag table (identity and name columns), either one value
+table or a partition catalog of value tables, and the schema that holds them
+(`mapping.database`). `value_table` and `partition_catalog` are mutually
+exclusive. `connect` checks that mapping against the catalog and refuses a
+missing table, a missing column, a time/value/name column of the wrong type,
+a nullable identity, time, value, or name column, a tag identity or name that
+is not unique, or identity columns that do not share a type and collation,
+before any sample is read. A partition catalog is a table of value-table name,
+range start, and range end (half-open `[start, end)` in catalog time).
+`connect` also refuses an empty catalog, overlapping or inverted ranges, a
+range that is not millisecond-aligned, and a named value table that fails the
+same column checks. Raw reads select by
+the tag identity column so a case-insensitive name collation cannot mix two
+tags. Time bounds are millisecond watermarks even when the time column stores
+fractional seconds. A hole in catalog coverage inside the requested window,
+or a catalog rotation that drops a used partition or inserts one over an
+already-read range, fails closed. Continuation is the last emitted timestamp.
+Changing catalog presence or identity is a new source revision: use a new
+`start_ms` and `state_dir`. Call the synchronous API from a dedicated OS
+thread outside a Tokio runtime. Verified TLS is required unless
+`allow_insecure_lab` explicitly permits a disposable fixture with a
+server-selected certificate.
 
 Raw reads are `SELECT`s over `(after_ms, until_ms]`, ordered by the time
 column, so a restart with the same window is replayable. Interpolated reads
@@ -108,8 +127,8 @@ runs over the rest. Session, trust, and PKI setup are the same as
 
 The parent historian scope in #6 is delivered by #22 (one trait, chunked
 backfill, per-tag checkpoints, tail handover), #23 (OPC UA Historical Access),
-#24 (MySQL mapping), and #68 (SQL Server mapping). The REST historian adapter
-stays later.
+#24 (MySQL mapping), #68 (SQL Server mapping), and #150 (time-partitioned SQL
+value tables). The REST historian adapter stays later.
 
 ```sh
 CARGO_TARGET_DIR="$PWD/target" cargo test --locked --test historian_backfill
@@ -128,8 +147,10 @@ bash scripts/test-mssql-container.sh
 | Raw Historical Access paging, same-millisecond refusal, variables without history, and namespace-table change against a foreign server | [Foreign container fixture](../tests/opcua_foreign.rs) |
 | Generic SQL historian adapter configured by mapping (tag table, value table, time column, quality column) on MySQL | [MySQL historian fixture](../tests/mysql_historian.rs) |
 | Wrong mapping refused at connect; interpolated SQL reads not offered | [MySQL historian fixture](../tests/mysql_historian.rs) |
+| Optional partition catalog: contiguous raw backfill across two value tables, resume from the watermark, uncovered window and vanished partition refused | [MySQL historian fixture](../tests/mysql_historian.rs) |
 | Generic SQL historian adapter configured by mapping (tag table, value table, time column, quality column) on SQL Server | [SQL Server historian fixture](../tests/mssql_historian.rs) |
 | Wrong SQL Server mapping refused at connect; interpolated SQL reads not offered | [SQL Server historian fixture](../tests/mssql_historian.rs) |
+| Optional partition catalog on SQL Server: contiguous raw backfill across two value tables, resume from the watermark, uncovered window and vanished partition refused | [SQL Server historian fixture](../tests/mssql_historian.rs) |
 
 These checks establish fixture and simulator conformance. They do not certify
 arbitrary plant historians. Vendor client libraries stay out of the default
