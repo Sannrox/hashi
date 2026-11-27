@@ -114,6 +114,7 @@ stays later.
 ```sh
 CARGO_TARGET_DIR="$PWD/target" cargo test --locked --test historian_backfill
 CARGO_TARGET_DIR="$PWD/target" cargo test --locked --features opcua-simulator --test opcua_historian
+bash scripts/test-opcua-foreign-container.sh
 bash scripts/test-mysql-container.sh
 bash scripts/test-mssql-container.sh
 ```
@@ -124,6 +125,7 @@ bash scripts/test-mssql-container.sh
 | One-year backfill of 1k tags, checkpoints, resume after a kill, handover to the tail with no gap or overlap beyond the idempotency key | [Backfill fixture](../tests/historian_backfill.rs) |
 | OPC UA Historical Access adapter: paged raw history, resume after a kill, tail handover, same-millisecond page refusal, session restart | [OPC UA historian fixture](../tests/opcua_historian.rs) |
 | Variables without history reported by `check`; connector still runs | [OPC UA historian fixture](../tests/opcua_historian.rs) |
+| Raw Historical Access paging, same-millisecond refusal, variables without history, and namespace-table change against a foreign server | [Foreign container fixture](../tests/opcua_foreign.rs) |
 | Generic SQL historian adapter configured by mapping (tag table, value table, time column, quality column) on MySQL | [MySQL historian fixture](../tests/mysql_historian.rs) |
 | Wrong mapping refused at connect; interpolated SQL reads not offered | [MySQL historian fixture](../tests/mysql_historian.rs) |
 | Generic SQL historian adapter configured by mapping (tag table, value table, time column, quality column) on SQL Server | [SQL Server historian fixture](../tests/mssql_historian.rs) |

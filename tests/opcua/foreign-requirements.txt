@@ -1,0 +1,2 @@
+# Pinned lab fixture only. Not part of the default build or the shipped image.
+asyncua==2.1.0

@@ -77,6 +77,16 @@ jobs:
         with:
           persist-credentials: false
       - run: bash scripts/test-opcua-container.sh
+  opcua-foreign-container:
+    # Interop against a server this repository does not compile. Parallel with
+    # the simulator image so it does not become the pull-request wall time.
+    name: OPC UA foreign container fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash scripts/test-opcua-foreign-container.sh
   mysql-container:
     name: MySQL container fixture
     runs-on: ubuntu-latest

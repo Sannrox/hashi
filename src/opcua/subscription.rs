@@ -335,6 +335,72 @@ impl Reader {
         Ok(())
     }
 
+    /// Wait until the session is usable again, then Publish. A server process
+    /// restart can leave Publish hanging when another subscription still
+    /// exists; transfer or create() then replaces ours.
+    async fn publish_after_reconnect(
+        &mut self,
+        session: &Session,
+        timeout: Duration,
+    ) -> Result<::opcua::types::PublishResponse, Error> {
+        if timeout.is_zero()
+            || !tokio::time::timeout(timeout, session.wait_for_connection())
+                .await
+                .is_ok_and(|v| v)
+        {
+            return Err(Error::new("OPC UA subscription reconnect timed out"));
+        }
+        let attempt = timeout
+            .min(self.publish_timeout)
+            .min(Duration::from_secs(2));
+        match Publish::new(session)
+            .timeout(attempt)
+            .acks(self.ack.clone())
+            .send(session.channel())
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) if subscription_gone(error.status()) || channel_unready(error.status()) => {
+                // Reconnection may reactivate the same session. Transfer
+                // reports BadNothingToDo when the subscription already
+                // belongs here; keep it so a short Publish timeout cannot
+                // drop its retransmission queue. A new session (server
+                // process restart) fails transfer; create() then replaces
+                // the subscription. A foreign server that still holds
+                // another subscription will not return BadNoSubscription,
+                // so a timed-out Publish after reconnect is probed the
+                // same way.
+                let status = TransferSubscriptions::new(session)
+                    .subscription(self.subscription_id)
+                    .send_initial_values(false)
+                    .send(session.channel())
+                    .await
+                    .ok()
+                    .and_then(|r| r.results)
+                    .and_then(|r| (r.len() == 1).then_some(r[0].status_code));
+                if !status.is_some_and(|code| code.is_good() || code == StatusCode::BadNothingToDo)
+                {
+                    self.create(session).await?;
+                }
+                Publish::new(session)
+                    .timeout(self.publish_timeout)
+                    .acks(self.ack.clone())
+                    .send(session.channel())
+                    .await
+                    .map_err(|error| {
+                        Error::new(format!(
+                            "OPC UA subscription publish failed after reconnect ({})",
+                            error.status()
+                        ))
+                    })
+            }
+            Err(error) => Err(Error::new(format!(
+                "OPC UA subscription recovery failed without replacing existing subscription ({})",
+                error.status()
+            ))),
+        }
+    }
+
     async fn collect(&mut self, session: &Session, timeout: Duration) -> Result<(), Error> {
         let response = match Publish::new(session)
             .timeout(self.publish_timeout)
@@ -345,53 +411,7 @@ impl Reader {
             Ok(response) => response,
             Err(_) => {
                 self.needs_history = self.history.is_some();
-                if !tokio::time::timeout(timeout, session.wait_for_connection())
-                    .await
-                    .is_ok_and(|v| v)
-                {
-                    return Err(Error::new("OPC UA subscription reconnect timed out"));
-                }
-                // Reconnection may reactivate the same session. Its existing
-                // subscription and retransmission queue must be tried before transfer.
-                match Publish::new(session)
-                    .timeout(self.publish_timeout)
-                    .acks(self.ack.clone())
-                    .send(session.channel())
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(error)
-                        if matches!(
-                            error.status(),
-                            StatusCode::BadNoSubscription | StatusCode::BadSubscriptionIdInvalid
-                        ) =>
-                    {
-                        let transferred = TransferSubscriptions::new(session)
-                            .subscription(self.subscription_id)
-                            .send_initial_values(false)
-                            .send(session.channel())
-                            .await
-                            .ok()
-                            .and_then(|r| r.results)
-                            .is_some_and(|r| r.len() == 1 && r[0].status_code.is_good());
-                        if !transferred {
-                            self.create(session).await?;
-                        }
-                        Publish::new(session)
-                            .timeout(self.publish_timeout)
-                            .acks(self.ack.clone())
-                            .send(session.channel())
-                            .await
-                            .map_err(|_| {
-                                Error::new("OPC UA subscription publish failed after reconnect")
-                            })?
-                    }
-                    Err(_) => {
-                        return Err(Error::new(
-                            "OPC UA subscription recovery failed without replacing existing subscription",
-                        ));
-                    }
-                }
+                self.publish_after_reconnect(session, timeout).await?
             }
         };
         if self.needs_history {
@@ -550,6 +570,28 @@ impl Reader {
         self.ack.extend(received);
         Ok(())
     }
+}
+
+fn subscription_gone(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BadNoSubscription
+            | StatusCode::BadSubscriptionIdInvalid
+            | StatusCode::BadSessionIdInvalid
+            | StatusCode::BadSessionClosed
+    )
+}
+
+fn channel_unready(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BadTimeout
+            | StatusCode::BadCommunicationError
+            | StatusCode::BadConnectionClosed
+            | StatusCode::BadSecureChannelIdInvalid
+            | StatusCode::BadSecureChannelClosed
+            | StatusCode::BadSessionNotActivated
+    )
 }
 
 fn recover(
