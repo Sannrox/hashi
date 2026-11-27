@@ -91,6 +91,139 @@ pub trait Historian {
     }
 }
 
+/// One catalog row: half-open `[start_ms, end_ms)` naming a value table.
+#[cfg(any(feature = "mysql", feature = "mssql", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartitionRange {
+    pub value_table: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+/// One Hashi raw window clipped onto a catalog partition.
+#[cfg(any(feature = "mysql", feature = "mssql", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartitionWindow {
+    pub value_table: String,
+    pub after_ms: i64,
+    pub until_ms: i64,
+}
+
+/// Sort catalog rows and refuse empty, inverted, or overlapping ranges.
+#[cfg(any(feature = "mysql", feature = "mssql", test))]
+pub(crate) fn ordered_partition_ranges(
+    partitions: &[PartitionRange],
+) -> Result<Vec<PartitionRange>, Error> {
+    let mut ordered = partitions.to_vec();
+    ordered.sort_by(|left, right| {
+        (left.start_ms, left.end_ms, left.value_table.as_str()).cmp(&(
+            right.start_ms,
+            right.end_ms,
+            right.value_table.as_str(),
+        ))
+    });
+    let mut previous_end = None;
+    for part in &ordered {
+        if part.start_ms >= part.end_ms {
+            return Err(Error::new(
+                "SQL historian partition catalog has an empty or inverted range",
+            ));
+        }
+        if previous_end.is_some_and(|end| part.start_ms < end) {
+            return Err(Error::new("SQL historian partition catalog ranges overlap"));
+        }
+        previous_end = Some(part.end_ms);
+    }
+    Ok(ordered)
+}
+
+/// Clip Hashi's `(after_ms, until_ms]` onto catalog partitions.
+///
+/// Catalog ranges are half-open `[start_ms, end_ms)`. Overlaps, empty or
+/// inverted ranges, and a hole inside the requested window fail closed.
+#[cfg(any(feature = "mysql", feature = "mssql", test))]
+pub(crate) fn partitioned_raw_windows(
+    after_ms: i64,
+    until_ms: i64,
+    partitions: &[PartitionRange],
+) -> Result<Vec<PartitionWindow>, Error> {
+    if after_ms >= until_ms {
+        return Ok(Vec::new());
+    }
+    let ordered = ordered_partition_ranges(partitions)?;
+    // Hashi's lower bound is exclusive, so coverage starts at the first
+    // millisecond that must be readable.
+    let mut covered = after_ms.saturating_add(1);
+    let mut windows = Vec::new();
+    for part in ordered {
+        if part.end_ms <= after_ms || part.start_ms > until_ms {
+            continue;
+        }
+        if part.start_ms > covered {
+            return Err(Error::new(
+                "SQL historian partition catalog does not cover the requested window",
+            ));
+        }
+        let after = match part.start_ms.checked_sub(1) {
+            Some(before_start) => after_ms.max(before_start),
+            None => after_ms,
+        };
+        let until = match part.end_ms.checked_sub(1) {
+            Some(last) => until_ms.min(last),
+            None => until_ms,
+        };
+        if after < until {
+            windows.push(PartitionWindow {
+                value_table: part.value_table,
+                after_ms: after,
+                until_ms: until,
+            });
+        }
+        covered = covered.max(part.end_ms);
+        if covered > until_ms {
+            break;
+        }
+    }
+    if covered <= until_ms {
+        return Err(Error::new(
+            "SQL historian partition catalog does not cover the requested window",
+        ));
+    }
+    Ok(windows)
+}
+
+/// True when a partition used by this read vanished or a new partition covers
+/// a range this read already walked.
+#[cfg(any(feature = "mysql", feature = "mssql", test))]
+pub(crate) fn partition_set_rotated(
+    before: &[PartitionRange],
+    after: &[PartitionRange],
+    used: &[PartitionWindow],
+) -> bool {
+    for walked in used {
+        let owner = before.iter().find(|part| {
+            part.value_table == walked.value_table
+                && part.start_ms <= walked.until_ms
+                && part.end_ms > walked.after_ms
+        });
+        let Some(owner) = owner else {
+            return true;
+        };
+        if !after.iter().any(|part| part == owner) {
+            return true;
+        }
+        if after.iter().any(|part| {
+            part != owner
+                && part.start_ms < owner.end_ms
+                && part.end_ms > owner.start_ms
+                && !before.contains(part)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistorianConfig {
     /// Backfill start; samples at or before it are not read.
@@ -870,5 +1003,108 @@ mod tests {
             json_value(f64::NEG_INFINITY),
             serde_json::json!("-Infinity")
         );
+    }
+
+    fn part(table: &str, start_ms: i64, end_ms: i64) -> PartitionRange {
+        PartitionRange {
+            value_table: table.into(),
+            start_ms,
+            end_ms,
+        }
+    }
+
+    #[test]
+    fn partitioned_raw_windows_clip_catalog_ranges_onto_a_hashi_window() {
+        let partitions = [part("p1", 1_000, 2_000), part("p0", 0, 1_000)];
+        assert_eq!(
+            partitioned_raw_windows(500, 1_500, &partitions).unwrap(),
+            vec![
+                PartitionWindow {
+                    value_table: "p0".into(),
+                    after_ms: 500,
+                    until_ms: 999,
+                },
+                PartitionWindow {
+                    value_table: "p1".into(),
+                    after_ms: 999,
+                    until_ms: 1_500,
+                },
+            ]
+        );
+        assert!(
+            partitioned_raw_windows(0, 0, &partitions)
+                .unwrap()
+                .is_empty()
+        );
+        let error = partitioned_raw_windows(500, 2_500, &[part("p0", 0, 1_000)]).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("does not cover the requested window"),
+            "{}",
+            error.message
+        );
+        let hole =
+            partitioned_raw_windows(0, 2_000, &[part("p0", 0, 1_000), part("p2", 1_500, 2_500)])
+                .unwrap_err();
+        assert!(
+            hole.message.contains("does not cover the requested window"),
+            "{}",
+            hole.message
+        );
+        let overlap =
+            ordered_partition_ranges(&[part("a", 0, 1_000), part("b", 500, 1_500)]).unwrap_err();
+        assert!(overlap.message.contains("overlap"), "{}", overlap.message);
+        let inverted = ordered_partition_ranges(&[part("a", 1_000, 1_000)]).unwrap_err();
+        assert!(
+            inverted.message.contains("empty or inverted"),
+            "{}",
+            inverted.message
+        );
+        assert_eq!(
+            partitioned_raw_windows(-1, 10, &[part("epoch", 0, 100)]).unwrap(),
+            vec![PartitionWindow {
+                value_table: "epoch".into(),
+                after_ms: -1,
+                until_ms: 10,
+            }]
+        );
+        assert_eq!(
+            partitioned_raw_windows(500, 1_000, &[part("p", 501, 2_000)]).unwrap(),
+            vec![PartitionWindow {
+                value_table: "p".into(),
+                after_ms: 500,
+                until_ms: 1_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn partition_set_rotated_detects_a_vanished_or_replaced_range() {
+        let before = [part("p0", 0, 1_000), part("p1", 1_000, 2_000)];
+        let used = [PartitionWindow {
+            value_table: "p0".into(),
+            after_ms: 0,
+            until_ms: 999,
+        }];
+        assert!(partition_set_rotated(
+            &before,
+            &[part("p1", 1_000, 2_000)],
+            &used
+        ));
+        assert!(partition_set_rotated(
+            &before,
+            &[part("p0b", 0, 1_000), part("p1", 1_000, 2_000)],
+            &used
+        ));
+        assert!(!partition_set_rotated(
+            &before,
+            &[
+                part("p0", 0, 1_000),
+                part("p1", 1_000, 2_000),
+                part("p2", 2_000, 3_000)
+            ],
+            &used
+        ));
     }
 }

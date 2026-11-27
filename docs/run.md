@@ -48,6 +48,8 @@ sink.jsonl = { dir = "out/line-1" }
 - `instance.source.<family>`: one section per source family. Implemented
   families: `fixture`, `opcua`, `mqtt`, `modbus`, `mysql`, `mssql`, `postgres`,
   and `historian` (nested `adapter.opcua`, `adapter.mysql`, or `adapter.mssql`).
+  Historian SQL mappings take either `value_table` or nested `partition_catalog`
+  (`table`, `value_table_column`, `start_column`, `end_column`), not both.
   A family compiled out of the binary is refused by name. Credentials stay
   file paths; `credential_file` is user then password on two lines for OPC UA
   and MQTT, the password only for MySQL, SQL Server, and PostgreSQL. OPC UA `hashi run`

@@ -4,9 +4,11 @@
 //! value table by the mapped identity column, not the name, so a
 //! case-insensitive collation cannot alias two tags. The mapping is checked
 //! against the catalog before any read: tables, columns, types, and unique
-//! identity and name columns. Interpolated reads are not offered: SQL tables
-//! do not define a processed history. `mapping.database` is the schema that
-//! holds the tables; the connection database is the catalog.
+//! identity and name columns. An optional partition catalog names time-sliced
+//! value tables; omitting it keeps one `value_table`. Interpolated reads are
+//! not offered: SQL tables do not define a processed history.
+//! `mapping.database` is the schema that holds the tables; the connection
+//! database is the catalog.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -17,10 +19,22 @@ use tokio::net::TcpStream;
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use super::schema::{ident, qualified};
-use crate::historian::{Historian, Sample, Tag};
+use crate::historian::{
+    Historian, PartitionRange, Sample, Tag, ordered_partition_ranges, partition_set_rotated,
+    partitioned_raw_windows,
+};
 use crate::{CheckReport, Error};
 
 type SqlClient = tiberius::Client<Compat<TcpStream>>;
+
+/// Catalog table that names value tables and their half-open time ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionCatalog {
+    pub table: String,
+    pub value_table_column: String,
+    pub start_column: String,
+    pub end_column: String,
+}
 
 /// One mapping from catalog tables onto tags and samples.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +43,9 @@ pub struct Mapping {
     pub tag_table: String,
     pub tag_id_column: String,
     pub tag_name_column: String,
+    /// Empty when [`partition_catalog`](Self::partition_catalog) is set.
     pub value_table: String,
+    pub partition_catalog: Option<PartitionCatalog>,
     pub value_tag_column: String,
     pub time_column: String,
     pub value_column: String,
@@ -127,25 +143,24 @@ fn validate_config(config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_mapping(mapping: &Mapping) -> Result<(), Error> {
-    let fields = [
-        ("database", mapping.database.as_str()),
-        ("tag_table", mapping.tag_table.as_str()),
-        ("tag_id_column", mapping.tag_id_column.as_str()),
-        ("tag_name_column", mapping.tag_name_column.as_str()),
-        ("value_table", mapping.value_table.as_str()),
-        ("value_tag_column", mapping.value_tag_column.as_str()),
-        ("time_column", mapping.time_column.as_str()),
-        ("value_column", mapping.value_column.as_str()),
-        ("quality_column", mapping.quality_column.as_str()),
-    ];
-    for (field, value) in fields {
-        if value.is_empty() || value.len() > 64 || value.contains('\0') {
-            return Err(Error::new(format!(
-                "invalid SQL historian mapping: {field}"
-            )));
-        }
+fn mapping_field(field: &str, value: &str) -> Result<(), Error> {
+    if value.is_empty() || value.len() > 64 || value.contains('\0') {
+        return Err(Error::new(format!(
+            "invalid SQL historian mapping: {field}"
+        )));
     }
+    Ok(())
+}
+
+fn validate_mapping(mapping: &Mapping) -> Result<(), Error> {
+    mapping_field("database", &mapping.database)?;
+    mapping_field("tag_table", &mapping.tag_table)?;
+    mapping_field("tag_id_column", &mapping.tag_id_column)?;
+    mapping_field("tag_name_column", &mapping.tag_name_column)?;
+    mapping_field("value_tag_column", &mapping.value_tag_column)?;
+    mapping_field("time_column", &mapping.time_column)?;
+    mapping_field("value_column", &mapping.value_column)?;
+    mapping_field("quality_column", &mapping.quality_column)?;
     if mapping.tag_id_column == mapping.tag_name_column {
         return Err(Error::new(
             "invalid SQL historian mapping: tag identity and name columns must differ",
@@ -161,6 +176,33 @@ fn validate_mapping(mapping: &Mapping) -> Result<(), Error> {
         return Err(Error::new(
             "invalid SQL historian mapping: value-table columns must be distinct",
         ));
+    }
+    match &mapping.partition_catalog {
+        None => mapping_field("value_table", &mapping.value_table)?,
+        Some(catalog) => {
+            if !mapping.value_table.is_empty() {
+                return Err(Error::new(
+                    "invalid SQL historian mapping: value_table and partition_catalog are mutually exclusive",
+                ));
+            }
+            mapping_field("partition_catalog.table", &catalog.table)?;
+            mapping_field(
+                "partition_catalog.value_table_column",
+                &catalog.value_table_column,
+            )?;
+            mapping_field("partition_catalog.start_column", &catalog.start_column)?;
+            mapping_field("partition_catalog.end_column", &catalog.end_column)?;
+            let catalog_columns = [
+                catalog.value_table_column.as_str(),
+                catalog.start_column.as_str(),
+                catalog.end_column.as_str(),
+            ];
+            if catalog_columns.iter().collect::<BTreeSet<_>>().len() != catalog_columns.len() {
+                return Err(Error::new(
+                    "invalid SQL historian mapping: partition catalog columns must be distinct",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -194,7 +236,6 @@ async fn connection(config: &Config) -> Result<SqlClient, Error> {
 
 async fn check_mapping(client: &mut SqlClient, mapping: &Mapping) -> Result<(), Error> {
     let tag_columns = catalog_columns(client, &mapping.database, &mapping.tag_table).await?;
-    let value_columns = catalog_columns(client, &mapping.database, &mapping.value_table).await?;
     let tag_id = require_column(
         &tag_columns,
         &mapping.tag_table,
@@ -209,39 +250,6 @@ async fn check_mapping(client: &mut SqlClient, mapping: &Mapping) -> Result<(), 
         Some(name_type_ok),
         false,
     )?;
-    let value_tag = require_column(
-        &value_columns,
-        &mapping.value_table,
-        &mapping.value_tag_column,
-        None,
-        false,
-    )?;
-    require_column(
-        &value_columns,
-        &mapping.value_table,
-        &mapping.time_column,
-        Some(time_type_ok),
-        false,
-    )?;
-    require_column(
-        &value_columns,
-        &mapping.value_table,
-        &mapping.value_column,
-        Some(value_type_ok),
-        false,
-    )?;
-    require_column(
-        &value_columns,
-        &mapping.value_table,
-        &mapping.quality_column,
-        None,
-        true,
-    )?;
-    if tag_id.data_type != value_tag.data_type || tag_id.collation != value_tag.collation {
-        return Err(Error::new(
-            "SQL historian mapping: tag identity columns are not comparable",
-        ));
-    }
     require_unique(
         client,
         &mapping.database,
@@ -256,6 +264,82 @@ async fn check_mapping(client: &mut SqlClient, mapping: &Mapping) -> Result<(), 
         &mapping.tag_name_column,
     )
     .await?;
+    match &mapping.partition_catalog {
+        None => check_value_table(client, mapping, &mapping.value_table, tag_id).await,
+        Some(catalog) => {
+            let catalog_columns =
+                catalog_columns(client, &mapping.database, &catalog.table).await?;
+            require_column(
+                &catalog_columns,
+                &catalog.table,
+                &catalog.value_table_column,
+                Some(name_type_ok),
+                false,
+            )?;
+            require_column(
+                &catalog_columns,
+                &catalog.table,
+                &catalog.start_column,
+                Some(time_type_ok),
+                false,
+            )?;
+            require_column(
+                &catalog_columns,
+                &catalog.table,
+                &catalog.end_column,
+                Some(time_type_ok),
+                false,
+            )?;
+            let partitions = load_partitions(client, mapping).await?;
+            if partitions.is_empty() {
+                return Err(Error::new("SQL historian partition catalog is empty"));
+            }
+            ordered_partition_ranges(&partitions)?;
+            let mut seen = BTreeSet::new();
+            for part in &partitions {
+                if seen.insert(part.value_table.as_str()) {
+                    check_value_table(client, mapping, &part.value_table, tag_id).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn check_value_table(
+    client: &mut SqlClient,
+    mapping: &Mapping,
+    table: &str,
+    tag_id: &CatalogColumn,
+) -> Result<(), Error> {
+    let value_columns = catalog_columns(client, &mapping.database, table).await?;
+    let value_tag = require_column(
+        &value_columns,
+        table,
+        &mapping.value_tag_column,
+        None,
+        false,
+    )?;
+    require_column(
+        &value_columns,
+        table,
+        &mapping.time_column,
+        Some(time_type_ok),
+        false,
+    )?;
+    require_column(
+        &value_columns,
+        table,
+        &mapping.value_column,
+        Some(value_type_ok),
+        false,
+    )?;
+    require_column(&value_columns, table, &mapping.quality_column, None, true)?;
+    if tag_id.data_type != value_tag.data_type || tag_id.collation != value_tag.collation {
+        return Err(Error::new(
+            "SQL historian mapping: tag identity columns are not comparable",
+        ));
+    }
     Ok(())
 }
 
@@ -418,6 +502,88 @@ async fn load_tags(client: &mut SqlClient, mapping: &Mapping) -> Result<Vec<Mapp
     Ok(tags)
 }
 
+async fn load_partitions(
+    client: &mut SqlClient,
+    mapping: &Mapping,
+) -> Result<Vec<PartitionRange>, Error> {
+    let catalog = mapping
+        .partition_catalog
+        .as_ref()
+        .ok_or_else(|| Error::new("SQL historian partition catalog is not mapped"))?;
+    let sql = format!(
+        "SELECT {}, {}, {} FROM {}",
+        ident(&catalog.value_table_column),
+        ident(&catalog.start_column),
+        ident(&catalog.end_column),
+        qualified(&mapping.database, &catalog.table)
+    );
+    let rows = query_rows(client, tiberius::Query::new(sql)).await?;
+    let mut partitions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let value_table = required_text(&row, 0)?;
+        mapping_field("partition value table", &value_table)?;
+        partitions.push(PartitionRange {
+            value_table,
+            start_ms: catalog_timestamp_ms(&row, 1)?,
+            end_ms: catalog_timestamp_ms(&row, 2)?,
+        });
+    }
+    Ok(partitions)
+}
+
+async fn read_raw_samples(
+    client: &mut SqlClient,
+    mapping: &Mapping,
+    tag: &str,
+    tag_id: &TagId,
+    after_ms: i64,
+    until_ms: i64,
+    limit: usize,
+) -> Result<Vec<Sample>, Error> {
+    if mapping.partition_catalog.is_none() {
+        return read_samples(client, mapping, tag, tag_id, after_ms, until_ms, limit).await;
+    }
+    if limit == 0 || after_ms >= until_ms {
+        return Ok(Vec::new());
+    }
+    let before = load_partitions(client, mapping).await?;
+    let windows = partitioned_raw_windows(after_ms, until_ms, &before)?;
+    let mut samples = Vec::new();
+    let mut remaining = limit;
+    let mut after = after_ms;
+    let mut used = Vec::new();
+    for window in windows {
+        if remaining == 0 {
+            break;
+        }
+        let mut page_mapping = mapping.clone();
+        page_mapping.value_table = window.value_table.clone();
+        let page = read_samples(
+            client,
+            &page_mapping,
+            tag,
+            tag_id,
+            after.max(window.after_ms),
+            window.until_ms,
+            remaining,
+        )
+        .await?;
+        if let Some(last) = page.last() {
+            after = last.ts_ms;
+        }
+        remaining -= page.len();
+        samples.extend(page);
+        used.push(window);
+    }
+    let after_snap = load_partitions(client, mapping).await?;
+    if partition_set_rotated(&before, &after_snap, &used) {
+        return Err(Error::new(
+            "SQL historian partition catalog changed during the read",
+        ));
+    }
+    Ok(samples)
+}
+
 async fn read_samples(
     client: &mut SqlClient,
     mapping: &Mapping,
@@ -487,6 +653,26 @@ fn next_dt(ms: i64) -> Result<NaiveDateTime, Error> {
     )
     .map(|time| time.naive_utc())
     .ok_or_else(|| Error::new("SQL historian timestamp is out of range"))
+}
+
+fn catalog_timestamp_ms(row: &Row, index: usize) -> Result<i64, Error> {
+    let ts_ms = timestamp_ms(row, index)?;
+    let aligned = if let Ok(Some(value)) = row.try_get::<NaiveDateTime, _>(index) {
+        value.and_utc().timestamp_subsec_nanos() % 1_000_000 == 0
+    } else if let Ok(Some(value)) = row.try_get::<DateTime<Utc>, _>(index) {
+        value.timestamp_subsec_nanos() % 1_000_000 == 0
+    } else if let Ok(Some(value)) = row.try_get::<DateTime<FixedOffset>, _>(index) {
+        value.timestamp_subsec_nanos() % 1_000_000 == 0
+    } else {
+        false
+    };
+    if aligned {
+        Ok(ts_ms)
+    } else {
+        Err(Error::new(
+            "SQL historian partition catalog range is not millisecond-aligned",
+        ))
+    }
 }
 
 fn timestamp_ms(row: &Row, index: usize) -> Result<i64, Error> {
@@ -644,7 +830,7 @@ impl Historian for SqlHistorian {
         self.runtime.block_on(async {
             tokio::time::timeout(self.config.timeout, async {
                 let mut client = connection(&self.config).await?;
-                read_samples(
+                read_raw_samples(
                     &mut client,
                     &self.config.mapping,
                     &tag,
@@ -684,6 +870,7 @@ mod tests {
             tag_id_column: "id".into(),
             tag_name_column: "name".into(),
             value_table: "samples".into(),
+            partition_catalog: None,
             value_tag_column: "tag_id".into(),
             time_column: "ts".into(),
             value_column: "value".into(),
@@ -717,6 +904,28 @@ mod tests {
         mapping.tag_table.clear();
         let error = refused(config(mapping, true));
         assert!(error.message.contains("tag_table"), "{}", error.message);
+    }
+
+    #[test]
+    fn value_table_and_partition_catalog_are_mutually_exclusive() {
+        let mut both = mapping();
+        both.partition_catalog = Some(PartitionCatalog {
+            table: "partitions".into(),
+            value_table_column: "value_table".into(),
+            start_column: "start_ts".into(),
+            end_column: "end_ts".into(),
+        });
+        let error = refused(config(both, true));
+        assert!(
+            error.message.contains("mutually exclusive"),
+            "{}",
+            error.message
+        );
+
+        let mut neither = mapping();
+        neither.value_table.clear();
+        let error = refused(config(neither, true));
+        assert!(error.message.contains("value_table"), "{}", error.message);
     }
 
     #[test]

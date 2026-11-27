@@ -378,6 +378,41 @@ pub enum SourceConfig {
     Historian(HistorianSourceConfig),
 }
 
+fn validate_historian_partition_mapping(
+    value_table: &str,
+    catalog: &Option<HistorianPartitionCatalogConfig>,
+    field: &impl Fn(&str) -> String,
+    prefix: &str,
+) -> Result<(), String> {
+    let invalid = |name: &str, problem: &str| {
+        Err(format!(
+            "invalid config: {}: {problem}",
+            field(&format!("{prefix}.{name}"))
+        ))
+    };
+    match (value_table.is_empty(), catalog) {
+        (false, None) => Ok(()),
+        (true, Some(catalog)) => {
+            if catalog.table.is_empty()
+                || catalog.value_table_column.is_empty()
+                || catalog.start_column.is_empty()
+                || catalog.end_column.is_empty()
+            {
+                return invalid(
+                    "partition_catalog.table",
+                    "table and range columns must not be empty",
+                );
+            }
+            Ok(())
+        }
+        (false, Some(_)) => invalid(
+            "value_table",
+            "set value_table or partition_catalog, not both",
+        ),
+        (true, None) => invalid("value_table", "set value_table or partition_catalog"),
+    }
+}
+
 impl SourceConfig {
     pub fn family(&self) -> &'static str {
         match self {
@@ -711,6 +746,12 @@ impl SourceConfig {
                                 "must be at least 1",
                             );
                         }
+                        validate_historian_partition_mapping(
+                            &mysql.value_table,
+                            &mysql.partition_catalog,
+                            field,
+                            "source.historian.adapter.mysql",
+                        )?;
                     }
                     HistorianAdapterConfig::Mssql(mssql) => {
                         if mssql.host.trim().is_empty()
@@ -734,6 +775,12 @@ impl SourceConfig {
                                 "must not be empty",
                             );
                         }
+                        validate_historian_partition_mapping(
+                            &mssql.value_table,
+                            &mssql.partition_catalog,
+                            field,
+                            "source.historian.adapter.mssql",
+                        )?;
                     }
                 }
             }
@@ -1193,6 +1240,16 @@ pub enum HistorianAdapterConfig {
     Mssql(MssqlHistorianConfig),
 }
 
+/// Catalog table that names time-sliced value tables.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistorianPartitionCatalogConfig {
+    pub table: String,
+    pub value_table_column: String,
+    pub start_column: String,
+    pub end_column: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MysqlHistorianConfig {
@@ -1205,7 +1262,10 @@ pub struct MysqlHistorianConfig {
     pub tag_table: String,
     pub tag_id_column: String,
     pub tag_name_column: String,
+    #[serde(default)]
     pub value_table: String,
+    #[serde(default)]
+    pub partition_catalog: Option<HistorianPartitionCatalogConfig>,
     pub value_tag_column: String,
     pub time_column: String,
     pub value_column: String,
@@ -1227,7 +1287,10 @@ pub struct MssqlHistorianConfig {
     pub tag_table: String,
     pub tag_id_column: String,
     pub tag_name_column: String,
+    #[serde(default)]
     pub value_table: String,
+    #[serde(default)]
+    pub partition_catalog: Option<HistorianPartitionCatalogConfig>,
     pub value_tag_column: String,
     pub time_column: String,
     pub value_column: String,
@@ -1802,6 +1865,38 @@ mod tests {
              sink.jsonl = { dir = \"out\" }";
         let parsed = Config::parse(&config(historian), Path::new("/etc/hashi")).unwrap();
         assert_eq!(parsed.instances[0].source.family(), "historian");
+
+        let historian_catalog = historian.replace(
+            "value_table = \"samples\", ",
+            "partition_catalog = { table = \"partitions\", value_table_column = \"value_table\", start_column = \"start_ts\", end_column = \"end_ts\" }, ",
+        );
+        let parsed = Config::parse(&config(&historian_catalog), Path::new("/etc/hashi")).unwrap();
+        let SourceConfig::Historian(parsed_historian) = &parsed.instances[0].source else {
+            panic!("expected historian");
+        };
+        let HistorianAdapterConfig::Mysql(mysql) = &parsed_historian.adapter else {
+            panic!("expected mysql historian");
+        };
+        assert!(mysql.value_table.is_empty());
+        assert_eq!(
+            mysql
+                .partition_catalog
+                .as_ref()
+                .map(|catalog| catalog.table.as_str()),
+            Some("partitions")
+        );
+
+        let historian_both = historian.replace(
+            "value_table = \"samples\", ",
+            "value_table = \"samples\", partition_catalog = { table = \"partitions\", value_table_column = \"value_table\", start_column = \"start_ts\", end_column = \"end_ts\" }, ",
+        );
+        let error = Config::parse(&config(&historian_both), Path::new("."))
+            .unwrap_err()
+            .message;
+        assert!(
+            error.contains("value_table or partition_catalog"),
+            "{error}"
+        );
 
         let mssql = "name = \"line-1\"\n\
              source.mssql = { host = \"db\", port = 1433, user = \"sa\", database = \"plant\", \

@@ -796,6 +796,14 @@ fn open_historian(
                             tag_id_column: mysql.tag_id_column.clone(),
                             tag_name_column: mysql.tag_name_column.clone(),
                             value_table: mysql.value_table.clone(),
+                            partition_catalog: mysql.partition_catalog.as_ref().map(|catalog| {
+                                crate::mysql::historian::PartitionCatalog {
+                                    table: catalog.table.clone(),
+                                    value_table_column: catalog.value_table_column.clone(),
+                                    start_column: catalog.start_column.clone(),
+                                    end_column: catalog.end_column.clone(),
+                                }
+                            }),
                             value_tag_column: mysql.value_tag_column.clone(),
                             time_column: mysql.time_column.clone(),
                             value_column: mysql.value_column.clone(),
@@ -838,6 +846,14 @@ fn open_historian(
                             tag_id_column: mssql.tag_id_column.clone(),
                             tag_name_column: mssql.tag_name_column.clone(),
                             value_table: mssql.value_table.clone(),
+                            partition_catalog: mssql.partition_catalog.as_ref().map(|catalog| {
+                                crate::mssql::historian::PartitionCatalog {
+                                    table: catalog.table.clone(),
+                                    value_table_column: catalog.value_table_column.clone(),
+                                    start_column: catalog.start_column.clone(),
+                                    end_column: catalog.end_column.clone(),
+                                }
+                            }),
                             value_tag_column: mssql.value_tag_column.clone(),
                             time_column: mssql.time_column.clone(),
                             value_column: mssql.value_column.clone(),
